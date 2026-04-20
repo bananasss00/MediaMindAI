@@ -1490,10 +1490,14 @@ def index_page():
             state.aes_page = max(1, min(total_pages, state.aes_page + d))
             aesthetic_gallery_ui.refresh()
 
-        with ui.row().classes('w-full justify-center my-2 items-center gap-4'):
-            ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
-            ui.label(f'Страница {state.aes_page} из {total_pages}').classes('text-gray-300')
-            ui.button(icon='chevron_right', on_click=lambda: change_page(1)).props('flat outline color=white')
+        def render_pagination():
+            with ui.row().classes('w-full justify-center my-2 items-center gap-4'):
+                ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
+                ui.label(f'Страница {state.aes_page} из {total_pages}').classes('text-gray-300')
+                ui.button(icon='chevron_right', on_click=lambda: change_page(1)).props('flat outline color=white')
+
+        # Отрисовка верхней пагинации
+        render_pagination()
 
         start_idx = (state.aes_page - 1) * ITEMS_PER_PAGE
         page_items = state.aesthetic_results[start_idx : start_idx + ITEMS_PER_PAGE]
@@ -1517,6 +1521,9 @@ def index_page():
                         ui.label(f"★ {avg_score:.2f}").classes('text-yellow-400 font-bold text-lg')
                         if avg_score != max_score: ui.label(f"Пик: {max_score:.2f}").classes('text-xs text-gray-500')
                     ui.label(os.path.basename(path)).classes('text-xs text-gray-400 px-2 pb-2 truncate w-full').tooltip(path)
+
+        # Отрисовка нижней пагинации
+        render_pagination()
 
     @ui.refreshable
     def nsfw_gallery_ui():
