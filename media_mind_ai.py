@@ -1050,6 +1050,10 @@ class AppState:
         self.full_log_history =[]
         self.current_tab = 'Search'
 
+        # Глобальные настройки
+        self.nsfw_threshold = 0.45
+        self.flatten_structure = False
+
     def add_log(self, msg):
         ts = datetime.datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] {msg}"
@@ -1169,6 +1173,8 @@ def copy_image_to_clipboard(path):
 @ui.page('/')
 def index_page():
     cfg = load_config()
+    state.nsfw_threshold = float(cfg.get('nsfw_threshold', 0.45))
+    state.flatten_structure = bool(cfg.get('flatten_structure', False))
 
     def cancel_all_tasks():
         if state.is_processing:
@@ -1183,7 +1189,25 @@ def index_page():
 
     with ui.header().classes('bg-gray-900 border-b border-gray-800 flex justify-between items-center px-4 py-2 shrink-0'):
         ui.label('🤖 AI Media Organizer Pro').classes('text-xl font-bold tracking-wider text-blue-400')
+        ui.button(icon='settings', on_click=lambda: global_settings_dialog.open()).props('flat round dense text-color=white').tooltip('Глобальные настройки')
         
+    with ui.dialog() as global_settings_dialog:
+        with ui.card().classes('w-[450px] max-w-full bg-gray-900 text-white border border-gray-700'):
+            ui.label('Глобальные настройки').classes('text-xl font-bold mb-4 text-blue-400')
+            
+            ui.number('Порог опасности NSFW (0.0 - 1.0)', value=state.nsfw_threshold, min=0.0, max=1.0, step=0.01, format='%.2f').bind_value(state, 'nsfw_threshold').classes('w-full')
+            ui.checkbox('Копировать/Перемещать без структуры папок (в корень)', value=state.flatten_structure).bind_value(state, 'flatten_structure').classes('w-full mt-2')
+            
+            def save_global_settings():
+                save_config({
+                    'nsfw_threshold': state.nsfw_threshold,
+                    'flatten_structure': state.flatten_structure
+                })
+                ui.notify('Глобальные настройки сохранены', type='positive')
+                global_settings_dialog.close()
+                
+            ui.button('Сохранить', on_click=save_global_settings).classes('w-full mt-6 bg-blue-600 hover:bg-blue-500 font-bold')
+
     with ui.tabs().classes('w-full bg-gray-900 z-10 shrink-0').bind_value(state, 'current_tab') as tabs:
         tab_search = ui.tab('Search', label='Умный Поиск', icon='search')
         tab_aesthetic = ui.tab('Aesthetic', label='Оценка Эстетики', icon='star')
@@ -1410,6 +1434,8 @@ def index_page():
             except Exception: rel_path = os.path.basename(path)
                 
             rel_dir, fname = os.path.split(rel_path)
+            if state.flatten_structure:
+                rel_dir = ""
 
             prefix = ""
             if prepend_score:
@@ -1785,7 +1811,7 @@ def index_page():
                                             # Мягкий режим: неизвестное считаем за SFW (а в NSFW-поиск не пускаем)
                                             if search_nsfw_filter.value == 'Только NSFW': continue 
                                     else:
-                                        is_nsfw = danger >= 0.45 # Порог опасности (можно поменять, 0.45 = 45%)
+                                        is_nsfw = danger >= state.nsfw_threshold # Порог опасности (можно поменять, 0.45 = 45%)
                                         if search_nsfw_filter.value == 'Только SFW' and is_nsfw: continue
                                         if search_nsfw_filter.value == 'Только NSFW' and not is_nsfw: continue
                                         
@@ -1893,7 +1919,7 @@ def index_page():
                                         else:
                                             if aes_nsfw_filter.value == 'Только NSFW': continue
                                     else:
-                                        is_nsfw = danger >= 0.45
+                                        is_nsfw = danger >= state.nsfw_threshold
                                         if aes_nsfw_filter.value == 'Только SFW' and is_nsfw: continue
                                         if aes_nsfw_filter.value == 'Только NSFW' and not is_nsfw: continue
                                         
