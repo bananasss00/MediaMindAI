@@ -1420,15 +1420,6 @@ def index_page():
     def search_gallery_ui():
         if not state.search_results:
             return ui.label("Здесь появятся результаты...").classes("text-gray-400 m-4")
-            
-        with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
-            with ui.row().classes('gap-2 items-center'):
-                ui.button('Выбрать всё', on_click=lambda: set_all('search', True)).props('outline color=white dense')
-                ui.button('Снять всё', on_click=lambda: set_all('search', False)).props('outline color=white dense')
-            with ui.row().classes('gap-2 items-center'):
-                ui.button('HTML Экспорт', icon='html', on_click=lambda: export_html_action('search')).props('color=purple dense outline')
-                ui.button('Копировать ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'search', chk_prefix_search.value)).props('color=blue dense')
-                ui.button('Переместить ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'search', chk_prefix_search.value)).props('color=red dense')
 
         total_pages = max(1, (len(state.search_results) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
         def change_page(d):
@@ -1436,54 +1427,61 @@ def index_page():
             search_gallery_ui.refresh()
 
         def render_pagination():
-            with ui.row().classes('w-full justify-center my-2 items-center gap-4'):
+            with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
                 ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
-                ui.label(f'Страница {state.search_page} из {total_pages}').classes('text-gray-300')
+                ui.label(f'Страница {state.search_page} из {total_pages}').classes('text-gray-300 font-bold')
                 ui.button(icon='chevron_right', on_click=lambda: change_page(1)).props('flat outline color=white')
 
-        render_pagination()
+        with ui.column().classes('w-full h-full flex flex-col p-0 m-0 gap-0 relative'):
+            # Фиксированная верхняя панель (Панель управления + Пагинатор)
+            with ui.column().classes('w-full shrink-0 bg-gray-900 p-4 pb-2 border-b border-gray-800 z-20 gap-0 shadow-md'):
+                with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
+                    with ui.row().classes('gap-2 items-center'):
+                        ui.button('Выбрать всё', on_click=lambda: set_all('search', True)).props('outline color=white dense')
+                        ui.button('Снять всё', on_click=lambda: set_all('search', False)).props('outline color=white dense')
+                    with ui.row().classes('gap-2 items-center'):
+                        ui.button('HTML Экспорт', icon='html', on_click=lambda: export_html_action('search')).props('color=purple dense outline')
+                        ui.button('Копировать ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'search', chk_prefix_search.value)).props('color=blue dense')
+                        ui.button('Переместить ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'search', chk_prefix_search.value)).props('color=red dense')
+                
+                render_pagination()
 
-        start_idx = (state.search_page - 1) * ITEMS_PER_PAGE
-        page_items = state.search_results[start_idx : start_idx + ITEMS_PER_PAGE]
-        all_paths =[p for s, p in state.search_results]
+            # Прокручиваемая область с результатами
+            scroll_id = 'search_scroll_area'
+            with ui.column().classes('w-full flex-1 overflow-y-auto p-4 relative').props(f'id="{scroll_id}"'):
+                start_idx = (state.search_page - 1) * ITEMS_PER_PAGE
+                page_items = state.search_results[start_idx : start_idx + ITEMS_PER_PAGE]
+                all_paths =[p for s, p in state.search_results]
 
-        with ui.grid(columns=4).classes('w-full gap-6 pb-20'):
-            for score, path in page_items:
-                safe_path = urllib.parse.quote(path)
-                with ui.card().classes('bg-gray-800 border border-gray-700 hover:border-blue-500 transition-colors p-0 overflow-hidden relative'):
-                    with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
-                        ui.checkbox().bind_value(state.sel_search, path)
-                    
-                    with ui.context_menu():
-                        ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
-                        ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
+                with ui.grid(columns=4).classes('w-full gap-6 pb-10'):
+                    for score, path in page_items:
+                        safe_path = urllib.parse.quote(path)
+                        with ui.card().classes('bg-gray-800 border border-gray-700 hover:border-blue-500 transition-colors p-0 overflow-hidden relative'):
+                            with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
+                                ui.checkbox().bind_value(state.sel_search, path)
+                            
+                            with ui.context_menu():
+                                ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
+                                ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
 
-                    global_index = all_paths.index(path)
-                    if os.path.splitext(path)[1].lower() in SUPPORTED_TEXTS:
-                        ui.icon('article', size='4rem').classes('w-full h-48 flex items-center justify-center bg-gray-900 cursor-pointer text-gray-500').on('click', lambda p=path: open_file_native(p))
-                    else:
-                        ui.image(f"/thumb/{safe_path}").classes('w-full h-48 object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
-                    
-                    with ui.row().classes('w-full justify-between items-center p-2 bg-gray-800'):
-                        ui.label(f"Score: {score:.3f}").classes('text-green-400 font-bold text-sm')
-                        ui.button(icon='folder', on_click=lambda p=path: reveal_file_native(p)).props('flat round dense color=white')
-                    ui.label(os.path.basename(path)).classes('text-xs text-gray-400 px-2 pb-2 truncate w-full').tooltip(path)
+                            global_index = all_paths.index(path)
+                            if os.path.splitext(path)[1].lower() in SUPPORTED_TEXTS:
+                                ui.icon('article', size='4rem').classes('w-full h-48 flex items-center justify-center bg-gray-900 cursor-pointer text-gray-500').on('click', lambda p=path: open_file_native(p))
+                            else:
+                                ui.image(f"/thumb/{safe_path}").classes('w-full h-48 object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
+                            
+                            with ui.row().classes('w-full justify-between items-center p-2 bg-gray-800'):
+                                ui.label(f"Score: {score:.3f}").classes('text-green-400 font-bold text-sm')
+                                ui.button(icon='folder', on_click=lambda p=path: reveal_file_native(p)).props('flat round dense color=white')
+                            ui.label(os.path.basename(path)).classes('text-xs text-gray-400 px-2 pb-2 truncate w-full').tooltip(path)
 
-        render_pagination()
+            # Плавающая кнопка "Наверх"
+            ui.button(icon='keyboard_arrow_up', on_click=lambda: ui.run_javascript(f'document.getElementById("{scroll_id}").scrollTo({{top: 0, behavior: "smooth"}})')).props('round color=blue').classes('absolute bottom-6 right-6 z-50 shadow-lg').tooltip('Наверх')
 
     @ui.refreshable
     def aesthetic_gallery_ui():
         if not state.aesthetic_results:
             return ui.label("Здесь появятся топовые фото/видео...").classes("text-gray-400 m-4")
-
-        with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
-            with ui.row().classes('gap-2'):
-                ui.button('Выбрать всё', on_click=lambda: set_all('aes', True)).props('outline color=white dense')
-                ui.button('Снять всё', on_click=lambda: set_all('aes', False)).props('outline color=white dense')
-            with ui.row().classes('gap-2'):
-                ui.button('HTML Экспорт', icon='html', on_click=lambda: export_html_action('aes')).props('color=purple dense outline')
-                ui.button('Копировать ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'aes', chk_prefix_aes.value)).props('color=yellow-800 dense')
-                ui.button('Переместить ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'aes', chk_prefix_aes.value)).props('color=red dense')
 
         total_pages = max(1, (len(state.aesthetic_results) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
         def change_page(d):
@@ -1491,53 +1489,58 @@ def index_page():
             aesthetic_gallery_ui.refresh()
 
         def render_pagination():
-            with ui.row().classes('w-full justify-center my-2 items-center gap-4'):
+            with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
                 ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
-                ui.label(f'Страница {state.aes_page} из {total_pages}').classes('text-gray-300')
+                ui.label(f'Страница {state.aes_page} из {total_pages}').classes('text-gray-300 font-bold')
                 ui.button(icon='chevron_right', on_click=lambda: change_page(1)).props('flat outline color=white')
 
-        # Отрисовка верхней пагинации
-        render_pagination()
+        with ui.column().classes('w-full h-full flex flex-col p-0 m-0 gap-0 relative'):
+            # Фиксированная верхняя панель (Панель управления + Пагинатор)
+            with ui.column().classes('w-full shrink-0 bg-gray-900 p-4 pb-2 border-b border-gray-800 z-20 gap-0 shadow-md'):
+                with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
+                    with ui.row().classes('gap-2'):
+                        ui.button('Выбрать всё', on_click=lambda: set_all('aes', True)).props('outline color=white dense')
+                        ui.button('Снять всё', on_click=lambda: set_all('aes', False)).props('outline color=white dense')
+                    with ui.row().classes('gap-2'):
+                        ui.button('HTML Экспорт', icon='html', on_click=lambda: export_html_action('aes')).props('color=purple dense outline')
+                        ui.button('Копировать ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'aes', chk_prefix_aes.value)).props('color=yellow-800 dense')
+                        ui.button('Переместить ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'aes', chk_prefix_aes.value)).props('color=red dense')
 
-        start_idx = (state.aes_page - 1) * ITEMS_PER_PAGE
-        page_items = state.aesthetic_results[start_idx : start_idx + ITEMS_PER_PAGE]
-        all_paths =[p for a, p, m in state.aesthetic_results]
+                render_pagination()
 
-        with ui.grid(columns=4).classes('w-full gap-6 pb-20'):
-            for avg_score, path, max_score in page_items:
-                safe_path = urllib.parse.quote(path)
-                with ui.card().classes('bg-gray-800 border border-gray-700 hover:border-yellow-500 transition-colors p-0 overflow-hidden relative'):
-                    with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
-                        ui.checkbox().bind_value(state.sel_aes, path)
+            # Прокручиваемая область с результатами
+            scroll_id = 'aes_scroll_area'
+            with ui.column().classes('w-full flex-1 overflow-y-auto p-4 relative').props(f'id="{scroll_id}"'):
+                start_idx = (state.aes_page - 1) * ITEMS_PER_PAGE
+                page_items = state.aesthetic_results[start_idx : start_idx + ITEMS_PER_PAGE]
+                all_paths =[p for a, p, m in state.aesthetic_results]
 
-                    with ui.context_menu():
-                        ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
-                        ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
+                with ui.grid(columns=4).classes('w-full gap-6 pb-10'):
+                    for avg_score, path, max_score in page_items:
+                        safe_path = urllib.parse.quote(path)
+                        with ui.card().classes('bg-gray-800 border border-gray-700 hover:border-yellow-500 transition-colors p-0 overflow-hidden relative'):
+                            with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
+                                ui.checkbox().bind_value(state.sel_aes, path)
 
-                    global_index = all_paths.index(path)
-                    ui.image(f"/thumb/{safe_path}").classes('w-full h-48 object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
-                    
-                    with ui.row().classes('w-full justify-between items-center p-2'):
-                        ui.label(f"★ {avg_score:.2f}").classes('text-yellow-400 font-bold text-lg')
-                        if avg_score != max_score: ui.label(f"Пик: {max_score:.2f}").classes('text-xs text-gray-500')
-                    ui.label(os.path.basename(path)).classes('text-xs text-gray-400 px-2 pb-2 truncate w-full').tooltip(path)
+                            with ui.context_menu():
+                                ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
+                                ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
 
-        # Отрисовка нижней пагинации
-        render_pagination()
+                            global_index = all_paths.index(path)
+                            ui.image(f"/thumb/{safe_path}").classes('w-full h-48 object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
+                            
+                            with ui.row().classes('w-full justify-between items-center p-2'):
+                                ui.label(f"★ {avg_score:.2f}").classes('text-yellow-400 font-bold text-lg')
+                                if avg_score != max_score: ui.label(f"Пик: {max_score:.2f}").classes('text-xs text-gray-500')
+                            ui.label(os.path.basename(path)).classes('text-xs text-gray-400 px-2 pb-2 truncate w-full').tooltip(path)
+
+            # Плавающая кнопка "Наверх"
+            ui.button(icon='keyboard_arrow_up', on_click=lambda: ui.run_javascript(f'document.getElementById("{scroll_id}").scrollTo({{top: 0, behavior: "smooth"}})')).props('round color=yellow-800').classes('absolute bottom-6 right-6 z-50 shadow-lg').tooltip('Наверх')
 
     @ui.refreshable
     def nsfw_gallery_ui():
         if not state.nsfw_results:
             return ui.label("Здесь появятся результаты NSFW сканирования...").classes("text-gray-400 m-4")
-
-        with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
-            with ui.row().classes('gap-2'):
-                ui.button('Выбрать всё', on_click=lambda: set_all('nsfw', True)).props('outline color=white dense')
-                ui.button('Снять всё', on_click=lambda: set_all('nsfw', False)).props('outline color=white dense')
-            with ui.row().classes('gap-2'):
-                ui.button('HTML Экспорт', icon='html', on_click=lambda: export_html_action('nsfw')).props('color=purple dense outline')
-                ui.button('Копировать ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'nsfw', chk_prefix_nsfw.value)).props('color=red-800 dense')
-                ui.button('Переместить ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'nsfw', chk_prefix_nsfw.value)).props('color=red dense')
 
         total_pages = max(1, (len(state.nsfw_results) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
         def change_page(d):
@@ -1545,39 +1548,55 @@ def index_page():
             nsfw_gallery_ui.refresh()
 
         def render_pagination():
-            with ui.row().classes('w-full justify-center my-2 items-center gap-4'):
+            with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
                 ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
-                ui.label(f'Страница {state.nsfw_page} из {total_pages}').classes('text-gray-300')
+                ui.label(f'Страница {state.nsfw_page} из {total_pages}').classes('text-gray-300 font-bold')
                 ui.button(icon='chevron_right', on_click=lambda: change_page(1)).props('flat outline color=white')
 
-        render_pagination()
+        with ui.column().classes('w-full h-full flex flex-col p-0 m-0 gap-0 relative'):
+            # Фиксированная верхняя панель (Панель управления + Пагинатор)
+            with ui.column().classes('w-full shrink-0 bg-gray-900 p-4 pb-2 border-b border-gray-800 z-20 gap-0 shadow-md'):
+                with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
+                    with ui.row().classes('gap-2'):
+                        ui.button('Выбрать всё', on_click=lambda: set_all('nsfw', True)).props('outline color=white dense')
+                        ui.button('Снять всё', on_click=lambda: set_all('nsfw', False)).props('outline color=white dense')
+                    with ui.row().classes('gap-2'):
+                        ui.button('HTML Экспорт', icon='html', on_click=lambda: export_html_action('nsfw')).props('color=purple dense outline')
+                        ui.button('Копировать ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'nsfw', chk_prefix_nsfw.value)).props('color=red-800 dense')
+                        ui.button('Переместить ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'nsfw', chk_prefix_nsfw.value)).props('color=red dense')
 
-        start_idx = (state.nsfw_page - 1) * ITEMS_PER_PAGE
-        page_items = state.nsfw_results[start_idx : start_idx + ITEMS_PER_PAGE]
-        all_paths =[p for d, p, l, dt in state.nsfw_results]
+                render_pagination()
 
-        with ui.grid(columns=4).classes('w-full gap-6 pb-20'):
-            for danger_score, path, top_label, details in page_items:
-                safe_path = urllib.parse.quote(path)
-                with ui.card().classes('bg-gray-800 border border-gray-700 hover:border-red-500 transition-colors p-0 overflow-hidden relative'):
-                    with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
-                        ui.checkbox().bind_value(state.sel_nsfw, path)
+            # Прокручиваемая область с результатами
+            scroll_id = 'nsfw_scroll_area'
+            with ui.column().classes('w-full flex-1 overflow-y-auto p-4 relative').props(f'id="{scroll_id}"'):
+                start_idx = (state.nsfw_page - 1) * ITEMS_PER_PAGE
+                page_items = state.nsfw_results[start_idx : start_idx + ITEMS_PER_PAGE]
+                all_paths =[p for d, p, l, dt in state.nsfw_results]
 
-                    with ui.context_menu():
-                        ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
-                        ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
+                with ui.grid(columns=4).classes('w-full gap-6 pb-10'):
+                    for danger_score, path, top_label, details in page_items:
+                        safe_path = urllib.parse.quote(path)
+                        with ui.card().classes('bg-gray-800 border border-gray-700 hover:border-red-500 transition-colors p-0 overflow-hidden relative'):
+                            with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
+                                ui.checkbox().bind_value(state.sel_nsfw, path)
 
-                    global_index = all_paths.index(path)
-                    ui.image(f"/thumb/{safe_path}").classes('w-full h-48 object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
-                    
-                    with ui.row().classes('w-full justify-between items-center p-2'):
-                        ui.label(f"🚨 {danger_score*100:.1f}%").classes('text-red-500 font-bold text-lg')
-                        ui.button(icon='troubleshoot', on_click=lambda p=path, d=details: show_nsfw_debug(p, d)).props('flat round dense color=white').tooltip('Детальный разбор категорий')
-                        
-                    ui.label(top_label.upper()).classes('text-xs text-gray-400 font-bold px-2')
-                    ui.label(os.path.basename(path)).classes('text-xs text-gray-400 px-2 pb-2 truncate w-full').tooltip(path)
+                            with ui.context_menu():
+                                ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
+                                ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
 
-        render_pagination()
+                            global_index = all_paths.index(path)
+                            ui.image(f"/thumb/{safe_path}").classes('w-full h-48 object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
+                            
+                            with ui.row().classes('w-full justify-between items-center p-2'):
+                                ui.label(f"🚨 {danger_score*100:.1f}%").classes('text-red-500 font-bold text-lg')
+                                ui.button(icon='troubleshoot', on_click=lambda p=path, d=details: show_nsfw_debug(p, d)).props('flat round dense color=white').tooltip('Детальный разбор категорий')
+                                
+                            ui.label(top_label.upper()).classes('text-xs text-gray-400 font-bold px-2')
+                            ui.label(os.path.basename(path)).classes('text-xs text-gray-400 px-2 pb-2 truncate w-full').tooltip(path)
+
+            # Плавающая кнопка "Наверх"
+            ui.button(icon='keyboard_arrow_up', on_click=lambda: ui.run_javascript(f'document.getElementById("{scroll_id}").scrollTo({{top: 0, behavior: "smooth"}})')).props('round color=red-800').classes('absolute bottom-6 right-6 z-50 shadow-lg').tooltip('Наверх')
 
 
     # --- ОСНОВНАЯ РАБОЧАЯ ОБЛАСТЬ ---
@@ -1708,7 +1727,7 @@ def index_page():
                 with ui.row().classes('w-full p-4 pt-2 shrink-0 border-t border-gray-800 bg-gray-900 z-10'):
                     btn_search = ui.button('🚀 Искать', on_click=run_search_action).classes('w-full bg-blue-600 hover:bg-blue-500 font-bold')
 
-            with ui.column().classes('flex-1 w-0 bg-gray-900 rounded-xl border border-gray-800 p-4 overflow-y-auto h-full relative'):
+            with ui.column().classes('flex-1 w-0 bg-gray-900 rounded-xl border border-gray-800 overflow-hidden h-full relative p-0'):
                 search_gallery_ui()
 
         # ВКЛАДКА 2: ЭСТЕТИКА
@@ -1816,7 +1835,7 @@ def index_page():
                 with ui.row().classes('w-full p-4 pt-2 shrink-0 border-t border-gray-800 bg-gray-900 z-10'):
                     btn_rate = ui.button('✨ Оценить', on_click=run_aesthetic_action).classes('w-full bg-yellow-600 hover:bg-yellow-500 font-bold text-lg')
 
-            with ui.column().classes('flex-1 w-0 bg-gray-900 rounded-xl border border-gray-800 p-4 overflow-y-auto h-full relative'):
+            with ui.column().classes('flex-1 w-0 bg-gray-900 rounded-xl border border-gray-800 overflow-hidden h-full relative p-0'):
                 aesthetic_gallery_ui()
 
         # ВКЛАДКА 3: NSFW
@@ -1898,7 +1917,7 @@ def index_page():
                 with ui.row().classes('w-full p-4 pt-2 shrink-0 border-t border-gray-800 bg-gray-900 z-10'):
                     btn_nsfw = ui.button('🚨 Анализ', on_click=run_nsfw_action).classes('w-full bg-red-800 hover:bg-red-700 font-bold text-lg')
 
-            with ui.column().classes('flex-1 w-0 bg-gray-900 rounded-xl border border-gray-800 p-4 overflow-y-auto h-full relative'):
+            with ui.column().classes('flex-1 w-0 bg-gray-900 rounded-xl border border-gray-800 overflow-hidden h-full relative p-0'):
                 nsfw_gallery_ui()
 
         # ВКЛАДКА 4: ИНДЕКСАТОР (Кэш)
