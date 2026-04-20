@@ -37,7 +37,7 @@
 
 1. Склонируйте репозиторий:
    ```bash
-   git clone https://github.com/ВАШ_НИК/mediamind-ai.git
+   git clone https://github.com/bananasss00/mediamind-ai.git
    cd mediamind-ai
    ```
 2. Запустите `run.bat`.
