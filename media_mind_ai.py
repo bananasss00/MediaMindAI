@@ -7,6 +7,7 @@ except ImportError:
 import os
 import argparse
 import sys
+import asyncio
 import gc
 import time
 import json
@@ -1404,6 +1405,39 @@ def index_page():
                 state.nsfw_results =[i for i in state.nsfw_results if i[1] not in moved_paths]
                 nsfw_gallery_ui.refresh()
 
+    async def handle_shift_click(e, idx, path, tab):
+        # Проверяем, зажат ли Shift
+        is_shift = isinstance(e.args, dict) and e.args.get('shiftKey', False)
+        # Ждем 50мс, чтобы NiceGUI успел обновить значение текущего чекбокса в словаре
+        await asyncio.sleep(0.05) 
+        
+        if tab == 'search':
+            sel_dict = state.sel_search
+            all_p =[p for s, p in state.search_results]
+        elif tab == 'aes':
+            sel_dict = state.sel_aes
+            all_p =[p for a, p, m in state.aesthetic_results]
+        elif tab == 'nsfw':
+            sel_dict = state.sel_nsfw
+            all_p = [p for d, p, l, dt in state.nsfw_results]
+
+        # Получаем индекс прошлого клика (создастся автоматически, если его еще нет)
+        last_idx = getattr(state, f'last_clicked_{tab}', None)
+
+        if not is_shift:
+            # Обычный клик — запоминаем индекс
+            setattr(state, f'last_clicked_{tab}', idx)
+        else:
+            # Shift-клик — выделяем/снимаем выделение для диапазона
+            if last_idx is not None:
+                start = min(idx, last_idx)
+                end = max(idx, last_idx)
+                # Берем то значение, которое только что получил кликнутый чекбокс
+                target_val = sel_dict.get(path, True)
+                
+                for i in range(start, end + 1):
+                    sel_dict[all_p[i]] = target_val
+
     def set_all(tab, value):
         if tab == 'search':
             for p in state.sel_search: state.sel_search[p] = value
@@ -1456,15 +1490,16 @@ def index_page():
                 with ui.grid(columns=4).classes('w-full gap-6 pb-10'):
                     for score, path in page_items:
                         safe_path = urllib.parse.quote(path)
+                        global_index = all_paths.index(path) # Вычисляем индекс ЗДЕСЬ
+                        
                         with ui.card().classes('bg-gray-800 border border-gray-700 hover:border-blue-500 transition-colors p-0 overflow-hidden relative'):
                             with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
-                                ui.checkbox().bind_value(state.sel_search, path)
+                                ui.checkbox().bind_value(state.sel_search, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'search'), ['shiftKey'])
                             
                             with ui.context_menu():
                                 ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
                                 ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
 
-                            global_index = all_paths.index(path)
                             if os.path.splitext(path)[1].lower() in SUPPORTED_TEXTS:
                                 ui.icon('article', size='4rem').classes('w-full h-48 flex items-center justify-center bg-gray-900 cursor-pointer text-gray-500').on('click', lambda p=path: open_file_native(p))
                             else:
@@ -1518,15 +1553,16 @@ def index_page():
                 with ui.grid(columns=4).classes('w-full gap-6 pb-10'):
                     for avg_score, path, max_score in page_items:
                         safe_path = urllib.parse.quote(path)
+                        global_index = all_paths.index(path) # Вычисляем индекс ЗДЕСЬ
+                        
                         with ui.card().classes('bg-gray-800 border border-gray-700 hover:border-yellow-500 transition-colors p-0 overflow-hidden relative'):
                             with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
-                                ui.checkbox().bind_value(state.sel_aes, path)
+                                ui.checkbox().bind_value(state.sel_aes, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'aes'),['shiftKey'])
 
                             with ui.context_menu():
                                 ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
                                 ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
 
-                            global_index = all_paths.index(path)
                             ui.image(f"/thumb/{safe_path}").classes('w-full h-48 object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
                             
                             with ui.row().classes('w-full justify-between items-center p-2'):
@@ -1577,15 +1613,16 @@ def index_page():
                 with ui.grid(columns=4).classes('w-full gap-6 pb-10'):
                     for danger_score, path, top_label, details in page_items:
                         safe_path = urllib.parse.quote(path)
+                        global_index = all_paths.index(path) # Вычисляем индекс ЗДЕСЬ
+                        
                         with ui.card().classes('bg-gray-800 border border-gray-700 hover:border-red-500 transition-colors p-0 overflow-hidden relative'):
                             with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
-                                ui.checkbox().bind_value(state.sel_nsfw, path)
+                                ui.checkbox().bind_value(state.sel_nsfw, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'nsfw'), ['shiftKey'])
 
                             with ui.context_menu():
                                 ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
                                 ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
 
-                            global_index = all_paths.index(path)
                             ui.image(f"/thumb/{safe_path}").classes('w-full h-48 object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
                             
                             with ui.row().classes('w-full justify-between items-center p-2'):
