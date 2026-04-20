@@ -1123,6 +1123,46 @@ def copy_logs():
     ui.clipboard.write('\n'.join(state.full_log_history))
     ui.notify('Логи скопированы!', type='positive', color='green')
 
+# --- КРОССПЛАТФОРМЕННОЕ КОПИРОВАНИЕ В БУФЕР ОБМЕНА ---
+def copy_image_to_clipboard(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext in SUPPORTED_VIDEOS:
+        ui.notify('Видео нельзя скопировать в буфер обмена', type='warning')
+        return
+    if ext in SUPPORTED_TEXTS:
+        ui.notify('Текст нельзя скопировать как картинку', type='warning')
+        return
+        
+    try:
+        if os.name == 'nt':
+            try:
+                import win32clipboard
+                from PIL import Image
+                import io
+                img = Image.open(path).convert('RGB')
+                output = io.BytesIO()
+                img.save(output, 'BMP')
+                data = output.getvalue()[14:]
+                output.close()
+                win32clipboard.OpenClipboard()
+                win32clipboard.EmptyClipboard()
+                win32clipboard.SetClipboardData(win32clipboard.CF_DIB, data)
+                win32clipboard.CloseClipboard()
+            except ImportError:
+                # Фоллбэк на PowerShell, если pywin32 не установлен
+                abs_path = os.path.abspath(path).replace("'", "''")
+                cmd = f"Add-Type -AssemblyName System.Windows.Forms;[System.Windows.Forms.Clipboard]::SetImage([System.Drawing.Image]::FromFile('{abs_path}'))"
+                creationflags = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
+                subprocess.run(['powershell', '-command', cmd], creationflags=creationflags)
+        elif sys.platform == 'darwin':
+            abs_path = os.path.abspath(path)
+            subprocess.run(['osascript', '-e', f'set the clipboard to (read (POSIX file "{abs_path}") as JPEG picture)'])
+        else:
+            subprocess.run(['xclip', '-selection', 'clipboard', '-t', 'image/png', '-i', path])
+        ui.notify('Картинка скопирована в буфер обмена!', type='positive')
+    except Exception as e:
+        ui.notify(f'Ошибка копирования в буфер: {e}', type='negative')
+
 # ==========================================
 # 5. ВЕРСТКА И ИНТЕРФЕЙС NICEGUI
 # ==========================================
@@ -1193,6 +1233,7 @@ def index_page():
             with ui.row().classes('absolute bottom-4 left-1/2 -translate-x-1/2 bg-black/60 px-3 py-1 rounded-full text-white flex-nowrap items-center gap-2 z-50 shadow-lg'):
                 btn_viewer_select = ui.button(on_click=lambda: toggle_selection()).props('flat round dense size=sm').tooltip('Выделить (Space)')
                 lbl_media_name = ui.label().classes('font-mono text-xs text-center whitespace-nowrap overflow-hidden text-ellipsis min-w-[150px] max-w-[400px] px-2')
+                ui.button(icon='content_copy', on_click=lambda: copy_image_to_clipboard(state.viewer_items[state.viewer_index])).props('flat round dense size=sm color=white').tooltip('Копировать картинку в буфер (C)')
                 ui.button(icon='download', on_click=lambda: download_current_item()).props('flat round dense size=sm color=white').tooltip('Сохранить в Downloads (D)')
 
     def update_viewer_selection_ui():
@@ -1281,6 +1322,7 @@ def index_page():
         elif e.key.arrow_left: change_media(-1)
         elif e.key.space: toggle_selection()
         elif e.key.name and e.key.name.lower() == 'd': download_current_item()
+        elif e.key.name and e.key.name.lower() == 'c': copy_image_to_clipboard(state.viewer_items[state.viewer_index])
 
     ui.keyboard(on_key=handle_keyboard, ignore=['input', 'textarea', 'select'])
 
@@ -1498,6 +1540,7 @@ def index_page():
                             
                             with ui.context_menu():
                                 ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
+                                ui.menu_item('Копировать картинку', on_click=lambda p=path: copy_image_to_clipboard(p))
                                 ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
 
                             if os.path.splitext(path)[1].lower() in SUPPORTED_TEXTS:
@@ -1561,6 +1604,7 @@ def index_page():
 
                             with ui.context_menu():
                                 ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
+                                ui.menu_item('Копировать картинку', on_click=lambda p=path: copy_image_to_clipboard(p))
                                 ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
 
                             ui.image(f"/thumb/{safe_path}").classes('w-full h-48 object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
@@ -1621,6 +1665,7 @@ def index_page():
 
                             with ui.context_menu():
                                 ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
+                                ui.menu_item('Копировать картинку', on_click=lambda p=path: copy_image_to_clipboard(p))
                                 ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
 
                             ui.image(f"/thumb/{safe_path}").classes('w-full h-48 object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
