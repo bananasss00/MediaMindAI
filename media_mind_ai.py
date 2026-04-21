@@ -1308,9 +1308,16 @@ def index_page():
     ui.colors(primary='#2563eb', secondary='#10b981', accent='#f59e0b', dark='#1e1e2f')
     ui.query('body').classes('bg-[#121212] text-white overflow-hidden m-0 p-0')
 
-    with ui.header().classes('bg-gray-900 border-b border-gray-800 flex justify-between items-center px-4 py-2 shrink-0'):
-        ui.label('🤖 AI Media Organizer Pro').classes('text-xl font-bold tracking-wider text-blue-400')
-        ui.button(icon='settings', on_click=lambda: global_settings_dialog.open()).props('flat round dense text-color=white').tooltip('Глобальные настройки')
+    with ui.header().classes('bg-gray-900 border-b border-gray-800 flex justify-between items-center px-4 py-0 shrink-0 h-[60px]'):
+        ui.label('🤖 AI Media Organizer Pro').classes('text-xl font-bold tracking-wider text-blue-400 shrink-0')
+        
+        with ui.tabs().bind_value(state, 'current_tab').classes('h-full') as tabs:
+            tab_search = ui.tab('Search', label='Умный Поиск', icon='search')
+            tab_aesthetic = ui.tab('Aesthetic', label='Оценка Эстетики', icon='star')
+            tab_nsfw = ui.tab('NSFW', label='NSFW Детектор', icon='visibility_off')
+            tab_cache = ui.tab('Cache', label='Индексатор', icon='storage')
+            
+        ui.button(icon='settings', on_click=lambda: global_settings_dialog.open()).props('flat round dense text-color=white').classes('shrink-0').tooltip('Глобальные настройки')
         
     with ui.dialog() as global_settings_dialog:
         with ui.card().classes('w-[500px] max-w-full bg-gray-900 text-white border border-gray-700'):
@@ -1393,12 +1400,6 @@ def index_page():
                 global_settings_dialog.close()
                 
             ui.button('Сохранить и закрыть', on_click=save_global_settings).classes('w-full mt-6 bg-blue-600 hover:bg-blue-500 font-bold')
-
-    with ui.tabs().classes('w-full bg-gray-900 z-10 shrink-0').bind_value(state, 'current_tab') as tabs:
-        tab_search = ui.tab('Search', label='Умный Поиск', icon='search')
-        tab_aesthetic = ui.tab('Aesthetic', label='Оценка Эстетики', icon='star')
-        tab_nsfw = ui.tab('NSFW', label='NSFW Детектор', icon='visibility_off')
-        tab_cache = ui.tab('Cache', label='Индексатор', icon='storage')
 
     with ui.right_drawer(value=False).props('width=550').classes('bg-gray-900 border-l border-gray-800 p-4 z-50 flex flex-col') as log_drawer:
         with ui.row().classes('w-full flex justify-between items-center mb-2 shrink-0'):
@@ -1964,7 +1965,7 @@ def index_page():
     with ui.tab_panels(tabs).bind_value(state, 'current_tab').classes('w-full bg-[#121212] p-0'):
         
         # ВКЛАДКА 1: ПОИСК
-        with ui.tab_panel(tab_search).classes('w-full h-[calc(100vh-180px)] p-4 flex flex-row flex-nowrap items-stretch gap-4'):
+        with ui.tab_panel(tab_search).classes('w-full h-[calc(100vh-115px)] p-4 flex flex-row flex-nowrap items-stretch gap-4'):
             with ui.column().classes('w-[350px] shrink-0 bg-gray-900 rounded-xl border border-gray-800 shadow-lg flex flex-col overflow-hidden p-0 gap-0'):
                 with ui.row().classes('w-full p-4 pb-2 shrink-0 border-b border-gray-800 bg-gray-900 z-10'):
                     ui.label('Параметры поиска').classes('text-lg font-bold')
@@ -2092,7 +2093,7 @@ def index_page():
                 search_gallery_ui()
 
         # ВКЛАДКА 2: ЭСТЕТИКА
-        with ui.tab_panel(tab_aesthetic).classes('w-full h-[calc(100vh-180px)] p-4 flex flex-row flex-nowrap items-stretch gap-4'):
+        with ui.tab_panel(tab_aesthetic).classes('w-full h-[calc(100vh-115px)] p-4 flex flex-row flex-nowrap items-stretch gap-4'):
             with ui.column().classes('w-[350px] shrink-0 bg-gray-900 rounded-xl border border-gray-800 shadow-lg flex flex-col overflow-hidden p-0 gap-0'):
                 with ui.row().classes('w-full p-4 pb-2 shrink-0 border-b border-gray-800 bg-gray-900 z-10'):
                     ui.label('Оценка Эстетики').classes('text-lg font-bold')
@@ -2202,7 +2203,7 @@ def index_page():
                 aesthetic_gallery_ui()
 
         # ВКЛАДКА 3: NSFW
-        with ui.tab_panel(tab_nsfw).classes('w-full h-[calc(100vh-180px)] p-4 flex flex-row flex-nowrap items-stretch gap-4'):
+        with ui.tab_panel(tab_nsfw).classes('w-full h-[calc(100vh-115px)] p-4 flex flex-row flex-nowrap items-stretch gap-4'):
             with ui.column().classes('w-[350px] shrink-0 bg-gray-900 rounded-xl border border-gray-800 shadow-lg flex flex-col overflow-hidden p-0 gap-0'):
                 with ui.row().classes('w-full p-4 pb-2 shrink-0 border-b border-gray-800 bg-gray-900 z-10'):
                     ui.label('NSFW Детектор').classes('text-lg font-bold')
@@ -2287,7 +2288,7 @@ def index_page():
                 nsfw_gallery_ui()
 
         # ВКЛАДКА 4: ИНДЕКСАТОР (Кэш)
-        with ui.tab_panel(tab_cache).classes('w-full h-[calc(100vh-180px)] p-8 flex flex-col items-center overflow-y-auto pb-24'):
+        with ui.tab_panel(tab_cache).classes('w-full h-[calc(100vh-115px)] p-8 flex flex-col items-center overflow-y-auto pb-24'):
             with ui.card().classes('w-full max-w-[600px] p-6 flex flex-col gap-4 bg-gray-900 border border-gray-800 shrink-0 mb-12 mt-4'):
                 ui.label('Массовая Индексация (Предкэширование)').classes('text-xl font-bold text-blue-400')
                 ui.label('Используйте это, чтобы заранее проанализировать всю папку без необходимости выполнять сам поиск. Это сохранит все нейросетевые признаки в базу данных.').classes('text-gray-400 text-sm')
