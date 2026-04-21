@@ -39,7 +39,7 @@ if not exist ".venv\Scripts\python.exe" (
     echo[5/5] Подготовка конфигурации...
     if not exist ".env" (
         echo # Конфигурация AI Media Organizer Pro > .env
-        echo HF_TOKEN=hf_ВАШ_ТОКЕН_ЗДЕСЬ >> .env
+        echo # HF_TOKEN=hf_ВАШ_ТОКЕН_ЗДЕСЬ >> .env
         echo PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True >> .env
         echo. >> .env
         echo # Если SageAttention требует CUDA Toolkit 13, укажите путь к папке ^(без кавычек^) >> .env
