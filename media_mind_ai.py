@@ -1,10 +1,22 @@
+import os
+
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    
+    env_path = '.env'
+    if os.path.exists(env_path):
+        for enc in['utf-8', 'cp1251', 'utf-8-sig', 'utf-16']:
+            try:
+                load_dotenv(dotenv_path=env_path, encoding=enc)
+                break
+            except UnicodeDecodeError:
+                continue
+    else:
+        load_dotenv()
+
 except ImportError:
     pass
 
-import os
 import argparse
 import sys
 import asyncio
