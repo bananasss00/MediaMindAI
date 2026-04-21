@@ -1038,6 +1038,10 @@ class AppState:
         self.aes_base_dir = ""
         self.nsfw_base_dir = ""
         
+        self.search_res_filter = 'Все'
+        self.aes_res_filter = 'Все'
+        self.nsfw_res_filter = 'Все'
+        
         self.viewer_open = False
         self.viewer_items =[]
         self.viewer_index = 0
@@ -1365,9 +1369,19 @@ def index_page():
         items = state.search_results if tab == 'search' else (state.aesthetic_results if tab == 'aes' else state.nsfw_results)
         for item in items:
             path = item[1]
-            if tab == 'search': label_text = f"Score: {item[0]:.3f}"
-            elif tab == 'aes': label_text = f"★ {item[0]:.2f} (Пик: {item[2]:.2f})"
-            elif tab == 'nsfw': label_text = f"🚨 Danger: {item[0]*100:.1f}% | {item[2].upper()}"
+            
+            if tab == 'search':
+                if state.search_res_filter == 'Картинки' and not path.lower().endswith(SUPPORTED_IMAGES): continue
+                if state.search_res_filter == 'Видео' and not path.lower().endswith(SUPPORTED_VIDEOS): continue
+                label_text = f"Score: {item[0]:.3f}"
+            elif tab == 'aes':
+                if state.aes_res_filter == 'Картинки' and not path.lower().endswith(SUPPORTED_IMAGES): continue
+                if state.aes_res_filter == 'Видео' and not path.lower().endswith(SUPPORTED_VIDEOS): continue
+                label_text = f"★ {item[0]:.2f} (Пик: {item[2]:.2f})"
+            elif tab == 'nsfw':
+                if state.nsfw_res_filter == 'Картинки' and not path.lower().endswith(SUPPORTED_IMAGES): continue
+                if state.nsfw_res_filter == 'Видео' and not path.lower().endswith(SUPPORTED_VIDEOS): continue
+                label_text = f"🚨 Danger: {item[0]*100:.1f}% | {item[2].upper()}"
                 
             uri = Path(path).absolute().as_uri()
             ext = os.path.splitext(path)[1].lower()
@@ -1508,13 +1522,22 @@ def index_page():
 
     def set_all(tab, value):
         if tab == 'search':
-            for p in state.sel_search: state.sel_search[p] = value
+            for _, p in state.search_results:
+                if state.search_res_filter == 'Картинки' and not p.lower().endswith(SUPPORTED_IMAGES): continue
+                if state.search_res_filter == 'Видео' and not p.lower().endswith(SUPPORTED_VIDEOS): continue
+                if p in state.sel_search: state.sel_search[p] = value
             search_gallery_ui.refresh()
         elif tab == 'aes':
-            for p in state.sel_aes: state.sel_aes[p] = value
+            for _, p, _ in state.aesthetic_results:
+                if state.aes_res_filter == 'Картинки' and not p.lower().endswith(SUPPORTED_IMAGES): continue
+                if state.aes_res_filter == 'Видео' and not p.lower().endswith(SUPPORTED_VIDEOS): continue
+                if p in state.sel_aes: state.sel_aes[p] = value
             aesthetic_gallery_ui.refresh()
         elif tab == 'nsfw':
-            for p in state.sel_nsfw: state.sel_nsfw[p] = value
+            for _, p, _, _ in state.nsfw_results:
+                if state.nsfw_res_filter == 'Картинки' and not p.lower().endswith(SUPPORTED_IMAGES): continue
+                if state.nsfw_res_filter == 'Видео' and not p.lower().endswith(SUPPORTED_VIDEOS): continue
+                if p in state.sel_nsfw: state.sel_nsfw[p] = value
             nsfw_gallery_ui.refresh()
 
     # --- КОМПОНЕНТЫ ГАЛЕРЕИ ---
@@ -1523,9 +1546,23 @@ def index_page():
         if not state.search_results:
             return ui.label("Здесь появятся результаты...").classes("text-gray-400 m-4")
 
-        total_pages = max(1, (len(state.search_results) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+        filtered_results = []
+        for item in state.search_results:
+            p = item[1].lower()
+            if state.search_res_filter == 'Картинки' and not p.endswith(SUPPORTED_IMAGES): continue
+            if state.search_res_filter == 'Видео' and not p.endswith(SUPPORTED_VIDEOS): continue
+            filtered_results.append(item)
+
+        total_pages = max(1, (len(filtered_results) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+        if state.search_page > total_pages: state.search_page = 1
+
         def change_page(d):
             state.search_page = max(1, min(total_pages, state.search_page + d))
+            search_gallery_ui.refresh()
+
+        def apply_filter(e):
+            state.search_res_filter = e.value
+            state.search_page = 1
             search_gallery_ui.refresh()
 
         def render_pagination():
@@ -1541,6 +1578,7 @@ def index_page():
                     with ui.row().classes('gap-2 items-center'):
                         ui.button('Выбрать всё', on_click=lambda: set_all('search', True)).props('outline color=white dense')
                         ui.button('Снять всё', on_click=lambda: set_all('search', False)).props('outline color=white dense')
+                        ui.toggle(['Все', 'Картинки', 'Видео'], value=state.search_res_filter, on_change=apply_filter).classes('text-xs ml-2')
                     with ui.row().classes('gap-2 items-center'):
                         ui.button('HTML Экспорт', icon='html', on_click=lambda: export_html_action('search')).props('color=purple dense outline')
                         ui.button('Копировать ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'search', chk_prefix_search.value)).props('color=blue dense')
@@ -1552,8 +1590,11 @@ def index_page():
             scroll_id = 'search_scroll_area'
             with ui.column().classes('w-full flex-1 overflow-y-auto p-4 relative').props(f'id="{scroll_id}"'):
                 start_idx = (state.search_page - 1) * ITEMS_PER_PAGE
-                page_items = state.search_results[start_idx : start_idx + ITEMS_PER_PAGE]
-                all_paths =[p for s, p in state.search_results]
+                page_items = filtered_results[start_idx : start_idx + ITEMS_PER_PAGE]
+                all_paths =[p for s, p in filtered_results]
+
+                if not page_items:
+                    ui.label("Нет файлов, подходящих под выбранный фильтр.").classes("text-gray-400 m-4")
 
                 with ui.grid(columns=4).classes('w-full gap-6 pb-10'):
                     for score, path in page_items:
@@ -1587,9 +1628,23 @@ def index_page():
         if not state.aesthetic_results:
             return ui.label("Здесь появятся топовые фото/видео...").classes("text-gray-400 m-4")
 
-        total_pages = max(1, (len(state.aesthetic_results) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+        filtered_results = []
+        for item in state.aesthetic_results:
+            p = item[1].lower()
+            if state.aes_res_filter == 'Картинки' and not p.endswith(SUPPORTED_IMAGES): continue
+            if state.aes_res_filter == 'Видео' and not p.endswith(SUPPORTED_VIDEOS): continue
+            filtered_results.append(item)
+
+        total_pages = max(1, (len(filtered_results) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+        if state.aes_page > total_pages: state.aes_page = 1
+
         def change_page(d):
             state.aes_page = max(1, min(total_pages, state.aes_page + d))
+            aesthetic_gallery_ui.refresh()
+
+        def apply_filter(e):
+            state.aes_res_filter = e.value
+            state.aes_page = 1
             aesthetic_gallery_ui.refresh()
 
         def render_pagination():
@@ -1602,10 +1657,11 @@ def index_page():
             # Фиксированная верхняя панель (Панель управления + Пагинатор)
             with ui.column().classes('w-full shrink-0 bg-gray-900 p-4 pb-2 border-b border-gray-800 z-20 gap-0 shadow-md'):
                 with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
-                    with ui.row().classes('gap-2'):
+                    with ui.row().classes('gap-2 items-center'):
                         ui.button('Выбрать всё', on_click=lambda: set_all('aes', True)).props('outline color=white dense')
                         ui.button('Снять всё', on_click=lambda: set_all('aes', False)).props('outline color=white dense')
-                    with ui.row().classes('gap-2'):
+                        ui.toggle(['Все', 'Картинки', 'Видео'], value=state.aes_res_filter, on_change=apply_filter).classes('text-xs ml-2')
+                    with ui.row().classes('gap-2 items-center'):
                         ui.button('HTML Экспорт', icon='html', on_click=lambda: export_html_action('aes')).props('color=purple dense outline')
                         ui.button('Копировать ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'aes', chk_prefix_aes.value)).props('color=yellow-800 dense')
                         ui.button('Переместить ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'aes', chk_prefix_aes.value)).props('color=red dense')
@@ -1616,8 +1672,11 @@ def index_page():
             scroll_id = 'aes_scroll_area'
             with ui.column().classes('w-full flex-1 overflow-y-auto p-4 relative').props(f'id="{scroll_id}"'):
                 start_idx = (state.aes_page - 1) * ITEMS_PER_PAGE
-                page_items = state.aesthetic_results[start_idx : start_idx + ITEMS_PER_PAGE]
-                all_paths =[p for a, p, m in state.aesthetic_results]
+                page_items = filtered_results[start_idx : start_idx + ITEMS_PER_PAGE]
+                all_paths =[p for a, p, m in filtered_results]
+
+                if not page_items:
+                    ui.label("Нет файлов, подходящих под выбранный фильтр.").classes("text-gray-400 m-4")
 
                 with ui.grid(columns=4).classes('w-full gap-6 pb-10'):
                     for avg_score, path, max_score in page_items:
@@ -1648,9 +1707,23 @@ def index_page():
         if not state.nsfw_results:
             return ui.label("Здесь появятся результаты NSFW сканирования...").classes("text-gray-400 m-4")
 
-        total_pages = max(1, (len(state.nsfw_results) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+        filtered_results =[]
+        for item in state.nsfw_results:
+            p = item[1].lower()
+            if state.nsfw_res_filter == 'Картинки' and not p.endswith(SUPPORTED_IMAGES): continue
+            if state.nsfw_res_filter == 'Видео' and not p.endswith(SUPPORTED_VIDEOS): continue
+            filtered_results.append(item)
+
+        total_pages = max(1, (len(filtered_results) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+        if state.nsfw_page > total_pages: state.nsfw_page = 1
+
         def change_page(d):
             state.nsfw_page = max(1, min(total_pages, state.nsfw_page + d))
+            nsfw_gallery_ui.refresh()
+
+        def apply_filter(e):
+            state.nsfw_res_filter = e.value
+            state.nsfw_page = 1
             nsfw_gallery_ui.refresh()
 
         def render_pagination():
@@ -1663,10 +1736,11 @@ def index_page():
             # Фиксированная верхняя панель (Панель управления + Пагинатор)
             with ui.column().classes('w-full shrink-0 bg-gray-900 p-4 pb-2 border-b border-gray-800 z-20 gap-0 shadow-md'):
                 with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
-                    with ui.row().classes('gap-2'):
+                    with ui.row().classes('gap-2 items-center'):
                         ui.button('Выбрать всё', on_click=lambda: set_all('nsfw', True)).props('outline color=white dense')
                         ui.button('Снять всё', on_click=lambda: set_all('nsfw', False)).props('outline color=white dense')
-                    with ui.row().classes('gap-2'):
+                        ui.toggle(['Все', 'Картинки', 'Видео'], value=state.nsfw_res_filter, on_change=apply_filter).classes('text-xs ml-2')
+                    with ui.row().classes('gap-2 items-center'):
                         ui.button('HTML Экспорт', icon='html', on_click=lambda: export_html_action('nsfw')).props('color=purple dense outline')
                         ui.button('Копировать ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'nsfw', chk_prefix_nsfw.value)).props('color=red-800 dense')
                         ui.button('Переместить ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'nsfw', chk_prefix_nsfw.value)).props('color=red dense')
@@ -1677,8 +1751,11 @@ def index_page():
             scroll_id = 'nsfw_scroll_area'
             with ui.column().classes('w-full flex-1 overflow-y-auto p-4 relative').props(f'id="{scroll_id}"'):
                 start_idx = (state.nsfw_page - 1) * ITEMS_PER_PAGE
-                page_items = state.nsfw_results[start_idx : start_idx + ITEMS_PER_PAGE]
-                all_paths =[p for d, p, l, dt in state.nsfw_results]
+                page_items = filtered_results[start_idx : start_idx + ITEMS_PER_PAGE]
+                all_paths =[p for d, p, l, dt in filtered_results]
+
+                if not page_items:
+                    ui.label("Нет файлов, подходящих под выбранный фильтр.").classes("text-gray-400 m-4")
 
                 with ui.grid(columns=4).classes('w-full gap-6 pb-10'):
                     for danger_score, path, top_label, details in page_items:
