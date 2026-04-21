@@ -1057,6 +1057,7 @@ class AppState:
         # Глобальные настройки
         self.nsfw_threshold = 0.45
         self.flatten_structure = False
+        self.grid_columns = 4
 
     def add_log(self, msg):
         ts = datetime.datetime.now().strftime("%H:%M:%S")
@@ -1179,6 +1180,7 @@ def index_page():
     cfg = load_config()
     state.nsfw_threshold = float(cfg.get('nsfw_threshold', 0.45))
     state.flatten_structure = bool(cfg.get('flatten_structure', False))
+    state.grid_columns = int(cfg.get('grid_columns', 4))
 
     def cancel_all_tasks():
         if state.is_processing:
@@ -1200,14 +1202,19 @@ def index_page():
             ui.label('Глобальные настройки').classes('text-xl font-bold mb-4 text-blue-400')
             
             ui.number('Порог опасности NSFW (0.0 - 1.0)', value=state.nsfw_threshold, min=0.0, max=1.0, step=0.01, format='%.2f').bind_value(state, 'nsfw_threshold').classes('w-full')
-            ui.checkbox('Копировать/Перемещать без структуры папок (в корень)', value=state.flatten_structure).bind_value(state, 'flatten_structure').classes('w-full mt-2')
+            ui.number('Колонок в сетке (чем больше - тем меньше плитки)', value=state.grid_columns, min=1, max=12, format='%d').bind_value(state, 'grid_columns').classes('w-full mt-2')
             
             def save_global_settings():
+                state.grid_columns = int(state.grid_columns)
                 save_config({
                     'nsfw_threshold': state.nsfw_threshold,
-                    'flatten_structure': state.flatten_structure
+                    'flatten_structure': state.flatten_structure,
+                    'grid_columns': state.grid_columns
                 })
                 ui.notify('Глобальные настройки сохранены', type='positive')
+                search_gallery_ui.refresh()
+                aesthetic_gallery_ui.refresh()
+                nsfw_gallery_ui.refresh()
                 global_settings_dialog.close()
                 
             ui.button('Сохранить', on_click=save_global_settings).classes('w-full mt-6 bg-blue-600 hover:bg-blue-500 font-bold')
@@ -1596,7 +1603,7 @@ def index_page():
                 if not page_items:
                     ui.label("Нет файлов, подходящих под выбранный фильтр.").classes("text-gray-400 m-4")
 
-                with ui.grid(columns=4).classes('w-full gap-6 pb-10'):
+                with ui.grid(columns=int(state.grid_columns)).classes('w-full gap-6 pb-10'):
                     for score, path in page_items:
                         safe_path = urllib.parse.quote(path)
                         global_index = all_paths.index(path) # Вычисляем индекс ЗДЕСЬ
@@ -1678,7 +1685,7 @@ def index_page():
                 if not page_items:
                     ui.label("Нет файлов, подходящих под выбранный фильтр.").classes("text-gray-400 m-4")
 
-                with ui.grid(columns=4).classes('w-full gap-6 pb-10'):
+                with ui.grid(columns=int(state.grid_columns)).classes('w-full gap-6 pb-10'):
                     for avg_score, path, max_score in page_items:
                         safe_path = urllib.parse.quote(path)
                         global_index = all_paths.index(path) # Вычисляем индекс ЗДЕСЬ
@@ -1757,7 +1764,7 @@ def index_page():
                 if not page_items:
                     ui.label("Нет файлов, подходящих под выбранный фильтр.").classes("text-gray-400 m-4")
 
-                with ui.grid(columns=4).classes('w-full gap-6 pb-10'):
+                with ui.grid(columns=int(state.grid_columns)).classes('w-full gap-6 pb-10'):
                     for danger_score, path, top_label, details in page_items:
                         safe_path = urllib.parse.quote(path)
                         global_index = all_paths.index(path) # Вычисляем индекс ЗДЕСЬ
