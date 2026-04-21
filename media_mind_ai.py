@@ -1787,9 +1787,9 @@ def index_page():
                                 ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
 
                             if os.path.splitext(path)[1].lower() in SUPPORTED_TEXTS:
-                                ui.icon('article', size='4rem').classes('w-full h-48 flex items-center justify-center bg-gray-900 cursor-pointer text-gray-500').on('click', lambda p=path: open_file_native(p))
+                                ui.icon('article', size='4rem').classes('w-full aspect-square flex items-center justify-center bg-gray-900 cursor-pointer text-gray-500').on('click', lambda p=path: open_file_native(p))
                             else:
-                                ui.image(f"/thumb/{safe_path}").classes('w-full h-48 object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
+                                ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
                             
                             with ui.row().classes('w-full justify-between items-center p-2 bg-gray-800'):
                                 ui.label(f"Score: {score:.3f}").classes('text-green-400 font-bold text-sm')
@@ -1868,7 +1868,7 @@ def index_page():
                                 ui.menu_item('Копировать картинку', on_click=lambda p=path: copy_image_to_clipboard(p))
                                 ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
 
-                            ui.image(f"/thumb/{safe_path}").classes('w-full h-48 object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
+                            ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
                             
                             with ui.row().classes('w-full justify-between items-center p-2'):
                                 ui.label(f"★ {avg_score:.2f}").classes('text-yellow-400 font-bold text-lg')
@@ -1947,7 +1947,7 @@ def index_page():
                                 ui.menu_item('Копировать картинку', on_click=lambda p=path: copy_image_to_clipboard(p))
                                 ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
 
-                            ui.image(f"/thumb/{safe_path}").classes('w-full h-48 object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
+                            ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
                             
                             with ui.row().classes('w-full justify-between items-center p-2'):
                                 ui.label(f"🚨 {danger_score*100:.1f}%").classes('text-red-500 font-bold text-lg')
