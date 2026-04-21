@@ -1259,30 +1259,44 @@ def copy_image_to_clipboard(path):
         
     try:
         if os.name == 'nt':
+            import ctypes
+            from PIL import Image
+            import io
+            
+            # Читаем любую картинку через PIL (отлично понимает webp)
+            img = Image.open(path).convert('RGB')
+            output = io.BytesIO()
+            img.save(output, 'BMP')
+            data = output.getvalue()[14:] # Пропускаем 14 байт заголовка BMP-файла
+            output.close()
+            
+            # Используем встроенный ctypes для прямого доступа к API Windows
+            CF_DIB = 8
+            GMEM_MOVEABLE = 0x0002
+            
+            hGlobalMem = ctypes.windll.kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+            lpGlobalMem = ctypes.windll.kernel32.GlobalLock(hGlobalMem)
+            ctypes.memmove(lpGlobalMem, data, len(data))
+            ctypes.windll.kernel32.GlobalUnlock(hGlobalMem)
+            
+            if not ctypes.windll.user32.OpenClipboard(0):
+                raise Exception("Буфер обмена занят другим процессом")
+                
             try:
-                import win32clipboard
-                from PIL import Image
-                import io
-                img = Image.open(path).convert('RGB')
-                output = io.BytesIO()
-                img.save(output, 'BMP')
-                data = output.getvalue()[14:]
-                output.close()
-                win32clipboard.OpenClipboard()
-                win32clipboard.EmptyClipboard()
-                win32clipboard.SetClipboardData(win32clipboard.CF_DIB, data)
-                win32clipboard.CloseClipboard()
-            except ImportError:
-                # Фоллбэк на PowerShell, если pywin32 не установлен
-                abs_path = os.path.abspath(path).replace("'", "''")
-                cmd = f"Add-Type -AssemblyName System.Windows.Forms;[System.Windows.Forms.Clipboard]::SetImage([System.Drawing.Image]::FromFile('{abs_path}'))"
-                creationflags = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
-                subprocess.run(['powershell', '-command', cmd], creationflags=creationflags)
+                ctypes.windll.user32.EmptyClipboard()
+                ctypes.windll.user32.SetClipboardData(CF_DIB, hGlobalMem)
+            finally:
+                ctypes.windll.user32.CloseClipboard()
+                
         elif sys.platform == 'darwin':
             abs_path = os.path.abspath(path)
             subprocess.run(['osascript', '-e', f'set the clipboard to (read (POSIX file "{abs_path}") as JPEG picture)'])
         else:
-            subprocess.run(['xclip', '-selection', 'clipboard', '-t', 'image/png', '-i', path])
+            import mimetypes
+            mimetype, _ = mimetypes.guess_type(path)
+            if not mimetype: mimetype = 'image/png'
+            subprocess.run(['xclip', '-selection', 'clipboard', '-t', mimetype, '-i', path])
+            
         ui.notify('Картинка скопирована в буфер обмена!', type='positive')
     except Exception as e:
         ui.notify(f'Ошибка копирования в буфер: {e}', type='negative')
