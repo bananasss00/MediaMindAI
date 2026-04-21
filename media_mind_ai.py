@@ -1339,6 +1339,7 @@ def index_page():
             
             ui.number('Порог опасности NSFW (0.0 - 1.0)', value=state.nsfw_threshold, min=0.0, max=1.0, step=0.01, format='%.2f').bind_value(state, 'nsfw_threshold').classes('w-full')
             ui.number('Колонок в сетке (чем больше - тем меньше плитки)', value=state.grid_columns, min=1, max=12, format='%d').bind_value(state, 'grid_columns').classes('w-full mt-2')
+            ui.checkbox('Копировать/Перемещать без структуры папок (в одну директорию)', value=state.flatten_structure).bind_value(state, 'flatten_structure').classes('w-full mt-2')
             
             # --- УПРАВЛЕНИЕ КЭШЕМ ---
             ui.label('Управление базой данных и кэшем').classes('text-lg font-bold mt-6 mb-2 text-red-400')
