@@ -1463,13 +1463,10 @@ def index_page():
         path = state.viewer_items[state.viewer_index]
         if state.current_tab == 'Search' and path in state.sel_search:
             state.sel_search[path] = not state.sel_search[path]
-            search_gallery_ui.refresh()
         elif state.current_tab == 'Aesthetic' and path in state.sel_aes:
             state.sel_aes[path] = not state.sel_aes[path]
-            aesthetic_gallery_ui.refresh()
         elif state.current_tab == 'NSFW' and path in state.sel_nsfw:
             state.sel_nsfw[path] = not state.sel_nsfw[path]
-            nsfw_gallery_ui.refresh()
         update_viewer_selection_ui()
 
     def download_current_item():
@@ -1708,19 +1705,16 @@ def index_page():
                 if state.search_res_filter == 'Картинки' and not p.lower().endswith(SUPPORTED_IMAGES): continue
                 if state.search_res_filter == 'Видео' and not p.lower().endswith(SUPPORTED_VIDEOS): continue
                 if p in state.sel_search: state.sel_search[p] = value
-            search_gallery_ui.refresh()
         elif tab == 'aes':
             for _, p, _ in state.aesthetic_results:
                 if state.aes_res_filter == 'Картинки' and not p.lower().endswith(SUPPORTED_IMAGES): continue
                 if state.aes_res_filter == 'Видео' and not p.lower().endswith(SUPPORTED_VIDEOS): continue
                 if p in state.sel_aes: state.sel_aes[p] = value
-            aesthetic_gallery_ui.refresh()
         elif tab == 'nsfw':
             for _, p, _, _ in state.nsfw_results:
                 if state.nsfw_res_filter == 'Картинки' and not p.lower().endswith(SUPPORTED_IMAGES): continue
                 if state.nsfw_res_filter == 'Видео' and not p.lower().endswith(SUPPORTED_VIDEOS): continue
                 if p in state.sel_nsfw: state.sel_nsfw[p] = value
-            nsfw_gallery_ui.refresh()
 
     # --- КОМПОНЕНТЫ ГАЛЕРЕИ ---
     @ui.refreshable
