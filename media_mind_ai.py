@@ -242,6 +242,50 @@ class DatabaseCache:
         res = c.fetchone()
         return res[0] if res and res[0] is not None else -1.0  # -1.0 означает, что файла нет в базе
 
+    def get_all_models(self):
+        c = self.conn.cursor()
+        models = set()
+        for table in['emb_cache', 'rerank_cache_v2', 'aes_cache', 'sim_cache', 'nsfw_cache']:
+            try:
+                c.execute(f"SELECT DISTINCT model FROM {table}")
+                models.update([r[0] for r in c.fetchall() if r[0]])
+            except: pass
+        return list(models)
+
+    def clear_model_cache(self, model_name=None):
+        c = self.conn.cursor()
+        tables =['emb_cache', 'rerank_cache_v2', 'aes_cache', 'sim_cache', 'nsfw_cache']
+        if model_name:
+            for table in tables:
+                c.execute(f"DELETE FROM {table} WHERE model=?", (model_name,))
+        else:
+            for table in tables:
+                c.execute(f"DELETE FROM {table}")
+        self.conn.commit()
+        self.conn.execute("VACUUM") # Автоматически сжимаем файл БД и освобождаем место на диске
+
+    def get_all_paths(self):
+        c = self.conn.cursor()
+        paths = set()
+        for table in ['emb_cache', 'aes_cache', 'nsfw_cache']:
+            try:
+                c.execute(f"SELECT DISTINCT path FROM {table}")
+                paths.update([r[0] for r in c.fetchall() if r[0]])
+            except: pass
+        return list(paths)
+
+    def remove_paths(self, paths_to_remove):
+        if not paths_to_remove: return
+        c = self.conn.cursor()
+        tables =['emb_cache', 'rerank_cache_v2', 'aes_cache', 'sim_cache', 'nsfw_cache']
+        chunk_size = 900
+        for i in range(0, len(paths_to_remove), chunk_size):
+            chunk = paths_to_remove[i:i+chunk_size]
+            placeholders = ','.join(['?'] * len(chunk))
+            for table in tables:
+                c.execute(f"DELETE FROM {table} WHERE path IN ({placeholders})", chunk)
+        self.conn.commit()
+
     def close(self): self.conn.close()
 
 class FilesCache:
@@ -377,6 +421,7 @@ class SearchEngine:
 
     def _apply_quantization(self, kwargs):
         if self.quant_mode != "None" and self.device == "cuda":
+            kwargs["device_map"] = {"": self.device}
             try:
                 from transformers import BitsAndBytesConfig
                 if self.quant_mode == "8-bit":
@@ -705,22 +750,55 @@ class AestheticEngine:
         self.batch_size = 16
         self.max_dim = 512
         self.video_frames = 4
+        self.quant_mode = "None"
+        self.current_model_state = None
 
     def load_model(self):
-        if self.model is None:
+        current_state = f"v2_5_{self.quant_mode}"
+        if self.model is None or self.current_model_state != current_state:
+            self.unload()
             state.add_log(f"Загрузка модели Aesthetic Predictor на {self.device}...")
             # Принудительная скачка модели в локальную папку моделей
             kwargs = {
                 "low_cpu_mem_usage": True, 
                 "trust_remote_code": True,
-                "cache_dir": os.path.join(current_dir, "models")
+                "cache_dir": os.path.join(current_dir, "models"),
+                "torch_dtype": self.dtype
             }
             if self.device == "cuda":
                 kwargs["attn_implementation"] = "sdpa"
                 
+            if self.quant_mode != "None" and self.device == "cuda":
+                kwargs["device_map"] = {"": self.device}
+                try:
+                    from transformers import BitsAndBytesConfig
+                    # Игнорируем кастомную голову 'layers', так как она грузится отдельно через load_state_dict
+                    bnb_kwargs = {"llm_int8_skip_modules": ["layers"]} 
+                    
+                    if self.quant_mode == "8-bit":
+                        kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True, **bnb_kwargs)
+                    elif self.quant_mode == "4-bit":
+                        kwargs["quantization_config"] = BitsAndBytesConfig(
+                            load_in_4bit=True,
+                            bnb_4bit_compute_dtype=self.dtype,
+                            **bnb_kwargs
+                        )
+                except ImportError:
+                    state.add_log("⚠️ ОШИБКА: Для квантования установите пакеты: pip install bitsandbytes accelerate")
+                
             self.model, self.preprocessor = convert_v2_5_from_siglip(**kwargs)
-            self.model = self.model.to(self.dtype).to(self.device)
+            
+            if self.quant_mode == "None":
+                self.model = self.model.to(self.dtype).to(self.device)
+            else:
+                # Перекидываем пропущенную голову в нужный формат вручную
+                if hasattr(self.model, "layers"):
+                    self.model.layers.to(self.dtype).to(self.device)
+                elif hasattr(self.model, "mlp"):
+                    self.model.mlp.to(self.dtype).to(self.device)
+                
             self.model.eval()
+            self.current_model_state = current_state
 
     def unload(self):
         if self.model is not None:
@@ -729,6 +807,7 @@ class AestheticEngine:
             del self.preprocessor
             self.model = None
             self.preprocessor = None
+            self.current_model_state = None
             gc.collect()
             if torch.cuda.is_available(): torch.cuda.empty_cache()
 
@@ -856,9 +935,12 @@ class NsfwEngine:
         self.batch_size = 16
         self.max_dim = 512
         self.video_frames = 4
+        self.quant_mode = "None"
+        self.current_model_state = None
 
     def load_model(self, model_name):
-        if self.model is None or self.current_model_name != model_name:
+        current_state = f"{model_name}_{self.quant_mode}"
+        if self.model is None or self.current_model_state != current_state:
             self.unload()
             state.add_log(f"Загрузка NSFW модели {model_name} на {self.device}...")
             
@@ -878,14 +960,34 @@ class NsfwEngine:
                                 except Exception as e:
                                     state.add_log(f"Не удалось удалить {item}: {e}")
             
+            kwargs = {
+                "torch_dtype": self.dtype,
+            }
+            if self.quant_mode != "None" and self.device == "cuda":
+                kwargs["device_map"] = {"": self.device}
+                try:
+                    from transformers import BitsAndBytesConfig
+                    if self.quant_mode == "8-bit":
+                        kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+                    elif self.quant_mode == "4-bit":
+                        kwargs["quantization_config"] = BitsAndBytesConfig(
+                            load_in_4bit=True,
+                            bnb_4bit_compute_dtype=self.dtype
+                        )
+                except ImportError:
+                    state.add_log("⚠️ ОШИБКА: Для квантования установите пакеты: pip install bitsandbytes accelerate")
+
             self.processor = AutoImageProcessor.from_pretrained(local_dir)
             if "siglip" in model_name.lower():
-                self.model = SiglipForImageClassification.from_pretrained(local_dir)
+                self.model = SiglipForImageClassification.from_pretrained(local_dir, **kwargs)
             else:
-                self.model = AutoModelForImageClassification.from_pretrained(local_dir)
-            self.model.to(self.dtype).to(self.device)
+                self.model = AutoModelForImageClassification.from_pretrained(local_dir, **kwargs)
+                
+            if self.quant_mode == "None":
+                self.model.to(self.dtype).to(self.device)
             self.model.eval()
             self.current_model_name = model_name
+            self.current_model_state = current_state
 
     def unload(self):
         if self.model is not None:
@@ -895,6 +997,7 @@ class NsfwEngine:
             self.model = None
             self.processor = None
             self.current_model_name = None
+            self.current_model_state = None
             gc.collect()
             if torch.cuda.is_available(): torch.cuda.empty_cache()
 
@@ -1210,12 +1313,72 @@ def index_page():
         ui.button(icon='settings', on_click=lambda: global_settings_dialog.open()).props('flat round dense text-color=white').tooltip('Глобальные настройки')
         
     with ui.dialog() as global_settings_dialog:
-        with ui.card().classes('w-[450px] max-w-full bg-gray-900 text-white border border-gray-700'):
-            ui.label('Глобальные настройки').classes('text-xl font-bold mb-4 text-blue-400')
+        with ui.card().classes('w-[500px] max-w-full bg-gray-900 text-white border border-gray-700'):
+            ui.label('Глобальные настройки').classes('text-xl font-bold mb-2 text-blue-400')
             
             ui.number('Порог опасности NSFW (0.0 - 1.0)', value=state.nsfw_threshold, min=0.0, max=1.0, step=0.01, format='%.2f').bind_value(state, 'nsfw_threshold').classes('w-full')
             ui.number('Колонок в сетке (чем больше - тем меньше плитки)', value=state.grid_columns, min=1, max=12, format='%d').bind_value(state, 'grid_columns').classes('w-full mt-2')
             
+            # --- УПРАВЛЕНИЕ КЭШЕМ ---
+            ui.label('Управление базой данных и кэшем').classes('text-lg font-bold mt-6 mb-2 text-red-400')
+            
+            with ui.row().classes('w-full gap-2 items-center'):
+                model_to_clear = ui.select(['Все модели'], value='Все модели', label='Выберите модель для очистки').classes('flex-grow')
+                
+                def clear_selected_model():
+                    if model_to_clear.value == 'Все модели':
+                        search_engine.db_cache.clear_model_cache(None)
+                        ui.notify("База данных ПОЛНОСТЬЮ очищена и сжата!", type="positive")
+                    else:
+                        search_engine.db_cache.clear_model_cache(model_to_clear.value)
+                        ui.notify(f"Кэш модели {model_to_clear.value} очищен!", type="positive")
+                    refresh_models_list()
+
+                ui.button(icon='delete_forever', on_click=clear_selected_model).props('color=red').tooltip('Очистить БД для выбранной модели')
+
+            def refresh_models_list():
+                models = search_engine.db_cache.get_all_models()
+                model_to_clear.options = ['Все модели'] + models
+                model_to_clear.value = 'Все модели'
+                model_to_clear.update()
+
+            global_settings_dialog.on('show', refresh_models_list)
+
+            async def cleanup_dead_links():
+                ui.notify("Ищем удаленные файлы... Это может занять время", type="info")
+                def task():
+                    paths = search_engine.db_cache.get_all_paths()
+                    dead =[p for p in paths if not os.path.exists(p)]
+                    if dead:
+                        search_engine.db_cache.remove_paths(dead)
+                        search_engine.db_cache.conn.execute("VACUUM")
+                    return len(dead)
+                dead_count = await run.io_bound(task)
+                if dead_count > 0:
+                    ui.notify(f"Удалено {dead_count} мертвых записей из базы!", type="positive")
+                else:
+                    ui.notify("Мертвых записей не найдено, база в порядке.", type="positive")
+
+            def cleanup_thumbnails():
+                count = 0
+                for f in os.listdir(THUMB_CACHE_DIR):
+                    try:
+                        os.remove(os.path.join(THUMB_CACHE_DIR, f))
+                        count += 1
+                    except: pass
+                ui.notify(f"Удалено {count} миниатюр", type="positive")
+
+            def cleanup_file_index():
+                search_engine.files_cache._data.clear()
+                search_engine.files_cache.save_cache()
+                ui.notify("Индекс файлов (кэш путей) сброшен", type="positive")
+
+            with ui.column().classes('w-full gap-2 mt-4'):
+                ui.button('Удалить "Мертвые души" (Файлы, которых больше нет на диске)', on_click=cleanup_dead_links).props('outline color=orange').classes('w-full')
+                with ui.row().classes('w-full gap-2'):
+                    ui.button('Очистить миниатюры', on_click=cleanup_thumbnails).props('outline color=gray').classes('flex-grow')
+                    ui.button('Сбросить индекс папок', on_click=cleanup_file_index).props('outline color=gray').classes('flex-grow')
+
             def save_global_settings():
                 state.grid_columns = int(state.grid_columns)
                 save_config({
@@ -1229,7 +1392,7 @@ def index_page():
                 nsfw_gallery_ui.refresh()
                 global_settings_dialog.close()
                 
-            ui.button('Сохранить', on_click=save_global_settings).classes('w-full mt-6 bg-blue-600 hover:bg-blue-500 font-bold')
+            ui.button('Сохранить и закрыть', on_click=save_global_settings).classes('w-full mt-6 bg-blue-600 hover:bg-blue-500 font-bold')
 
     with ui.tabs().classes('w-full bg-gray-900 z-10 shrink-0').bind_value(state, 'current_tab') as tabs:
         tab_search = ui.tab('Search', label='Умный Поиск', icon='search')
@@ -1840,7 +2003,7 @@ def index_page():
                             emb_size = ui.number('Рез. (Ф1)', value=cfg.get('emb_size', 512), format='%.0f').classes('w-[45%]')
                             rerank_size = ui.number('Рез. (Ф2)', value=cfg.get('rerank_size', 800), format='%.0f').classes('w-[45%]')
                         with ui.row().classes('w-full gap-2 px-2 pb-2'):
-                            quant_mode = ui.select(['None', '8-bit', '4-bit'], value=cfg.get('quant_mode', 'None'), label='Квант').classes('w-[45%]')
+                            search_quant_mode = ui.select(['None', '8-bit', '4-bit'], value=cfg.get('search_quant_mode', 'None'), label='Квант').classes('w-[45%]')
                             min_score = ui.number('Мин Score', value=cfg.get('min_score', 0.25), format='%.2f', step=0.05).classes('w-[45%]')
                         
                         # --- ДОБАВЛЕННЫЙ БЛОК NSFW-ФИЛЬТРА ДЛЯ ПОИСКА ---
@@ -1859,7 +2022,7 @@ def index_page():
                         'use_reranker': use_reranker.value, 'rerank_model': rerank_model.value,
                         'batch_size': batch_size.value, 'video_frames': video_frames.value,
                         'emb_size': emb_size.value, 'rerank_size': rerank_size.value,
-                        'quant_mode': quant_mode.value, 'min_score': min_score.value,
+                        'search_quant_mode': search_quant_mode.value, 'min_score': min_score.value,
                         'chk_prefix_search': chk_prefix_search.value,
                         'search_nsfw_filter': search_nsfw_filter.value, 'search_strict_nsfw': search_strict_nsfw.value
                     })
@@ -1886,7 +2049,7 @@ def index_page():
                             search_engine.video_frames = int(video_frames.value)
                             search_engine.emb_size = int(emb_size.value)
                             search_engine.rerank_size = int(rerank_size.value)
-                            search_engine.quant_mode = quant_mode.value
+                            search_engine.quant_mode = search_quant_mode.value
                             
                             state.search_base_dir = inp_dir.value
                             q_emb, q_rank = search_engine.prepare_query(inp_query.value)
@@ -1959,6 +2122,7 @@ def index_page():
                             aes_video_frames = ui.number('Кадры', value=cfg.get('aes_video_frames', 4), format='%.0f').classes('w-[45%]')
                         with ui.row().classes('w-full gap-2 px-2 pb-2'):
                             aes_max_dim = ui.number('Лимит разр.', value=cfg.get('aes_max_dim', 512), format='%.0f').classes('w-[45%]')
+                            aes_quant_mode = ui.select(['None', '8-bit', '4-bit'], value=cfg.get('aes_quant_mode', 'None'), label='Квант').classes('w-[45%]')
                             
                         # --- ДОБАВЛЕННЫЙ БЛОК NSFW-ФИЛЬТРА ДЛЯ ЭСТЕТИКИ ---
                         with ui.column().classes('w-full gap-0 px-2 pb-2 pt-2 border-t border-gray-700'):
@@ -1972,7 +2136,7 @@ def index_page():
                         'rate_dir': rate_dir.value, 'chk_img_aes': chk_img_aes.value, 'chk_vid_aes': chk_vid_aes.value,
                         'top_n_rate': top_n_rate.value, 'aes_batch_size': aes_batch_size.value, 
                         'aes_video_frames': aes_video_frames.value, 'aes_max_dim': aes_max_dim.value, 
-                        'chk_prefix_aes': chk_prefix_aes.value,
+                        'aes_quant_mode': aes_quant_mode.value, 'chk_prefix_aes': chk_prefix_aes.value,
                         'aes_nsfw_filter': aes_nsfw_filter.value, 'aes_strict_nsfw': aes_strict_nsfw.value
                     })
                     if not rate_dir.value: return ui.notify("Укажите папку!", type='warning')
@@ -1997,6 +2161,7 @@ def index_page():
                             aesthetic_engine.batch_size = int(aes_batch_size.value)
                             aesthetic_engine.video_frames = int(aes_video_frames.value)
                             aesthetic_engine.max_dim = int(aes_max_dim.value)
+                            aesthetic_engine.quant_mode = aes_quant_mode.value
                             
                             state.aes_base_dir = rate_dir.value
                             n = int(top_n_rate.value)
@@ -2069,13 +2234,15 @@ def index_page():
                             nsfw_video_frames = ui.number('Кадры', value=cfg.get('nsfw_video_frames', 4), format='%.0f').classes('w-[45%]')
                         with ui.row().classes('w-full gap-2 px-2 pb-2'):
                             nsfw_max_dim = ui.number('Лимит разр.', value=cfg.get('nsfw_max_dim', 512), format='%.0f').classes('w-[45%]')
+                            nsfw_quant_mode = ui.select(['None', '8-bit', '4-bit'], value=cfg.get('nsfw_quant_mode', 'None'), label='Квант').classes('w-[45%]')
                 
                 async def run_nsfw_action():
                     save_config({
                         'nsfw_dir': nsfw_dir.value, 'chk_img_nsfw': chk_img_nsfw.value, 'chk_vid_nsfw': chk_vid_nsfw.value,
                         'nsfw_model': nsfw_model_sel.value, 'top_n_nsfw': top_n_nsfw.value, 
                         'nsfw_batch_size': nsfw_batch_size.value, 'nsfw_video_frames': nsfw_video_frames.value, 
-                        'nsfw_max_dim': nsfw_max_dim.value, 'chk_prefix_nsfw': chk_prefix_nsfw.value
+                        'nsfw_max_dim': nsfw_max_dim.value, 'nsfw_quant_mode': nsfw_quant_mode.value,
+                        'chk_prefix_nsfw': chk_prefix_nsfw.value
                     })
                     if not nsfw_dir.value: return ui.notify("Укажите папку!", type='warning')
                     
@@ -2099,6 +2266,7 @@ def index_page():
                             nsfw_engine.batch_size = int(nsfw_batch_size.value)
                             nsfw_engine.video_frames = int(nsfw_video_frames.value)
                             nsfw_engine.max_dim = int(nsfw_max_dim.value)
+                            nsfw_engine.quant_mode = nsfw_quant_mode.value
                             
                             state.nsfw_base_dir = nsfw_dir.value
                             n = int(top_n_nsfw.value)
@@ -2143,12 +2311,18 @@ def index_page():
                 ui.label('Выберите, что кэшировать:').classes('font-bold mt-2')
                 
                 chk_cache_search = ui.checkbox('Умный Поиск (Qwen Embeddings)', value=cfg.get('chk_cache_search', True)).classes('text-md font-bold text-blue-300')
-                emb_model_cache = ui.select(['Qwen/Qwen3-VL-Embedding-2B', 'Qwen/Qwen3-VL-Embedding-8B'], value=cfg.get('emb_model', 'Qwen/Qwen3-VL-Embedding-2B')).classes('w-full pl-6').bind_visibility_from(chk_cache_search, 'value')
+                with ui.row().classes('w-full pl-6 pr-6 items-center gap-2').bind_visibility_from(chk_cache_search, 'value'):
+                    emb_model_cache = ui.select(['Qwen/Qwen3-VL-Embedding-2B', 'Qwen/Qwen3-VL-Embedding-8B'], value=cfg.get('emb_model', 'Qwen/Qwen3-VL-Embedding-2B')).classes('flex-1')
+                    cache_search_quant = ui.select(['None', '8-bit', '4-bit'], value=cfg.get('search_quant_mode', 'None'), label='Квант').classes('w-24')
                 
                 chk_cache_aes = ui.checkbox('Оценка Эстетики', value=cfg.get('chk_cache_aes', True)).classes('text-md font-bold text-yellow-300')
+                with ui.row().classes('w-full pl-6 pr-6 items-center gap-2').bind_visibility_from(chk_cache_aes, 'value'):
+                    cache_aes_quant = ui.select(['None', '8-bit', '4-bit'], value=cfg.get('aes_quant_mode', 'None'), label='Квант').classes('w-24')
                 
                 chk_cache_nsfw = ui.checkbox('NSFW Детектор', value=cfg.get('chk_cache_nsfw', True)).classes('text-md font-bold text-red-300')
-                nsfw_model_cache = ui.select(['prithivMLmods/siglip2-x256-explicit-content', 'strangerguardhf/nsfw-image-detection'], value=cfg.get('nsfw_model', 'prithivMLmods/siglip2-x256-explicit-content')).classes('w-full pl-6').bind_visibility_from(chk_cache_nsfw, 'value')
+                with ui.row().classes('w-full pl-6 pr-6 items-center gap-2').bind_visibility_from(chk_cache_nsfw, 'value'):
+                    nsfw_model_cache = ui.select(['prithivMLmods/siglip2-x256-explicit-content', 'strangerguardhf/nsfw-image-detection'], value=cfg.get('nsfw_model', 'prithivMLmods/siglip2-x256-explicit-content')).classes('flex-1')
+                    cache_nsfw_quant = ui.select(['None', '8-bit', '4-bit'], value=cfg.get('nsfw_quant_mode', 'None'), label='Квант').classes('w-24')
 
                 with ui.expansion('Единые тонкие настройки', icon='tune').classes('w-full bg-gray-800/50 rounded-lg border border-gray-700 mt-4'):
                     with ui.row().classes('w-full gap-4 px-4 pt-4'):
@@ -2174,6 +2348,8 @@ def index_page():
                         'chk_cache_vid': chk_cache_vid.value, 'chk_cache_txt': chk_cache_txt.value,
                         'chk_cache_search': chk_cache_search.value, 'chk_cache_aes': chk_cache_aes.value, 
                         'chk_cache_nsfw': chk_cache_nsfw.value,
+                        'search_quant_mode': cache_search_quant.value, 'aes_quant_mode': cache_aes_quant.value,
+                        'nsfw_quant_mode': cache_nsfw_quant.value,
                         'use_ram_compression': use_ram_compression.value, 'cache_chunk_size': cache_chunk_size.value
                     })
                     if not cache_dir.value: return ui.notify("Укажите папку!", type='warning')
@@ -2202,14 +2378,17 @@ def index_page():
 
                             search_engine.emb_size = int(cache_max_dim.value)
                             search_engine.video_frames = int(cache_video_frames.value)
+                            search_engine.quant_mode = cache_search_quant.value
                             
                             aesthetic_engine.batch_size = int(cache_batch_size.value)
                             aesthetic_engine.max_dim = int(cache_max_dim.value)
                             aesthetic_engine.video_frames = int(cache_video_frames.value)
+                            aesthetic_engine.quant_mode = cache_aes_quant.value
                             
                             nsfw_engine.batch_size = int(cache_batch_size.value)
                             nsfw_engine.max_dim = int(cache_max_dim.value)
                             nsfw_engine.video_frames = int(cache_video_frames.value)
+                            nsfw_engine.quant_mode = cache_nsfw_quant.value
 
                             # --- НОВАЯ ЛОГИКА БЛОЧНОЙ ОБРАБОТКИ (Вариант 3) ---
                             all_allowed_exts = tuple(set(exts_search + exts_media))
@@ -2293,7 +2472,7 @@ if __name__ in {"__main__", "__mp_main__"}:
     parser = argparse.ArgumentParser(description="AI Media Organizer Pro")
     parser.add_argument('--server-only', action='store_true', help='Запустить в режиме сервера (без локального окна)')
     parser.add_argument('--host', type=str, default='127.0.0.1', help='IP адрес для сервера')
-    parser.add_argument('--port', type=int, default=8080, help='Порт сервера')
+    parser.add_argument('--port', type=int, default=8190, help='Порт сервера')
     
     # Считываем аргументы
     args, unknown = parser.parse_known_args()
