@@ -1274,8 +1274,24 @@ def copy_image_to_clipboard(path):
             CF_DIB = 8
             GMEM_MOVEABLE = 0x0002
             
+            # Явно указываем типы, чтобы 64-битные указатели не обрезались до 32-битных
+            ctypes.windll.kernel32.GlobalAlloc.restype = ctypes.c_void_p
+            ctypes.windll.kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+            ctypes.windll.kernel32.GlobalLock.restype = ctypes.c_void_p
+            ctypes.windll.kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+            ctypes.windll.kernel32.GlobalUnlock.restype = ctypes.c_int
+            ctypes.windll.kernel32.GlobalUnlock.argtypes =[ctypes.c_void_p]
+            ctypes.windll.user32.SetClipboardData.restype = ctypes.c_void_p
+            ctypes.windll.user32.SetClipboardData.argtypes =[ctypes.c_uint, ctypes.c_void_p]
+            
             hGlobalMem = ctypes.windll.kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+            if not hGlobalMem:
+                raise Exception("Не удалось выделить память")
+                
             lpGlobalMem = ctypes.windll.kernel32.GlobalLock(hGlobalMem)
+            if not lpGlobalMem:
+                raise Exception("Не удалось заблокировать память")
+                
             ctypes.memmove(lpGlobalMem, data, len(data))
             ctypes.windll.kernel32.GlobalUnlock(hGlobalMem)
             
