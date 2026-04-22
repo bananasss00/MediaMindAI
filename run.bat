@@ -32,6 +32,7 @@ if not exist ".venv\Scripts\python.exe" (
 
     echo [3/5] Скачивание и установка нейросетевых библиотек...
     ".bin\uv.exe" pip install -r requirements.txt --index-strategy unsafe-best-match
+    copy /y requirements.txt ".venv\requirements.installed" >nul
 
     echo[4/5] Очистка временных файлов для экономии места...
     ".bin\uv.exe" cache clean
@@ -59,6 +60,24 @@ if not exist ".venv\Scripts\python.exe" (
 :: ==============================================================
 :: БЛОК 2: ОБЫЧНЫЙ ЗАПУСК ПРИЛОЖЕНИЯ
 :: ==============================================================
+
+:: Проверка изменений в requirements.txt
+if exist "requirements.txt" (
+    if exist ".venv\requirements.installed" (
+        fc requirements.txt ".venv\requirements.installed" >nul 2>nul
+        if errorlevel 1 (
+            echo [INFO] Обнаружены изменения в requirements.txt. Обновление зависимостей...
+            ".bin\uv.exe" pip install -r requirements.txt --index-strategy unsafe-best-match
+            copy /y requirements.txt ".venv\requirements.installed" >nul
+            ".bin\uv.exe" cache clean
+        )
+    ) else (
+        echo [INFO] Восстановление списка зависимостей...
+        ".bin\uv.exe" pip install -r requirements.txt --index-strategy unsafe-best-match
+        copy /y requirements.txt ".venv\requirements.installed" >nul
+    )
+)
+
 echo Запуск AI Media Organizer Pro...
 
 :: Подгружаем переменные из .env файла
