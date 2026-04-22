@@ -2129,13 +2129,20 @@ def index_page():
 
     # --- ПОЛНОЭКРАННЫЙ ПЛЕЕР ---
     with ui.dialog().on('value', lambda e: setattr(state, 'viewer_open', e.value)).props('maximized transition-show=fade transition-hide=fade') as media_dialog:
-        with ui.element('div').classes('w-full h-full bg-black/95 p-0 flex flex-col relative items-center justify-center overflow-hidden'):
+        with ui.element('div') \
+            .classes('w-full h-full bg-black/95 p-0 flex flex-col relative items-center justify-center overflow-hidden') \
+            .on('wheel.prevent', lambda e: change_media(1 if e.args['deltaY'] > 0 else -1),['deltaY']) \
+            .on('click.self', media_dialog.close):
+            
             ui.button(icon='close', on_click=media_dialog.close).classes('absolute top-4 right-4 z-50 bg-white/10 hover:bg-white/20 text-white').props('flat round')
             
             ui.button(icon='chevron_left', on_click=lambda: change_media(-1)).classes('absolute left-4 top-1/2 -translate-y-1/2 z-50 bg-white/10 hover:bg-white/20 text-white text-4xl p-2').props('flat round').tooltip('Предыдущий (←)')
             ui.button(icon='chevron_right', on_click=lambda: change_media(1)).classes('absolute right-4 top-1/2 -translate-y-1/2 z-50 bg-white/10 hover:bg-white/20 text-white text-4xl p-2').props('flat round').tooltip('Следующий (→)')
             
-            media_container = ui.element('div').classes('absolute inset-0 w-full h-full flex items-center justify-center z-0 p-8')
+            # Отступ p-8 не даст картинке залезть под боковые кнопки
+            media_container = ui.element('div') \
+                .classes('absolute inset-0 w-full h-full flex items-center justify-center z-0 p-8') \
+                .on('click.self', media_dialog.close)
             
             with ui.row().classes('absolute bottom-6 left-1/2 -translate-x-1/2 bg-black/80 border border-gray-700 px-4 py-2 rounded-full text-white flex-nowrap items-center gap-3 z-50 shadow-lg'):
                 btn_viewer_select = ui.button(on_click=lambda: toggle_selection()).props('flat round dense size=sm').tooltip('Выделить (Space)')
@@ -2213,10 +2220,11 @@ def index_page():
                     .props('autoplay controls loop')
             elif ext in SUPPORTED_IMAGES:
                 ui.element('img').props(f'src="/media/{safe_path}"') \
-                    .classes('outline-none') \
-                    .style('max-width: 100%; max-height: 90vh; width: auto; height: auto; object-fit: contain;')
+                    .classes('outline-none cursor-pointer') \
+                    .style('max-width: 100%; max-height: 90vh; width: auto; height: auto; object-fit: contain;') \
+                    .on('click', media_dialog.close)
             else:
-                ui.icon('article', size='15rem').classes('text-gray-500')
+                ui.icon('article', size='15rem').classes('text-gray-500 cursor-pointer').on('click', media_dialog.close)
 
     def open_media(index, items):
         state.viewer_index = index
