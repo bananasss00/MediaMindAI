@@ -3197,33 +3197,53 @@ def index_page():
                     ], value=cfg.get('tags_model', 'SmilingWolf/wd-swinv2-tagger-v3'), label='Модель').classes('w-full text-xs')
                     
                     # Кнопка подгрузки тегов из БД
-                    def load_available_tags():
+                    async def load_available_tags():
                         if not tags_dir.value: return ui.notify("Сначала выберите папку", type='warning')
+                        
+                        dir_val = tags_dir.value
                         exts =[]
                         if chk_img_tags.value: exts.extend(SUPPORTED_IMAGES)
                         if chk_vid_tags.value: exts.extend(SUPPORTED_VIDEOS)
-                        
-                        all_files = search_engine._gather_files(tags_dir.value, tuple(exts))
                         
                         # Берем значение кадров из конфига, так как UI элемент tags_video_frames создается ниже
                         frames_val = int(cfg.get('tags_video_frames', 4))
                         cache_key = f"{tags_model_sel.value}_{frames_val}"
                         
-                        unique_tags = {}
-                        for f in all_files:
-                            tags = search_engine.db_cache.get_tags(cache_key, f)
-                            if tags:
-                                for t in tags.keys(): unique_tags[t] = unique_tags.get(t, 0) + 1
+                        ui.notify("🔄 Идет сбор тегов из БД, подождите...", type='info', timeout=2000)
+                        
+                        def process_tags(directory, extensions, key):
+                            all_files = search_engine._gather_files(directory, tuple(extensions))
+                            unique_tags = {}
+                            
+                            # Ускорение: запрашиваем все теги для модели ОДНИМ запросом (Bulk fetch)
+                            c = search_engine.db_cache.conn.cursor()
+                            c.execute("SELECT path, tags FROM tags_cache WHERE model=?", (key,))
+                            db_data = c.fetchall()
+                            
+                            valid_paths = set(all_files)
+                            for row in db_data:
+                                path, tags_json = row[0], row[1]
+                                if path in valid_paths and tags_json:
+                                    tags = json.loads(tags_json)
+                                    for t in tags.keys(): 
+                                        unique_tags[t] = unique_tags.get(t, 0) + 1
+                            return unique_tags
+
+                        # Выполняем в фоне, чтобы не заблокировать веб-сервер и не потерять соединение
+                        unique_tags = await run.io_bound(process_tags, dir_val, exts, cache_key)
                                 
                         if not unique_tags:
                             return ui.notify("В базе нет тегов для этой папки. Нажмите 'Индексировать'.", type='warning')
                             
                         sorted_tags = sorted(unique_tags.keys(), key=lambda x: unique_tags[x], reverse=True)
-                        pos_tags_sel.options = sorted_tags[:3000]
-                        neg_tags_sel.options = sorted_tags[:3000]
+                        
+                        # Ограничиваем до 1500 тегов, чтобы не "вешать" интерфейс браузера при открытии списка
+                        top_tags = sorted_tags[:1500]
+                        pos_tags_sel.options = top_tags
+                        neg_tags_sel.options = top_tags
                         pos_tags_sel.update()
                         neg_tags_sel.update()
-                        ui.notify(f"Загружено {len(sorted_tags)} уникальных тегов.", type='positive')
+                        ui.notify(f"Загружено {len(sorted_tags)} уникальных тегов (показан ТОП-1500).", type='positive')
 
                     ui.button('🔄 Загрузить доступные теги из БД', on_click=load_available_tags).props('outline color=pink size=sm').classes('w-full')
 
@@ -3326,46 +3346,63 @@ def index_page():
                     })
                     if not tags_dir.value: return ui.notify("Укажите папку!", type='warning')
                     
+                    state.is_processing = True
+                    btn_search_tags.disable()
                     state.tags_base_dir = tags_dir.value
                     state.tags_results.clear()
                     state.sel_tags.clear()
                     state.tags_page = 1
                     tags_gallery_ui.refresh()
                     
+                    dir_val = tags_dir.value
+                    thres_val = float(tags_threshold.value)
+                    pos_val = set(pos_tags_sel.value)
+                    neg_val = set(neg_tags_sel.value)
+                    cache_key = f"{tags_model_sel.value}_{int(tags_video_frames.value)}"
+                    
                     exts =[]
                     if chk_img_tags.value: exts.extend(SUPPORTED_IMAGES)
                     if chk_vid_tags.value: exts.extend(SUPPORTED_VIDEOS)
 
-                    all_files = search_engine._gather_files(tags_dir.value, tuple(exts))
-                    cache_key = f"{tags_model_sel.value}_{int(tags_video_frames.value)}"
+                    def process_search(directory, extensions, key, thres, pos, neg):
+                        all_files = search_engine._gather_files(directory, tuple(extensions))
+                        
+                        c = search_engine.db_cache.conn.cursor()
+                        c.execute("SELECT path, tags FROM tags_cache WHERE model=?", (key,))
+                        db_data = c.fetchall()
+                        
+                        valid_paths = set(all_files)
+                        res =[]
+                        
+                        for row in db_data:
+                            path, tags_json = row[0], row[1]
+                            if path not in valid_paths or not tags_json: continue
+                            
+                            tags = json.loads(tags_json)
+                            valid = True
+                            for pt in pos:
+                                if pt not in tags or tags[pt] < thres:
+                                    valid = False; break
+                            if not valid: continue
+                            
+                            for nt in neg:
+                                if nt in tags and tags[nt] >= thres:
+                                    valid = False; break
+                            if not valid: continue
+                            
+                            score = sum([tags[pt] for pt in pos]) if pos else max(tags.values()) if tags else 0
+                            res.append((score, path, tags))
+                            
+                        res.sort(key=lambda x: x[0], reverse=True)
+                        return res
+
+                    res = await run.io_bound(process_search, dir_val, exts, cache_key, thres_val, pos_val, neg_val)
                     
-                    res =[]
-                    thres = float(tags_threshold.value)
-                    pos = set(pos_tags_sel.value)
-                    neg = set(neg_tags_sel.value)
-                    
-                    for p in all_files:
-                        tags = search_engine.db_cache.get_tags(cache_key, p)
-                        if not tags: continue
-                        
-                        valid = True
-                        for pt in pos:
-                            if pt not in tags or tags[pt] < thres:
-                                valid = False; break
-                        if not valid: continue
-                        
-                        for nt in neg:
-                            if nt in tags and tags[nt] >= thres:
-                                valid = False; break
-                        if not valid: continue
-                        
-                        score = sum([tags[pt] for pt in pos]) if pos else max(tags.values()) if tags else 0
-                        res.append((score, p, tags))
-                        
-                    res.sort(key=lambda x: x[0], reverse=True)
                     state.tags_results = res
                     state.sel_tags = {p: False for s, p, t in res}
                     tags_gallery_ui.refresh()
+                    btn_search_tags.enable()
+                    state.is_processing = False
                     
                 with ui.row().classes('w-full p-4 pt-2 shrink-0 border-t border-gray-800 bg-gray-900 z-10 gap-2'):
                     btn_index_tags = ui.button('🔍 Индексировать', on_click=index_tags_action).classes('w-full bg-gray-700 hover:bg-gray-600 font-bold')
