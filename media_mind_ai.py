@@ -3242,13 +3242,13 @@ def index_page():
                             
                         sorted_tags = sorted(unique_tags.keys(), key=lambda x: unique_tags[x], reverse=True)
                         
-                        # Ограничиваем до 1500 тегов, чтобы не "вешать" интерфейс браузера при открытии списка
-                        top_tags = sorted_tags[:1500]
+                        # Ограничиваем до 8000 тегов (этого хватит для 99% базы), а редкие можно вводить вручную
+                        top_tags = sorted_tags[:8000]
                         pos_tags_sel.options = top_tags
                         neg_tags_sel.options = top_tags
                         pos_tags_sel.update()
                         neg_tags_sel.update()
-                        ui.notify(f"Загружено {len(sorted_tags)} уникальных тегов (показан ТОП-1500).", type='positive')
+                        ui.notify(f"Загружено {len(sorted_tags)} уникальных тегов (в списке ТОП-8000).", type='positive')
 
                     ui.button('🔄 Загрузить доступные теги из БД', on_click=load_available_tags).props('outline color=pink size=sm').classes('w-full')
 
@@ -3257,8 +3257,8 @@ def index_page():
                         ui.label('Включая (Positive - AND)').classes('text-sm font-bold text-blue-400')
                         ui.button('Очистить всё', on_click=lambda: pos_tags_sel.set_value([])).props('flat dense size=sm color=red')
                     
-                    # Свойство hide-selected скроет теги внутри поля, чтобы оно не растягивалось
-                    pos_tags_sel = ui.select([], multiple=True, with_input=True, value=cfg.get('pos_tags',[])).classes('w-full').props('hide-selected')
+                    # Свойство hide-selected скроет теги внутри поля
+                    pos_tags_sel = ui.select([], multiple=True, with_input=True, value=cfg.get('pos_tags',[])).classes('w-full').props('hide-selected new-value-mode=add-unique')
                     pos_tags_container = ui.row().classes('w-full gap-1 mt-1')
                     
                     def remove_pos_tag(tag):
@@ -3280,7 +3280,7 @@ def index_page():
                         ui.label('Исключая (Negative - NOT)').classes('text-sm font-bold text-pink-400')
                         ui.button('Очистить всё', on_click=lambda: neg_tags_sel.set_value([])).props('flat dense size=sm color=red')
                         
-                    neg_tags_sel = ui.select([], multiple=True, with_input=True, value=cfg.get('neg_tags',[])).classes('w-full').props('hide-selected')
+                    neg_tags_sel = ui.select([], multiple=True, with_input=True, value=cfg.get('neg_tags',[])).classes('w-full').props('hide-selected new-value-mode=add-unique')
                     neg_tags_container = ui.row().classes('w-full gap-1 mt-1')
 
                     def remove_neg_tag(tag):
