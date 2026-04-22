@@ -18,6 +18,9 @@ opencv-python
 python-dotenv
 aesthetic_predictor_v2_5
 
+# Danbooru Tags dependencies:
+pandas
+
 # Пакеты для поиска по лицу:
 # insightface
 # onnxruntime-gpu

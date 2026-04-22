@@ -54,7 +54,7 @@ try:
         return sageattn(query, key, value, is_causal=is_causal)
 
     F.scaled_dot_product_attention = sage_wrapper
-    print("✅ SageAttention успешно активирован и подменил SDPA!")
+    # print("✅ SageAttention успешно активирован и подменил SDPA!")
 
 except Exception as e:
     print(f"⚠️ SageAttention недоступен. Используем стандартный PyTorch SDPA.")
@@ -174,18 +174,37 @@ class DatabaseCache:
         c.execute('''CREATE TABLE IF NOT EXISTS aes_cache (model TEXT, path TEXT, avg_score REAL, max_score REAL, PRIMARY KEY (model, path))''')
         c.execute('''CREATE TABLE IF NOT EXISTS sim_cache (model TEXT, query TEXT, path TEXT, score REAL, PRIMARY KEY (model, query, path))''')
         c.execute('''CREATE TABLE IF NOT EXISTS nsfw_cache (model TEXT, path TEXT, top_label TEXT, danger_score REAL, details TEXT, PRIMARY KEY (model, path))''')
-        
-        # Таблица для поиска по лицам
         c.execute('''CREATE TABLE IF NOT EXISTS face_cache (path TEXT, face_idx INTEGER, embedding BLOB, PRIMARY KEY (path, face_idx))''')
         
-        # Создаем индексы для мгновенного поиска по пути файла (без Full Table Scan)
+        c.execute('''CREATE TABLE IF NOT EXISTS tags_cache (model TEXT, path TEXT, tags TEXT, PRIMARY KEY (model, path))''')
+        
         c.execute('CREATE INDEX IF NOT EXISTS idx_nsfw_path ON nsfw_cache(path)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_emb_path ON emb_cache(path)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_face_path ON face_cache(path)')
-
+        c.execute('CREATE INDEX IF NOT EXISTS idx_tags_path ON tags_cache(path)')
         self.conn.commit()
 
-    # --- Лица (Face Search) ---
+    # --- Danbooru Tags ---
+    def get_tags(self, model_name, path):
+        c = self.conn.cursor()
+        c.execute("SELECT tags FROM tags_cache WHERE model=? AND path=?", (model_name, path))
+        row = c.fetchone()
+        return json.loads(row[0]) if row and row[0] else None
+
+    def save_tags(self, model_name, path, tags_dict):
+        c = self.conn.cursor()
+        c.execute("INSERT OR REPLACE INTO tags_cache (model, path, tags) VALUES (?, ?, ?)", 
+                  (model_name, path, json.dumps(tags_dict)))
+        self.conn.commit()
+
+    def save_tags_batch(self, batch_data):
+        if not batch_data: return
+        c = self.conn.cursor()
+        data =[(m, p, json.dumps(t)) for m, p, t in batch_data]
+        c.executemany("INSERT OR REPLACE INTO tags_cache (model, path, tags) VALUES (?, ?, ?)", data)
+        self.conn.commit()
+
+    # --- Face ---
     def get_face_embeddings(self, path):
         c = self.conn.cursor()
         c.execute("SELECT embedding FROM face_cache WHERE path=?", (path,))
@@ -241,7 +260,7 @@ class DatabaseCache:
                   (model_name, path, top_label, danger_score, json.dumps(details)))
         self.conn.commit()
 
-    # --- Поиск и Эстетика ---
+    # --- Общие ---
     def get_query_sims(self, model_name, query):
         c = self.conn.cursor()
         c.execute("SELECT path, score FROM sim_cache WHERE model=? AND query=?", (model_name, query))
@@ -319,24 +338,24 @@ class DatabaseCache:
 
     def clear_model_cache(self, model_name=None):
         c = self.conn.cursor()
-        tables =['emb_cache', 'rerank_cache_v2', 'aes_cache', 'sim_cache', 'nsfw_cache', 'face_cache']
+        tables =['emb_cache', 'rerank_cache_v2', 'aes_cache', 'sim_cache', 'nsfw_cache', 'face_cache', 'tags_cache']
         if model_name:
             if model_name == "InsightFace (Лица)":
                 c.execute("DELETE FROM face_cache")
             else:
                 for table in tables:
-                    if table == 'face_cache': continue # У лиц нет колонки model
+                    if table == 'face_cache': continue 
                     c.execute(f"DELETE FROM {table} WHERE model=?", (model_name,))
         else:
             for table in tables:
                 c.execute(f"DELETE FROM {table}")
         self.conn.commit()
-        self.conn.execute("VACUUM") # Автоматически сжимаем файл БД и освобождаем место на диске
+        self.conn.execute("VACUUM")
 
     def get_all_paths(self):
         c = self.conn.cursor()
         paths = set()
-        for table in['emb_cache', 'aes_cache', 'nsfw_cache', 'face_cache']:
+        for table in['emb_cache', 'aes_cache', 'nsfw_cache', 'face_cache', 'tags_cache']:
             try:
                 c.execute(f"SELECT DISTINCT path FROM {table}")
                 paths.update([r[0] for r in c.fetchall() if r[0]])
@@ -346,7 +365,7 @@ class DatabaseCache:
     def remove_paths(self, paths_to_remove):
         if not paths_to_remove: return
         c = self.conn.cursor()
-        tables =['emb_cache', 'rerank_cache_v2', 'aes_cache', 'sim_cache', 'nsfw_cache', 'face_cache']
+        tables =['emb_cache', 'rerank_cache_v2', 'aes_cache', 'sim_cache', 'nsfw_cache', 'face_cache', 'tags_cache']
         chunk_size = 900
         for i in range(0, len(paths_to_remove), chunk_size):
             chunk = paths_to_remove[i:i+chunk_size]
@@ -375,11 +394,10 @@ class FilesCache:
     def list_files(self, directory):
         return self._data.get(directory, None)
 
-# ОПТИМИЗАЦИЯ ИНДЕКСАТОРА: Совместный кэш изображений в RAM для всех моделей в рамках одного цикла
 class MediaCache:
     def __init__(self):
         self.enabled = False
-        self.compress = False  # Флаг для сжатия в ОЗУ (Вариант 1)
+        self.compress = False
         self.cache = {}
 
     def clear(self):
@@ -388,12 +406,10 @@ class MediaCache:
 
     def _compress_img(self, img):
         buf = io.BytesIO()
-        # Сжимаем в JPEG прямо в памяти (качество 85% оптимально)
         img.save(buf, format="JPEG", quality=85)
         return buf.getvalue()
 
     def _decompress_img(self, bytes_data):
-        # Декодируем обратно в сырые пиксели при чтении
         return Image.open(io.BytesIO(bytes_data)).convert("RGB")
 
     def _get_bucket_size(self, w, h, max_dim, patch_size=28):
@@ -806,7 +822,7 @@ class SearchEngine:
         return final_results
 
 # ==========================================
-# 3. ДВИЖКИ ЭСТЕТИКИ, NSFW И ЛИЦ
+# 3. ДВИЖКИ ЭСТЕТИКИ, NSFW, ЛИЦ И ТЕГОВ
 # ==========================================
 class AestheticEngine:
     def __init__(self, search_engine):
@@ -1369,6 +1385,370 @@ class FaceEngine:
                 self.db_cache.save_face_embeddings_batch(batch_db_data)
                 batch_paths =[]
 
+# --- ДВИЖОК ТЕГИРОВАНИЯ DANBOORU ---
+class TagEngine:
+    def __init__(self, search_engine):
+        self.se = search_engine
+        self.db_cache = search_engine.db_cache
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.session = None
+        self.tag_names =[]
+        self.model_name = None
+        self.target_size = 448
+        self.batch_size = 16
+        self.video_frames = 4
+        self.min_save_threshold = 0.1
+
+    def load_model(self, model_repo):
+        if self.model_name == model_repo and self.session is not None:
+            return
+
+        self.unload()
+        state.add_log(f"Загрузка Tag-модели {model_repo} на {self.device}...")
+        
+        try:
+            import onnxruntime as rt
+            import pandas as pd
+            from huggingface_hub import hf_hub_download
+        except ImportError:
+            raise Exception("Установите зависимости: pip install onnxruntime-gpu pandas huggingface_hub")
+
+        local_dir = os.path.join(current_dir, "models", model_repo.replace("/", "_"))
+        os.makedirs(local_dir, exist_ok=True)
+
+        # 1. Загрузка CSV тегов
+        from huggingface_hub import list_repo_files, hf_hub_download
+        
+        # 1. Умный поиск файла тегов и ONNX модели
+        csv_path = os.path.join(local_dir, "tags.csv")
+        json_path = os.path.join(local_dir, "tags.json")
+        txt_path = os.path.join(local_dir, "tags.txt")
+        onnx_path = os.path.join(local_dir, "model.onnx")
+        
+        # Миграция со старых версий файлов
+        old_csv = os.path.join(local_dir, "selected_tags.csv")
+        if os.path.exists(old_csv) and not os.path.exists(csv_path): os.rename(old_csv, csv_path)
+        old_json = os.path.join(local_dir, "tag_mapping.json")
+        if os.path.exists(old_json) and not os.path.exists(json_path): os.rename(old_json, json_path)
+        old_txt = os.path.join(local_dir, "top_tags.txt")
+        if os.path.exists(old_txt) and not os.path.exists(txt_path): os.rename(old_txt, txt_path)
+
+        repo_files =[]
+        if not os.path.exists(onnx_path) or (not os.path.exists(csv_path) and not os.path.exists(json_path) and not os.path.exists(txt_path)):
+            try:
+                repo_files = list_repo_files(repo_id=model_repo)
+            except Exception as e:
+                raise Exception(f"Не удалось получить список файлов репозитория {model_repo}: {e}")
+
+        # --- ЗАГРУЗКА ТЕГОВ ---
+        if not os.path.exists(csv_path) and not os.path.exists(json_path) and not os.path.exists(txt_path):
+            tag_filename = None
+            # Приоритет 1: CSV файлы с 'tag' или 'class'
+            for f in repo_files:
+                if f.endswith('.csv') and ('tag' in f.lower() or 'class' in f.lower()):
+                    tag_filename = f; break
+            # Приоритет 2: JSON файлы с 'tag' или 'metadata'
+            if not tag_filename:
+                for f in repo_files:
+                    if f.endswith('.json') and ('tag' in f.lower() or 'metadata' in f.lower()) and 'config' not in f.lower():
+                        tag_filename = f; break
+            # Приоритет 3: TXT файлы с 'tag' (для моделей вроде joytag)
+            if not tag_filename:
+                for f in repo_files:
+                    if f.endswith('.txt') and 'tag' in f.lower():
+                        tag_filename = f; break
+                        
+            if not tag_filename:
+                raise Exception(f"Не удалось найти файл с тегами (.csv, .json или .txt) в репозитории {model_repo}")
+                
+            downloaded_path = hf_hub_download(repo_id=model_repo, filename=tag_filename, local_dir=local_dir)
+            if downloaded_path.endswith('.csv'):
+                os.rename(downloaded_path, csv_path)
+            elif downloaded_path.endswith('.json'):
+                os.rename(downloaded_path, json_path)
+            elif downloaded_path.endswith('.txt'):
+                os.rename(downloaded_path, txt_path)
+
+        if os.path.exists(csv_path):
+            df = pd.read_csv(csv_path)
+            if 'name' in df.columns:
+                self.tag_names = df['name'].fillna('unknown_tag').astype(str).tolist()
+            else:
+                self.tag_names = df.iloc[:, 0].fillna('unknown_tag').astype(str).tolist()
+        elif os.path.exists(json_path):
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                
+            extracted_names =[]
+            
+            def extract_from_list(lst):
+                names = []
+                if len(lst) > 0 and isinstance(lst[0], dict):
+                    if any(key in lst[0] for key in['id', 'tag_id', 'tag_index']):
+                        max_id = max((int(item.get('id', item.get('tag_id', item.get('tag_index', -1)))) for item in lst if isinstance(item, dict) and str(item.get('id', item.get('tag_id', item.get('tag_index', '')))).lstrip('-').isdigit()), default=-1)
+                        if max_id >= 0:
+                            names = ['unknown_tag'] * (max_id + 1)
+                            for item in lst:
+                                if isinstance(item, dict):
+                                    val = str(item.get('id', item.get('tag_id', item.get('tag_index', '-1'))))
+                                    if val.lstrip('-').isdigit():
+                                        idx = int(val)
+                                        if idx >= 0: names[idx] = str(item.get('name', item.get('tag', str(item))))
+                            return names
+                    for item in lst:
+                        if isinstance(item, dict):
+                            names.append(str(item.get('name', item.get('tag', str(item)))))
+                        else:
+                            names.append(str(item))
+                else:
+                    names =[str(x) for x in lst]
+                return names
+
+            if isinstance(data, dict):
+                # Уникальная структура для Camie-Tagger v2
+                if "dataset_info" in data and isinstance(data["dataset_info"], dict):
+                    mapping = data["dataset_info"].get("tag_mapping", {})
+                    if isinstance(mapping, dict):
+                        if "idx_to_tag" in mapping: data = mapping["idx_to_tag"]
+                        elif "tag_to_idx" in mapping: data = mapping["tag_to_idx"]
+
+                if isinstance(data, dict):
+                    for key in["tags", "tag_names", "classes", "labels"]:
+                        if key in data and isinstance(data[key], (list, dict)):
+                            data = data[key]
+                            break
+
+            if isinstance(data, list):
+                extracted_names = extract_from_list(data)
+            elif isinstance(data, dict):
+                keys_are_ints = all(str(k).isdigit() for k in data.keys() if k != "meta")
+                if keys_are_ints:
+                    int_keys =[int(k) for k in data.keys() if str(k).isdigit()]
+                    if int_keys:
+                        max_idx = max(int_keys)
+                        extracted_names = ['unknown_tag'] * (max_idx + 1)
+                        for k, v in data.items():
+                            if not str(k).isdigit(): continue
+                            idx = int(k)
+                            if isinstance(v, dict):
+                                extracted_names[idx] = str(v.get('name', v.get('tag', str(v))))
+                            else:
+                                extracted_names[idx] = str(v)
+                else:
+                    is_name_to_id = any(isinstance(v, int) or str(v).lstrip('-').isdigit() for v in data.values())
+                    if is_name_to_id:
+                        valid_pairs =[(int(v), str(k)) for k, v in data.items() if isinstance(v, (int, str)) and str(v).lstrip('-').isdigit()]
+                        if valid_pairs:
+                            max_idx = max(idx for idx, _ in valid_pairs)
+                            extracted_names = ['unknown_tag'] * (max_idx + 1)
+                            for idx, name in valid_pairs:
+                                if idx >= 0: extracted_names[idx] = name
+                    
+                    if not extracted_names:
+                        for k, v in data.items():
+                            if isinstance(v, list) and len(v) > 50:
+                                extracted_names = extract_from_list(v)
+                                break
+                            elif isinstance(v, dict) and len(v) > 50:
+                                valid_vals =[int(val) for val in v.values() if isinstance(val, int) or str(val).lstrip('-').isdigit()]
+                                if valid_vals:
+                                    max_val = max(valid_vals)
+                                    if max_val >= 0:
+                                        extracted_names = ['unknown_tag'] * (max_val + 1)
+                                        for tk, tv in v.items():
+                                            if isinstance(tv, int) or str(tv).lstrip('-').isdigit():
+                                                idx = int(tv)
+                                                if idx >= 0: extracted_names[idx] = str(tk)
+                                        break
+
+            if extracted_names:
+                self.tag_names = extracted_names
+            else:
+                self.tag_names = ['unknown_tag'] * 100000
+                state.add_log(f"⚠️ ОШИБКА ЧТЕНИЯ ТЕГОВ! Структура неизвестна. Первые 200 символов: {str(data)[:200]}")
+        elif os.path.exists(txt_path):
+            with open(txt_path, 'r', encoding='utf-8') as f:
+                self.tag_names =[line.strip() for line in f if line.strip()]
+
+        # --- ЗАГРУЗКА ONNX ---
+        if not os.path.exists(onnx_path):
+            onnx_filename = "model.onnx"
+            if "model.onnx" not in repo_files:
+                for f in repo_files:
+                    if f.endswith(".onnx"):
+                        onnx_filename = f; break
+            try:
+                downloaded_onnx = hf_hub_download(repo_id=model_repo, filename=onnx_filename, local_dir=local_dir)
+                if downloaded_onnx != onnx_path:
+                    os.rename(downloaded_onnx, onnx_path)
+            except Exception:
+                raise Exception(f"Не удалось скачать ONNX модель из репозитория {model_repo}")
+
+        providers =['CUDAExecutionProvider', 'CPUExecutionProvider'] if self.device == "cuda" else['CPUExecutionProvider']
+        self.session = rt.InferenceSession(onnx_path, providers=providers)
+        self.model_name = model_repo
+
+        # Динамическое определение размера входа (NCHW или NHWC)
+        input_shape = self.session.get_inputs()[0].shape
+        if len(input_shape) == 4:
+            self.target_size = input_shape[2] if input_shape[1] == 3 else input_shape[1]
+            if not isinstance(self.target_size, int): self.target_size = 448
+        else:
+            self.target_size = 448
+
+    def unload(self):
+        if self.session is not None:
+            state.add_log(f"Выгрузка Tag-модели {self.model_name} из VRAM...")
+            del self.session
+            self.session = None
+            self.model_name = None
+            self.tag_names =[]
+            gc.collect()
+
+    def evaluate_media(self, directory_path, model_name, allowed_exts, override_files=None):
+        all_files = self.se._gather_files(directory_path, allowed_exts) if override_files is None else[f for f in override_files if f.lower().endswith(allowed_exts)]
+        image_paths =[p for p in all_files if p.lower().endswith(SUPPORTED_IMAGES)]
+        video_paths =[p for p in all_files if p.lower().endswith(SUPPORTED_VIDEOS)]
+        
+        state.add_log(f"Найдено для тегирования: {len(image_paths)} фото, {len(video_paths)} видео.")
+        cache_key = f"{model_name}_{self.video_frames}"
+        
+        images_to_process, videos_to_process = [],[]
+        
+        for p in image_paths:
+            if self.db_cache.get_tags(cache_key, p) is None: images_to_process.append(p)
+        for p in video_paths:
+            if self.db_cache.get_tags(cache_key, p) is None: videos_to_process.append(p)
+
+        if images_to_process or videos_to_process:
+            self.load_model(model_name)
+        else:
+            return
+
+        input_name = self.session.get_inputs()[0].name
+        input_shape = self.session.get_inputs()[0].shape
+        is_nchw = (input_shape[1] == 3)
+
+        def process_batch(imgs, paths):
+            try:
+                img_arrs =[]
+                for img in imgs:
+                    max_dim = max(img.width, img.height)
+                    padded = Image.new('RGB', (max_dim, max_dim), (255, 255, 255))
+                    padded.paste(img, ((max_dim - img.width) // 2, (max_dim - img.height) // 2))
+                    padded = padded.resize((self.target_size, self.target_size), Image.Resampling.BICUBIC)
+                    arr = np.array(padded, dtype=np.float32)[:, :, ::-1] # BGR
+                    if is_nchw: arr = arr.transpose(2, 0, 1)
+                    img_arrs.append(arr)
+                batch_inputs = np.stack(img_arrs)
+                    
+                probs_batch = self.session.run(None, {input_name: batch_inputs})[0]
+                probs_batch = np.array(probs_batch, dtype=np.float32)
+                
+                # Применяем Sigmoid если на выходе логиты
+                if probs_batch.max() > 1.0 or probs_batch.min() < 0.0:
+                    probs_batch = 1 / (1 + np.exp(-np.clip(probs_batch, -100, 100)))
+                
+                db_data =[]
+                for j, p in enumerate(paths):
+                    probs = probs_batch[j]
+                    tags_dict = {str(tag): float(prob) for tag, prob in zip(self.tag_names, probs) if float(prob) >= self.min_save_threshold}
+                    
+                    if len(tags_dict) == 0:
+                        state.add_log(f"⚠️ Дебаг: Для файла {Path(p).name} не найдено тегов >= {self.min_save_threshold}. Макс вероятность модели: {float(probs.max()):.3f}")
+                        
+                    db_data.append((cache_key, p, tags_dict))
+                    
+                self.db_cache.save_tags_batch(db_data)
+                
+            except Exception as e:
+                state.add_log(f"⚠️ Ошибка инференса тегов (process_batch): {e}")
+                self.db_cache.save_tags_batch([(cache_key, p, {}) for p in paths])
+
+        # --- ОБРАБОТКА ИЗОБРАЖЕНИЙ ---
+        batch_images, batch_paths = [],[]
+        for i, img_path in enumerate(images_to_process):
+            if not state.is_processing: break
+            state.status_text = f"Теги фото: {Path(img_path).name} ({i+1}/{len(images_to_process)})"
+            
+            try:
+                image = media_cache.get_image(img_path, self.target_size)
+                if image:
+                    batch_images.append(image)
+                    batch_paths.append(img_path)
+                else:
+                    state.add_log(f"⚠️ Ошибка: не удалось прочитать изображение {Path(img_path).name}")
+                    self.db_cache.save_tags(cache_key, img_path, {})
+            except Exception as e:
+                state.add_log(f"⚠️ Ошибка загрузки {Path(img_path).name}: {e}")
+                self.db_cache.save_tags(cache_key, img_path, {})
+
+            if len(batch_images) >= self.batch_size or (i == len(images_to_process) - 1 and batch_images):
+                state.progress = (i + 1) / max(1, len(images_to_process))
+                process_batch(batch_images, batch_paths)
+                batch_images, batch_paths = [],[]
+
+        # --- ОБРАБОТКА ВИДЕО ---
+        batch_images, batch_frame_counts, batch_paths = [], [],[]
+        for i, vid_path in enumerate(videos_to_process):
+            time.sleep(0.002)
+            if not state.is_processing: break
+            state.status_text = f"Теги видео: {Path(vid_path).name} ({i+1}/{len(videos_to_process)})"
+            
+            try:
+                frames = media_cache.get_video_frames(vid_path, self.target_size, self.video_frames)
+                if frames:
+                    batch_images.extend(frames)
+                    batch_paths.append(vid_path)
+                    batch_frame_counts.append(len(frames))
+                else:
+                    state.add_log(f"⚠️ Ошибка: не удалось извлечь кадры из {Path(vid_path).name}")
+                    self.db_cache.save_tags(cache_key, vid_path, {})
+            except Exception as e:
+                state.add_log(f"⚠️ Ошибка загрузки видео {Path(vid_path).name}: {e}")
+                self.db_cache.save_tags(cache_key, vid_path, {})
+
+            if len(batch_images) >= self.batch_size or (i == len(videos_to_process) - 1 and batch_images):
+                state.progress = (i + 1) / max(1, len(videos_to_process))
+                
+                try:
+                    all_probs =[]
+                    for k in range(0, len(batch_images), self.batch_size):
+                        chunk = batch_images[k:k+self.batch_size]
+                        img_arrs =[]
+                        for img in chunk:
+                            max_dim = max(img.width, img.height)
+                            padded = Image.new('RGB', (max_dim, max_dim), (255, 255, 255))
+                            padded.paste(img, ((max_dim - img.width) // 2, (max_dim - img.height) // 2))
+                            padded = padded.resize((self.target_size, self.target_size), Image.Resampling.BICUBIC)
+                            arr = np.array(padded, dtype=np.float32)[:, :, ::-1]
+                            if is_nchw: arr = arr.transpose(2, 0, 1)
+                            img_arrs.append(arr)
+                        batch_inputs = np.stack(img_arrs)
+                            
+                        probs_chunk = self.session.run(None, {input_name: batch_inputs})[0]
+                        probs_chunk = np.array(probs_chunk, dtype=np.float32)
+                        if probs_chunk.max() > 1.0 or probs_chunk.min() < 0.0:
+                            probs_chunk = 1 / (1 + np.exp(-np.clip(probs_chunk, -100, 100)))
+                        all_probs.extend(probs_chunk)
+                        
+                    idx = 0
+                    db_data =[]
+                    for p, count in zip(batch_paths, batch_frame_counts):
+                        vid_probs = np.stack(all_probs[idx : idx + count])
+                        idx += count
+                        max_probs = vid_probs.max(axis=0)
+                        tags_dict = {str(tag): float(prob) for tag, prob in zip(self.tag_names, max_probs) if float(prob) >= self.min_save_threshold}
+                        
+                        if len(tags_dict) == 0:
+                            state.add_log(f"⚠️ Дебаг: Для видео {Path(p).name} не найдено тегов >= {self.min_save_threshold}. Макс вероятность: {float(max_probs.max()):.3f}")
+                            
+                        db_data.append((cache_key, p, tags_dict))
+                        
+                    self.db_cache.save_tags_batch(db_data)
+                except Exception as e: state.add_log(f"⚠️ Ошибка инференса тегов (видео): {e}")
+                
+                batch_images, batch_frame_counts, batch_paths = [], [], []
 
 # ==========================================
 # 4. СОСТОЯНИЕ И UI УТИЛИТЫ
@@ -1379,26 +1759,31 @@ class AppState:
         self.aesthetic_results =[]
         self.nsfw_results =[]
         self.face_results =[]
+        self.tags_results =[]
         
         self.sel_search = {}
         self.sel_aes = {}
         self.sel_nsfw = {}
         self.sel_face = {}
+        self.sel_tags = {}
         
         self.search_page = 1
         self.aes_page = 1
         self.nsfw_page = 1
         self.face_page = 1
+        self.tags_page = 1
         
         self.search_base_dir = ""
         self.aes_base_dir = ""
         self.nsfw_base_dir = ""
         self.face_base_dir = ""
+        self.tags_base_dir = ""
         
         self.search_res_filter = 'Все'
         self.aes_res_filter = 'Все'
         self.nsfw_res_filter = 'Все'
         self.face_res_filter = 'Все'
+        self.tags_res_filter = 'Все'
         
         self.viewer_open = False
         self.viewer_items =[]
@@ -1432,6 +1817,7 @@ search_engine = SearchEngine(
 aesthetic_engine = AestheticEngine(search_engine)
 nsfw_engine = NsfwEngine(search_engine)
 face_engine = FaceEngine(search_engine)
+tag_engine = TagEngine(search_engine)
 
 def open_file_native(filepath):
     try: os.startfile(filepath) if os.name == 'nt' else subprocess.call(('xdg-open', filepath))
@@ -1604,6 +1990,7 @@ def index_page():
             tab_aesthetic = ui.tab('Aesthetic', label='Оценка Эстетики', icon='star')
             tab_nsfw = ui.tab('NSFW', label='NSFW Детектор', icon='visibility_off')
             tab_face = ui.tab('Face', label='Поиск по лицу', icon='face')
+            tab_tags = ui.tab('Tags', label='Danbooru Теги', icon='label')
             tab_cache = ui.tab('Cache', label='Индексатор', icon='storage')
             
         ui.button(icon='settings', on_click=lambda: global_settings_dialog.open()).props('flat round dense text-color=white').classes('shrink-0').tooltip('Глобальные настройки')
@@ -1688,6 +2075,7 @@ def index_page():
                 aesthetic_gallery_ui.refresh()
                 nsfw_gallery_ui.refresh()
                 face_gallery_ui.refresh()
+                tags_gallery_ui.refresh()
                 global_settings_dialog.close()
                 
             ui.button('Сохранить и закрыть', on_click=save_global_settings).classes('w-full mt-6 bg-blue-600 hover:bg-blue-500 font-bold')
@@ -1722,7 +2110,24 @@ def index_page():
                     ui.label(f"{prob*100:.2f}%").classes(f'font-mono text-sm {color}')
         nsfw_debug_dialog.open()
 
-    # --- ДИАЛОГ ДЛЯ ПОЛНОЭКРАННОГО ПЛЕЕРА ---
+    with ui.dialog() as tags_debug_dialog:
+        with ui.card().classes('w-[500px] max-w-full bg-gray-900 text-white border border-gray-700'):
+            tags_debug_title = ui.label('Теги (Danbooru)').classes('text-lg font-bold mb-2 break-all')
+            tags_debug_container = ui.column().classes('w-full gap-1 max-h-[60vh] overflow-y-auto')
+            ui.button('Закрыть', on_click=tags_debug_dialog.close).classes('w-full mt-4 bg-gray-800 hover:bg-gray-700')
+
+    def show_tags_debug(path, tags_dict):
+        tags_debug_title.set_text(os.path.basename(path))
+        tags_debug_container.clear()
+        with tags_debug_container:
+            sorted_tags = sorted(tags_dict.items(), key=lambda x: x[1], reverse=True)
+            for lbl, prob in sorted_tags:
+                with ui.row().classes('w-full justify-between border-b border-gray-800 py-1 px-2'):
+                    ui.label(lbl).classes('font-mono text-sm text-pink-300')
+                    ui.label(f"{prob*100:.2f}%").classes('font-mono text-sm text-gray-400')
+        tags_debug_dialog.open()
+
+    # --- ПОЛНОЭКРАННЫЙ ПЛЕЕР ---
     with ui.dialog().on('value', lambda e: setattr(state, 'viewer_open', e.value)) as media_dialog:
         with ui.card().classes('w-[95vw] h-[95vh] bg-transparent shadow-none p-0 flex flex-col relative items-center justify-center'):
             ui.button(icon='close', on_click=media_dialog.close).classes('absolute top-2 right-2 z-50 bg-black/60 text-white').props('flat round dense')
@@ -1746,6 +2151,7 @@ def index_page():
         elif state.current_tab == 'Aesthetic' and path in state.sel_aes: is_selected = state.sel_aes[path]
         elif state.current_tab == 'NSFW' and path in state.sel_nsfw: is_selected = state.sel_nsfw[path]
         elif state.current_tab == 'Face' and path in state.sel_face: is_selected = state.sel_face[path]
+        elif state.current_tab == 'Tags' and path in state.sel_tags: is_selected = state.sel_tags[path]
             
         btn_viewer_select._props['icon'] = 'check_box' if is_selected else 'check_box_outline_blank'
         btn_viewer_select._props['color'] = 'green' if is_selected else 'white'
@@ -1762,13 +2168,15 @@ def index_page():
             state.sel_nsfw[path] = not state.sel_nsfw[path]
         elif state.current_tab == 'Face' and path in state.sel_face:
             state.sel_face[path] = not state.sel_face[path]
+        elif state.current_tab == 'Tags' and path in state.sel_tags:
+            state.sel_tags[path] = not state.sel_tags[path]
         update_viewer_selection_ui()
 
     def download_current_item():
         if not state.viewer_items: return
         path = state.viewer_items[state.viewer_index]
         tab = state.current_tab.lower()
-        base_dir = state.search_base_dir if tab == 'search' else (state.aes_base_dir if tab == 'aesthetic' else (state.face_base_dir if tab == 'face' else state.nsfw_base_dir))
+        base_dir = getattr(state, f"{tab}_base_dir", state.search_base_dir)
         try:
             dl_dir = os.path.join(str(Path.home()), 'Downloads')
             try:
@@ -1840,26 +2248,19 @@ def index_page():
             "<div style='display:flex; flex-wrap:wrap; gap:15px;'>"
         ]
         
-        items = state.search_results if tab == 'search' else (state.aesthetic_results if tab == 'aes' else (state.face_results if tab == 'face' else state.nsfw_results))
+        items = getattr(state, f"{tab}_results",[])
         for item in items:
             path = item[1]
+            filter_val = getattr(state, f"{tab}_res_filter", 'Все')
             
-            if tab == 'search':
-                if state.search_res_filter == 'Картинки' and not path.lower().endswith(SUPPORTED_IMAGES): continue
-                if state.search_res_filter == 'Видео' and not path.lower().endswith(SUPPORTED_VIDEOS): continue
-                label_text = f"Score: {item[0]:.3f}"
-            elif tab == 'aes':
-                if state.aes_res_filter == 'Картинки' and not path.lower().endswith(SUPPORTED_IMAGES): continue
-                if state.aes_res_filter == 'Видео' and not path.lower().endswith(SUPPORTED_VIDEOS): continue
-                label_text = f"★ {item[0]:.2f} (Пик: {item[2]:.2f})"
-            elif tab == 'nsfw':
-                if state.nsfw_res_filter == 'Картинки' and not path.lower().endswith(SUPPORTED_IMAGES): continue
-                if state.nsfw_res_filter == 'Видео' and not path.lower().endswith(SUPPORTED_VIDEOS): continue
-                label_text = f"🚨 Danger: {item[0]*100:.1f}% | {item[2].upper()}"
-            elif tab == 'face':
-                if state.face_res_filter == 'Картинки' and not path.lower().endswith(SUPPORTED_IMAGES): continue
-                if state.face_res_filter == 'Видео' and not path.lower().endswith(SUPPORTED_VIDEOS): continue
-                label_text = f"Match: {item[0]*100:.1f}%"
+            if filter_val == 'Картинки' and not path.lower().endswith(SUPPORTED_IMAGES): continue
+            if filter_val == 'Видео' and not path.lower().endswith(SUPPORTED_VIDEOS): continue
+            
+            if tab == 'search': label_text = f"Score: {item[0]:.3f}"
+            elif tab == 'aes': label_text = f"★ {item[0]:.2f} (Пик: {item[2]:.2f})"
+            elif tab == 'nsfw': label_text = f"🚨 Danger: {item[0]*100:.1f}% | {item[2].upper()}"
+            elif tab == 'face': label_text = f"Match: {item[0]*100:.1f}%"
+            elif tab == 'tags': label_text = f"Tags Score: {item[0]:.2f}"
                 
             uri = Path(path).absolute().as_uri()
             ext = os.path.splitext(path)[1].lower()
@@ -1906,8 +2307,8 @@ def index_page():
         except Exception as e: ui.notify(f"Ошибка экспорта: {e}", type='negative')
 
     # --- ПАКЕТНЫЕ ДЕЙСТВИЯ ---
-    async def execute_batch(action='copy', tab='search', prepend_score=False):
-        sel_dict = state.sel_search if tab == 'search' else (state.sel_aes if tab == 'aes' else (state.sel_face if tab == 'face' else state.sel_nsfw))
+    async def execute_batch(action='copy', tab='search', prepend_score=False, export_txt=False, txt_threshold=0.1):
+        sel_dict = getattr(state, f"sel_{tab}")
         selected_paths =[p for p, checked in sel_dict.items() if checked]
         if not selected_paths:
             return ui.notify('Ничего не выбрано!', type='warning')
@@ -1915,7 +2316,7 @@ def index_page():
         folder = await run.io_bound(pick_folder_native)
         if not folder: return
         
-        base_dir = state.search_base_dir if tab == 'search' else (state.aes_base_dir if tab == 'aes' else (state.face_base_dir if tab == 'face' else state.nsfw_base_dir))
+        base_dir = getattr(state, f"{tab}_base_dir", state.search_base_dir)
         success = 0
         moved_paths = set()
         
@@ -1931,18 +2332,10 @@ def index_page():
 
             prefix = ""
             if prepend_score:
-                if tab == 'search':
-                    score = next((s for s, p in state.search_results if p == path), 0)
-                    prefix = f"{score:.3f}_"
-                elif tab == 'aes':
-                    avg_s = next((a for a, p, m in state.aesthetic_results if p == path), 0)
-                    prefix = f"{avg_s:05.2f}_"
-                elif tab == 'nsfw':
-                    danger_s = next((d for d, p, l, dt in state.nsfw_results if p == path), 0)
-                    prefix = f"{danger_s*100:05.1f}_"
-                elif tab == 'face':
-                    match_s = next((s for s, p in state.face_results if p == path), 0)
-                    prefix = f"{match_s*100:05.1f}_"
+                if tab == 'search': prefix = f"{next((s for s, p in state.search_results if p == path), 0):.3f}_"
+                elif tab == 'aes': prefix = f"{next((a for a, p, m in state.aesthetic_results if p == path), 0):05.2f}_"
+                elif tab == 'nsfw': prefix = f"{next((d for d, p, l, dt in state.nsfw_results if p == path), 0)*100:05.1f}_"
+                elif tab == 'face': prefix = f"{next((s for s, p in state.face_results if p == path), 0)*100:05.1f}_"
                     
             dest = os.path.join(folder, rel_dir, prefix + fname)
             os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -1952,82 +2345,54 @@ def index_page():
                 else: 
                     shutil.move(path, dest)
                     moved_paths.add(path)
+                
+                # Экспорт txt тегов (только для вкладки Tags)
+                if export_txt and tab == 'tags':
+                    txt_dest = os.path.splitext(dest)[0] + '.txt'
+                    # Достаем теги прямо из результатов
+                    item_data = next((i for i in state.tags_results if i[1] == path), None)
+                    if item_data and len(item_data) > 2:
+                        tags_dict = item_data[2]
+                        valid_tags =[t for t, s in tags_dict.items() if s >= txt_threshold]
+                        if valid_tags:
+                            with open(txt_dest, 'w', encoding='utf-8') as f:
+                                f.write(", ".join(valid_tags))
                 success += 1
             except Exception as e: state.add_log(f"Ошибка {path}: {e}")
                 
         ui.notify(f'Успешно {action}: {success} файлов', type='positive')
         
         if action == 'move' and moved_paths:
-            if tab == 'search':
-                state.search_results =[i for i in state.search_results if i[1] not in moved_paths]
-                search_gallery_ui.refresh()
-            elif tab == 'aes':
-                state.aesthetic_results =[i for i in state.aesthetic_results if i[1] not in moved_paths]
-                aesthetic_gallery_ui.refresh()
-            elif tab == 'nsfw':
-                state.nsfw_results =[i for i in state.nsfw_results if i[1] not in moved_paths]
-                nsfw_gallery_ui.refresh()
-            elif tab == 'face':
-                state.face_results =[i for i in state.face_results if i[1] not in moved_paths]
-                face_gallery_ui.refresh()
+            setattr(state, f"{tab}_results", [i for i in getattr(state, f"{tab}_results") if i[1] not in moved_paths])
+            globals()[f"{tab}_gallery_ui"].refresh()
 
     async def handle_shift_click(e, idx, path, tab):
-        # Проверяем, зажат ли Shift
         is_shift = isinstance(e.args, dict) and e.args.get('shiftKey', False)
-        # Ждем 50мс, чтобы NiceGUI успел обновить значение текущего чекбокса в словаре
         await asyncio.sleep(0.05) 
         
-        if tab == 'search':
-            sel_dict = state.sel_search
-            all_p =[p for s, p in state.search_results]
-        elif tab == 'aes':
-            sel_dict = state.sel_aes
-            all_p =[p for a, p, m in state.aesthetic_results]
-        elif tab == 'nsfw':
-            sel_dict = state.sel_nsfw
-            all_p =[p for d, p, l, dt in state.nsfw_results]
-        elif tab == 'face':
-            sel_dict = state.sel_face
-            all_p = [p for s, p in state.face_results]
+        sel_dict = getattr(state, f"sel_{tab}")
+        all_p = [p for i in getattr(state, f"{tab}_results") for p in[i[1]]]
 
-        # Получаем индекс прошлого клика (создастся автоматически, если его еще нет)
         last_idx = getattr(state, f'last_clicked_{tab}', None)
 
         if not is_shift:
-            # Обычный клик — запоминаем индекс
             setattr(state, f'last_clicked_{tab}', idx)
         else:
-            # Shift-клик — выделяем/снимаем выделение для диапазона
             if last_idx is not None:
                 start = min(idx, last_idx)
                 end = max(idx, last_idx)
-                # Берем то значение, которое только что получил кликнутый чекбокс
                 target_val = sel_dict.get(path, True)
-                
                 for i in range(start, end + 1):
                     sel_dict[all_p[i]] = target_val
 
     def set_all(tab, value):
-        if tab == 'search':
-            for _, p in state.search_results:
-                if state.search_res_filter == 'Картинки' and not p.lower().endswith(SUPPORTED_IMAGES): continue
-                if state.search_res_filter == 'Видео' and not p.lower().endswith(SUPPORTED_VIDEOS): continue
-                if p in state.sel_search: state.sel_search[p] = value
-        elif tab == 'aes':
-            for _, p, _ in state.aesthetic_results:
-                if state.aes_res_filter == 'Картинки' and not p.lower().endswith(SUPPORTED_IMAGES): continue
-                if state.aes_res_filter == 'Видео' and not p.lower().endswith(SUPPORTED_VIDEOS): continue
-                if p in state.sel_aes: state.sel_aes[p] = value
-        elif tab == 'nsfw':
-            for _, p, _, _ in state.nsfw_results:
-                if state.nsfw_res_filter == 'Картинки' and not p.lower().endswith(SUPPORTED_IMAGES): continue
-                if state.nsfw_res_filter == 'Видео' and not p.lower().endswith(SUPPORTED_VIDEOS): continue
-                if p in state.sel_nsfw: state.sel_nsfw[p] = value
-        elif tab == 'face':
-            for _, p in state.face_results:
-                if state.face_res_filter == 'Картинки' and not p.lower().endswith(SUPPORTED_IMAGES): continue
-                if state.face_res_filter == 'Видео' and not p.lower().endswith(SUPPORTED_VIDEOS): continue
-                if p in state.sel_face: state.sel_face[p] = value
+        filter_val = getattr(state, f"{tab}_res_filter")
+        sel_dict = getattr(state, f"sel_{tab}")
+        for item in getattr(state, f"{tab}_results"):
+            p = item[1]
+            if filter_val == 'Картинки' and not p.lower().endswith(SUPPORTED_IMAGES): continue
+            if filter_val == 'Видео' and not p.lower().endswith(SUPPORTED_VIDEOS): continue
+            if p in sel_dict: sel_dict[p] = value
 
     # --- КОМПОНЕНТЫ ГАЛЕРЕИ ---
     @ui.refreshable
@@ -2054,14 +2419,7 @@ def index_page():
             state.search_page = 1
             search_gallery_ui.refresh()
 
-        def render_pagination():
-            with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
-                ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
-                ui.label(f'Страница {state.search_page} из {total_pages}').classes('text-gray-300 font-bold')
-                ui.button(icon='chevron_right', on_click=lambda: change_page(1)).props('flat outline color=white')
-
         with ui.column().classes('w-full h-full flex flex-col p-0 m-0 gap-0 relative'):
-            # Фиксированная верхняя панель (Панель управления + Пагинатор)
             with ui.column().classes('w-full shrink-0 bg-gray-900 p-4 pb-2 border-b border-gray-800 z-20 gap-0 shadow-md'):
                 with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
                     with ui.row().classes('gap-2 items-center'):
@@ -2073,9 +2431,11 @@ def index_page():
                         ui.button('Копировать ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'search', chk_prefix_search.value)).props('color=blue dense')
                         ui.button('Переместить ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'search', chk_prefix_search.value)).props('color=red dense')
                 
-                render_pagination()
+                with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
+                    ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
+                    ui.label(f'Страница {state.search_page} из {total_pages}').classes('text-gray-300 font-bold')
+                    ui.button(icon='chevron_right', on_click=lambda: change_page(1)).props('flat outline color=white')
 
-            # Прокручиваемая область с результатами
             scroll_id = 'search_scroll_area'
             with ui.column().classes('w-full flex-1 overflow-y-auto p-4 relative').props(f'id="{scroll_id}"'):
                 start_idx = (state.search_page - 1) * ITEMS_PER_PAGE
@@ -2088,7 +2448,7 @@ def index_page():
                 with ui.grid(columns=int(state.grid_columns)).classes('w-full gap-6 pb-10'):
                     for score, path in page_items:
                         safe_path = urllib.parse.quote(path)
-                        global_index = all_paths.index(path) # Вычисляем индекс ЗДЕСЬ
+                        global_index = all_paths.index(path)
                         
                         with ui.card().classes('bg-gray-800 border border-gray-700 hover:border-blue-500 transition-colors p-0 overflow-hidden relative'):
                             with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
@@ -2109,7 +2469,6 @@ def index_page():
                                 ui.button(icon='folder', on_click=lambda p=path: reveal_file_native(p)).props('flat round dense color=white')
                             ui.label(os.path.basename(path)).classes('text-xs text-gray-400 px-2 pb-2 truncate w-full').tooltip(path)
 
-            # Плавающая кнопка "Наверх"
             ui.button(icon='keyboard_arrow_up', on_click=lambda: ui.run_javascript(f'document.getElementById("{scroll_id}").scrollTo({{top: 0, behavior: "smooth"}})')).props('round color=blue').classes('absolute bottom-6 right-6 z-50 shadow-lg').tooltip('Наверх')
 
     @ui.refreshable
@@ -2136,14 +2495,7 @@ def index_page():
             state.aes_page = 1
             aesthetic_gallery_ui.refresh()
 
-        def render_pagination():
-            with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
-                ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
-                ui.label(f'Страница {state.aes_page} из {total_pages}').classes('text-gray-300 font-bold')
-                ui.button(icon='chevron_right', on_click=lambda: change_page(1)).props('flat outline color=white')
-
         with ui.column().classes('w-full h-full flex flex-col p-0 m-0 gap-0 relative'):
-            # Фиксированная верхняя панель (Панель управления + Пагинатор)
             with ui.column().classes('w-full shrink-0 bg-gray-900 p-4 pb-2 border-b border-gray-800 z-20 gap-0 shadow-md'):
                 with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
                     with ui.row().classes('gap-2 items-center'):
@@ -2155,9 +2507,11 @@ def index_page():
                         ui.button('Копировать ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'aes', chk_prefix_aes.value)).props('color=yellow-800 dense')
                         ui.button('Переместить ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'aes', chk_prefix_aes.value)).props('color=red dense')
 
-                render_pagination()
+                with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
+                    ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
+                    ui.label(f'Страница {state.aes_page} из {total_pages}').classes('text-gray-300 font-bold')
+                    ui.button(icon='chevron_right', on_click=lambda: change_page(1)).props('flat outline color=white')
 
-            # Прокручиваемая область с результатами
             scroll_id = 'aes_scroll_area'
             with ui.column().classes('w-full flex-1 overflow-y-auto p-4 relative').props(f'id="{scroll_id}"'):
                 start_idx = (state.aes_page - 1) * ITEMS_PER_PAGE
@@ -2170,7 +2524,7 @@ def index_page():
                 with ui.grid(columns=int(state.grid_columns)).classes('w-full gap-6 pb-10'):
                     for avg_score, path, max_score in page_items:
                         safe_path = urllib.parse.quote(path)
-                        global_index = all_paths.index(path) # Вычисляем индекс ЗДЕСЬ
+                        global_index = all_paths.index(path)
                         
                         with ui.card().classes('bg-gray-800 border border-gray-700 hover:border-yellow-500 transition-colors p-0 overflow-hidden relative'):
                             with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
@@ -2188,7 +2542,6 @@ def index_page():
                                 if avg_score != max_score: ui.label(f"Пик: {max_score:.2f}").classes('text-xs text-gray-500')
                             ui.label(os.path.basename(path)).classes('text-xs text-gray-400 px-2 pb-2 truncate w-full').tooltip(path)
 
-            # Плавающая кнопка "Наверх"
             ui.button(icon='keyboard_arrow_up', on_click=lambda: ui.run_javascript(f'document.getElementById("{scroll_id}").scrollTo({{top: 0, behavior: "smooth"}})')).props('round color=yellow-800').classes('absolute bottom-6 right-6 z-50 shadow-lg').tooltip('Наверх')
 
     @ui.refreshable
@@ -2215,14 +2568,7 @@ def index_page():
             state.nsfw_page = 1
             nsfw_gallery_ui.refresh()
 
-        def render_pagination():
-            with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
-                ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
-                ui.label(f'Страница {state.nsfw_page} из {total_pages}').classes('text-gray-300 font-bold')
-                ui.button(icon='chevron_right', on_click=lambda: change_page(1)).props('flat outline color=white')
-
         with ui.column().classes('w-full h-full flex flex-col p-0 m-0 gap-0 relative'):
-            # Фиксированная верхняя панель (Панель управления + Пагинатор)
             with ui.column().classes('w-full shrink-0 bg-gray-900 p-4 pb-2 border-b border-gray-800 z-20 gap-0 shadow-md'):
                 with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
                     with ui.row().classes('gap-2 items-center'):
@@ -2234,9 +2580,11 @@ def index_page():
                         ui.button('Копировать ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'nsfw', chk_prefix_nsfw.value)).props('color=red-800 dense')
                         ui.button('Переместить ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'nsfw', chk_prefix_nsfw.value)).props('color=red dense')
 
-                render_pagination()
+                with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
+                    ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
+                    ui.label(f'Страница {state.nsfw_page} из {total_pages}').classes('text-gray-300 font-bold')
+                    ui.button(icon='chevron_right', on_click=lambda: change_page(1)).props('flat outline color=white')
 
-            # Прокручиваемая область с результатами
             scroll_id = 'nsfw_scroll_area'
             with ui.column().classes('w-full flex-1 overflow-y-auto p-4 relative').props(f'id="{scroll_id}"'):
                 start_idx = (state.nsfw_page - 1) * ITEMS_PER_PAGE
@@ -2249,7 +2597,7 @@ def index_page():
                 with ui.grid(columns=int(state.grid_columns)).classes('w-full gap-6 pb-10'):
                     for danger_score, path, top_label, details in page_items:
                         safe_path = urllib.parse.quote(path)
-                        global_index = all_paths.index(path) # Вычисляем индекс ЗДЕСЬ
+                        global_index = all_paths.index(path)
                         
                         with ui.card().classes('bg-gray-800 border border-gray-700 hover:border-red-500 transition-colors p-0 overflow-hidden relative'):
                             with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
@@ -2269,7 +2617,6 @@ def index_page():
                             ui.label(top_label.upper()).classes('text-xs text-gray-400 font-bold px-2')
                             ui.label(os.path.basename(path)).classes('text-xs text-gray-400 px-2 pb-2 truncate w-full').tooltip(path)
 
-            # Плавающая кнопка "Наверх"
             ui.button(icon='keyboard_arrow_up', on_click=lambda: ui.run_javascript(f'document.getElementById("{scroll_id}").scrollTo({{top: 0, behavior: "smooth"}})')).props('round color=red-800').classes('absolute bottom-6 right-6 z-50 shadow-lg').tooltip('Наверх')
 
     @ui.refreshable
@@ -2296,14 +2643,7 @@ def index_page():
             state.face_page = 1
             face_gallery_ui.refresh()
 
-        def render_pagination():
-            with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
-                ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
-                ui.label(f'Страница {state.face_page} из {total_pages}').classes('text-gray-300 font-bold')
-                ui.button(icon='chevron_right', on_click=lambda: change_page(1)).props('flat outline color=white')
-
         with ui.column().classes('w-full h-full flex flex-col p-0 m-0 gap-0 relative'):
-            # Фиксированная верхняя панель
             with ui.column().classes('w-full shrink-0 bg-gray-900 p-4 pb-2 border-b border-gray-800 z-20 gap-0 shadow-md'):
                 with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
                     with ui.row().classes('gap-2 items-center'):
@@ -2315,9 +2655,11 @@ def index_page():
                         ui.button('Копировать ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'face', chk_prefix_face.value)).props('color=teal-800 dense')
                         ui.button('Переместить ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'face', chk_prefix_face.value)).props('color=red dense')
 
-                render_pagination()
+                with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
+                    ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
+                    ui.label(f'Страница {state.face_page} из {total_pages}').classes('text-gray-300 font-bold')
+                    ui.button(icon='chevron_right', on_click=lambda: change_page(1)).props('flat outline color=white')
 
-            # Прокручиваемая область с результатами
             scroll_id = 'face_scroll_area'
             with ui.column().classes('w-full flex-1 overflow-y-auto p-4 relative').props(f'id="{scroll_id}"'):
                 start_idx = (state.face_page - 1) * ITEMS_PER_PAGE
@@ -2348,8 +2690,86 @@ def index_page():
                                 ui.button(icon='folder', on_click=lambda p=path: reveal_file_native(p)).props('flat round dense color=white')
                             ui.label(os.path.basename(path)).classes('text-xs text-gray-400 px-2 pb-2 truncate w-full').tooltip(path)
 
-            # Плавающая кнопка "Наверх"
             ui.button(icon='keyboard_arrow_up', on_click=lambda: ui.run_javascript(f'document.getElementById("{scroll_id}").scrollTo({{top: 0, behavior: "smooth"}})')).props('round color=teal-800').classes('absolute bottom-6 right-6 z-50 shadow-lg').tooltip('Наверх')
+
+    # --- КОМПОНЕНТ ГАЛЕРЕИ ТЕГОВ ---
+    @ui.refreshable
+    def tags_gallery_ui():
+        if not state.tags_results:
+            return ui.label("Здесь появятся картинки, подходящие под выбранные теги...").classes("text-gray-400 m-4")
+
+        filtered_results = []
+        for item in state.tags_results:
+            p = item[1].lower()
+            if state.tags_res_filter == 'Картинки' and not p.endswith(SUPPORTED_IMAGES): continue
+            if state.tags_res_filter == 'Видео' and not p.endswith(SUPPORTED_VIDEOS): continue
+            filtered_results.append(item)
+
+        total_pages = max(1, (len(filtered_results) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+        if state.tags_page > total_pages: state.tags_page = 1
+
+        def change_page(d):
+            state.tags_page = max(1, min(total_pages, state.tags_page + d))
+            tags_gallery_ui.refresh()
+
+        def apply_filter(e):
+            state.tags_res_filter = e.value
+            state.tags_page = 1
+            tags_gallery_ui.refresh()
+
+        with ui.column().classes('w-full h-full flex flex-col p-0 m-0 gap-0 relative'):
+            with ui.column().classes('w-full shrink-0 bg-gray-900 p-4 pb-2 border-b border-gray-800 z-20 gap-0 shadow-md'):
+                with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
+                    with ui.row().classes('gap-2 items-center'):
+                        ui.button('Выбрать всё', on_click=lambda: set_all('tags', True)).props('outline color=white dense')
+                        ui.button('Снять всё', on_click=lambda: set_all('tags', False)).props('outline color=white dense')
+                        ui.toggle(['Все', 'Картинки', 'Видео'], value=state.tags_res_filter, on_change=apply_filter).classes('text-xs ml-2')
+                    with ui.row().classes('gap-2 items-center'):
+                        ui.button('HTML Экспорт', icon='html', on_click=lambda: export_html_action('tags')).props('color=purple dense outline')
+                        # Добавляем галочку экспорта txt только для копирования тегов
+                        ui.button('Копировать ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'tags', False, chk_txt_tags.value, tags_threshold.value)).props('color=pink-800 dense')
+                        ui.button('Переместить ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'tags', False, chk_txt_tags.value, tags_threshold.value)).props('color=red dense')
+
+                with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
+                    ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
+                    ui.label(f'Страница {state.tags_page} из {total_pages}').classes('text-gray-300 font-bold')
+                    ui.button(icon='chevron_right', on_click=lambda: change_page(1)).props('flat outline color=white')
+
+            scroll_id = 'tags_scroll_area'
+            with ui.column().classes('w-full flex-1 overflow-y-auto p-4 relative').props(f'id="{scroll_id}"'):
+                start_idx = (state.tags_page - 1) * ITEMS_PER_PAGE
+                page_items = filtered_results[start_idx : start_idx + ITEMS_PER_PAGE]
+                all_paths = [p for s, p, t in filtered_results]
+
+                if not page_items:
+                    ui.label("Нет файлов, подходящих под выбранный фильтр.").classes("text-gray-400 m-4")
+
+                with ui.grid(columns=int(state.grid_columns)).classes('w-full gap-6 pb-10'):
+                    for score, path, tags_dict in page_items:
+                        safe_path = urllib.parse.quote(path)
+                        global_index = all_paths.index(path)
+                        
+                        # Берем топ-3 тегов для предпросмотра
+                        top_tags = sorted(tags_dict.items(), key=lambda x: x[1], reverse=True)[:3]
+                        top_tags_str = ", ".join([f"{k}" for k, v in top_tags])
+                        
+                        with ui.card().classes('bg-gray-800 border border-gray-700 hover:border-pink-500 transition-colors p-0 overflow-hidden relative'):
+                            with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
+                                ui.checkbox().bind_value(state.sel_tags, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'tags'), ['shiftKey'])
+
+                            with ui.context_menu():
+                                ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
+                                ui.menu_item('Копировать картинку', on_click=lambda p=path: copy_image_to_clipboard(p))
+                                ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
+
+                            ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
+                            
+                            with ui.row().classes('w-full justify-between items-center p-2 bg-gray-800'):
+                                ui.label(top_tags_str).classes('text-pink-400 font-bold text-xs truncate max-w-[80%]').tooltip(", ".join([f"{k} ({v:.2f})" for k, v in top_tags]))
+                                ui.button(icon='sell', on_click=lambda p=path, d=tags_dict: show_tags_debug(p, d)).props('flat round dense color=white').tooltip('Все теги')
+                            ui.label(os.path.basename(path)).classes('text-xs text-gray-400 px-2 pb-2 truncate w-full').tooltip(path)
+
+            ui.button(icon='keyboard_arrow_up', on_click=lambda: ui.run_javascript(f'document.getElementById("{scroll_id}").scrollTo({{top: 0, behavior: "smooth"}})')).props('round color=pink-800').classes('absolute bottom-6 right-6 z-50 shadow-lg').tooltip('Наверх')
 
     # --- ОСНОВНАЯ РАБОЧАЯ ОБЛАСТЬ ---
     with ui.tab_panels(tabs).bind_value(state, 'current_tab').classes('w-full bg-[#121212] p-0'):
@@ -2391,10 +2811,8 @@ def index_page():
                             search_quant_mode = ui.select(['None', '8-bit', '4-bit'], value=cfg.get('search_quant_mode', 'None'), label='Квант').classes('w-[45%]')
                             min_score = ui.number('Мин Score', value=cfg.get('min_score', 0.25), format='%.2f', step=0.05).classes('w-[45%]')
                         
-                        # --- ДОБАВЛЕННЫЙ БЛОК NSFW-ФИЛЬТРА ДЛЯ ПОИСКА ---
                         with ui.column().classes('w-full gap-0 px-2 pb-2 pt-2 border-t border-gray-700'):
                             search_nsfw_filter = ui.toggle(['Все', 'Только SFW', 'Только NSFW'], value=cfg.get('search_nsfw_filter', 'Все')).classes('w-full text-xs mb-1')
-                            # Показываем галочку только если выбран фильтр (не "Все")
                             search_strict_nsfw = ui.checkbox('Строгий режим (скрывать файлы, которых нет в базе NSFW)', value=cfg.get('search_strict_nsfw', False)) \
                                 .classes('text-xs text-red-400') \
                                 .bind_visibility_from(search_nsfw_filter, 'value', value=lambda v: v != 'Все')
@@ -2423,6 +2841,7 @@ def index_page():
                     aesthetic_engine.unload()
                     nsfw_engine.unload()
                     face_engine.unload()
+                    tag_engine.unload()
                     
                     exts =[]
                     if chk_img.value: exts.extend(SUPPORTED_IMAGES)
@@ -2444,25 +2863,20 @@ def index_page():
                             if use_reranker.value: 
                                 cands = search_engine.phase2_rerank(inp_query.value, q_rank, cands, float(min_score.value), rerank_model.value)
 
-                            # --- ЛОГИКА ФИЛЬТРАЦИИ NSFW ---
                             if search_nsfw_filter.value != 'Все':
                                 filtered_cands =[]
                                 for score, path in cands:
                                     danger = search_engine.db_cache.get_max_danger_score(path)
-                                    
-                                    if danger == -1.0: # Файла нет в базе
-                                        if search_strict_nsfw.value: continue # Строгий режим: отсекаем
+                                    if danger == -1.0:
+                                        if search_strict_nsfw.value: continue
                                         else:
-                                            # Мягкий режим: неизвестное считаем за SFW (а в NSFW-поиск не пускаем)
                                             if search_nsfw_filter.value == 'Только NSFW': continue 
                                     else:
-                                        is_nsfw = danger >= state.nsfw_threshold # Порог опасности (можно поменять, 0.45 = 45%)
+                                        is_nsfw = danger >= state.nsfw_threshold
                                         if search_nsfw_filter.value == 'Только SFW' and is_nsfw: continue
                                         if search_nsfw_filter.value == 'Только NSFW' and not is_nsfw: continue
-                                        
                                     filtered_cands.append((score, path))
                                 cands = filtered_cands
-                            # -----------------------------
                                 
                             state.search_results = cands
                             state.sel_search = {path: False for _, path in cands}
@@ -2510,7 +2924,6 @@ def index_page():
                             aes_max_dim = ui.number('Лимит разр.', value=cfg.get('aes_max_dim', 512), format='%.0f').classes('w-[45%]')
                             aes_quant_mode = ui.select(['None', '8-bit', '4-bit'], value=cfg.get('aes_quant_mode', 'None'), label='Квант').classes('w-[45%]')
                             
-                        # --- ДОБАВЛЕННЫЙ БЛОК NSFW-ФИЛЬТРА ДЛЯ ЭСТЕТИКИ ---
                         with ui.column().classes('w-full gap-0 px-2 pb-2 pt-2 border-t border-gray-700'):
                             aes_nsfw_filter = ui.toggle(['Все', 'Только SFW', 'Только NSFW'], value=cfg.get('aes_nsfw_filter', 'Все')).classes('w-full text-xs mb-1')
                             aes_strict_nsfw = ui.checkbox('Строгий режим (скрывать файлы, которых нет в базе NSFW)', value=cfg.get('aes_strict_nsfw', False)) \
@@ -2537,6 +2950,7 @@ def index_page():
                     search_engine._unload_embedding_model()
                     nsfw_engine.unload()
                     face_engine.unload()
+                    tag_engine.unload()
                     
                     exts =[]
                     if chk_img_aes.value: exts.extend(SUPPORTED_IMAGES)
@@ -2555,14 +2969,12 @@ def index_page():
                             
                             res = aesthetic_engine.evaluate_media(rate_dir.value, tuple(exts))
 
-                            # --- ЛОГИКА ФИЛЬТРАЦИИ NSFW ---
                             if aes_nsfw_filter.value != 'Все':
                                 filtered_res =[]
                                 for item in res:
-                                    path = item[1] # В эстетике структура: (avg_score, path, max_score)
+                                    path = item[1] 
                                     danger = aesthetic_engine.db_cache.get_max_danger_score(path)
-                                    
-                                    if danger == -1.0: # Нет в базе
+                                    if danger == -1.0: 
                                         if aes_strict_nsfw.value: continue
                                         else:
                                             if aes_nsfw_filter.value == 'Только NSFW': continue
@@ -2570,10 +2982,8 @@ def index_page():
                                         is_nsfw = danger >= state.nsfw_threshold
                                         if aes_nsfw_filter.value == 'Только SFW' and is_nsfw: continue
                                         if aes_nsfw_filter.value == 'Только NSFW' and not is_nsfw: continue
-                                        
                                     filtered_res.append(item)
                                 res = filtered_res
-                            # -----------------------------
                                 
                             state.aesthetic_results = res[:n]
                             state.sel_aes = {path: False for _, path, _ in state.aesthetic_results}
@@ -2643,6 +3053,7 @@ def index_page():
                     search_engine._unload_embedding_model()
                     aesthetic_engine.unload()
                     face_engine.unload()
+                    tag_engine.unload()
                     
                     exts =[]
                     if chk_img_nsfw.value: exts.extend(SUPPORTED_IMAGES)
@@ -2727,6 +3138,7 @@ def index_page():
                     search_engine._unload_embedding_model()
                     aesthetic_engine.unload()
                     nsfw_engine.unload()
+                    tag_engine.unload()
                     
                     exts =[]
                     if chk_img_face.value: exts.extend(SUPPORTED_IMAGES)
@@ -2759,7 +3171,210 @@ def index_page():
             with ui.column().classes('flex-1 w-0 bg-gray-900 rounded-xl border border-gray-800 overflow-hidden h-full relative p-0'):
                 face_gallery_ui()
 
-        # ВКЛАДКА 5: ИНДЕКСАТОР (Кэш)
+        # ВКЛАДКА 5: ТЕГИ (DANBOORU)
+        with ui.tab_panel(tab_tags).classes('w-full h-[calc(100vh-115px)] p-4 flex flex-row flex-nowrap items-stretch gap-4'):
+            with ui.column().classes('w-[350px] shrink-0 bg-gray-900 rounded-xl border border-gray-800 shadow-lg flex flex-col overflow-hidden p-0 gap-0'):
+                with ui.row().classes('w-full p-4 pb-2 shrink-0 border-b border-gray-800 bg-gray-900 z-10'):
+                    ui.label('Поиск по тегам').classes('text-lg font-bold')
+                
+                with ui.column().classes('w-full flex-1 overflow-y-auto p-4 gap-2 min-h-0'):
+                    with ui.row().classes('w-full items-center gap-1 flex-nowrap'):
+                        tags_dir = ui.input('Папка', value=cfg.get('tags_dir', '')).classes('flex-grow')
+                        ui.button(icon='folder', on_click=lambda: select_folder(tags_dir)).props('flat round dense')
+                        ui.button(icon='delete_sweep', on_click=lambda: clear_folder_cache(tags_dir.value)).props('flat round dense text-color=red').tooltip('Очистить индекс файлов папки')
+                    
+                    with ui.row().classes('w-full gap-2'):
+                        chk_img_tags = ui.checkbox('Картинки', value=cfg.get('chk_img_tags', True))
+                        chk_vid_tags = ui.checkbox('Видео', value=cfg.get('chk_vid_tags', False))
+                    
+                    tags_model_sel = ui.select([
+                        'SmilingWolf/wd-swinv2-tagger-v3',
+                        'SmilingWolf/wd-convnext-tagger-v3',
+                        'SmilingWolf/wd-eva02-large-tagger-v3',
+                        'SmilingWolf/wd-vit-tagger-v3',
+                        'Camais03/camie-tagger-v2',
+                        'fancyfeast/joytag'
+                    ], value=cfg.get('tags_model', 'SmilingWolf/wd-swinv2-tagger-v3'), label='Модель').classes('w-full text-xs')
+                    
+                    # Кнопка подгрузки тегов из БД
+                    def load_available_tags():
+                        if not tags_dir.value: return ui.notify("Сначала выберите папку", type='warning')
+                        exts =[]
+                        if chk_img_tags.value: exts.extend(SUPPORTED_IMAGES)
+                        if chk_vid_tags.value: exts.extend(SUPPORTED_VIDEOS)
+                        
+                        all_files = search_engine._gather_files(tags_dir.value, tuple(exts))
+                        
+                        # Берем значение кадров из конфига, так как UI элемент tags_video_frames создается ниже
+                        frames_val = int(cfg.get('tags_video_frames', 4))
+                        cache_key = f"{tags_model_sel.value}_{frames_val}"
+                        
+                        unique_tags = {}
+                        for f in all_files:
+                            tags = search_engine.db_cache.get_tags(cache_key, f)
+                            if tags:
+                                for t in tags.keys(): unique_tags[t] = unique_tags.get(t, 0) + 1
+                                
+                        if not unique_tags:
+                            return ui.notify("В базе нет тегов для этой папки. Нажмите 'Индексировать'.", type='warning')
+                            
+                        sorted_tags = sorted(unique_tags.keys(), key=lambda x: unique_tags[x], reverse=True)
+                        pos_tags_sel.options = sorted_tags[:3000]
+                        neg_tags_sel.options = sorted_tags[:3000]
+                        pos_tags_sel.update()
+                        neg_tags_sel.update()
+                        ui.notify(f"Загружено {len(sorted_tags)} уникальных тегов.", type='positive')
+
+                    ui.button('🔄 Загрузить доступные теги из БД', on_click=load_available_tags).props('outline color=pink size=sm').classes('w-full')
+
+                    # --- БЛОК ПОЗИТИВНЫХ ТЕГОВ ---
+                    with ui.row().classes('w-full items-center justify-between mt-2 mb-[-12px]'):
+                        ui.label('Включая (Positive - AND)').classes('text-sm font-bold text-blue-400')
+                        ui.button('Очистить всё', on_click=lambda: pos_tags_sel.set_value([])).props('flat dense size=sm color=red')
+                    
+                    # Свойство hide-selected скроет теги внутри поля, чтобы оно не растягивалось
+                    pos_tags_sel = ui.select([], multiple=True, with_input=True, value=cfg.get('pos_tags',[])).classes('w-full').props('hide-selected')
+                    pos_tags_container = ui.row().classes('w-full gap-1 mt-1')
+                    
+                    def remove_pos_tag(tag):
+                        pos_tags_sel.set_value([t for t in pos_tags_sel.value if t != tag])
+
+                    def update_pos_tags(e=None):
+                        pos_tags_container.clear()
+                        with pos_tags_container:
+                            for tag in pos_tags_sel.value:
+                                ui.button(f"{tag} ✖", on_click=lambda _, t=tag: remove_pos_tag(t)) \
+                                    .props('dense size=sm outline color=blue-300 no-caps') \
+                                    .classes('rounded-full px-2 py-0 min-h-0 text-xs bg-blue-900/30')
+                    
+                    pos_tags_sel.on_value_change(update_pos_tags)
+                    update_pos_tags()
+
+                    # --- БЛОК НЕГАТИВНЫХ ТЕГОВ ---
+                    with ui.row().classes('w-full items-center justify-between mt-4 mb-[-12px]'):
+                        ui.label('Исключая (Negative - NOT)').classes('text-sm font-bold text-pink-400')
+                        ui.button('Очистить всё', on_click=lambda: neg_tags_sel.set_value([])).props('flat dense size=sm color=red')
+                        
+                    neg_tags_sel = ui.select([], multiple=True, with_input=True, value=cfg.get('neg_tags',[])).classes('w-full').props('hide-selected')
+                    neg_tags_container = ui.row().classes('w-full gap-1 mt-1')
+
+                    def remove_neg_tag(tag):
+                        neg_tags_sel.set_value([t for t in neg_tags_sel.value if t != tag])
+
+                    def update_neg_tags(e=None):
+                        neg_tags_container.clear()
+                        with neg_tags_container:
+                            for tag in neg_tags_sel.value:
+                                ui.button(f"{tag} ✖", on_click=lambda _, t=tag: remove_neg_tag(t)) \
+                                    .props('dense size=sm outline color=pink-300 no-caps') \
+                                    .classes('rounded-full px-2 py-0 min-h-0 text-xs bg-pink-900/30')
+                                
+                    neg_tags_sel.on_value_change(update_neg_tags)
+                    update_neg_tags()
+                    
+                    tags_threshold = ui.number('Порог уверенности (0.1 - 1.0)', value=cfg.get('tags_threshold', 0.4), format='%.2f', step=0.05).classes('w-full mt-4')
+                    chk_txt_tags = ui.checkbox('Сохранять .txt файл с тегами при копировании', value=cfg.get('chk_txt_tags', True)).classes('text-sm text-gray-300 w-full')
+
+                    with ui.expansion('Тонкие настройки', icon='tune').classes('w-full bg-gray-800/50 rounded-lg border border-gray-700 mt-2'):
+                        with ui.row().classes('w-full gap-2 px-2 pt-2'):
+                            tags_batch_size = ui.number('Батч', value=cfg.get('tags_batch_size', 8), format='%.0f').classes('w-[45%]')
+                            tags_video_frames = ui.number('Кадры', value=cfg.get('tags_video_frames', 4), format='%.0f').classes('w-[45%]')
+
+                async def index_tags_action():
+                    save_config({
+                        'tags_dir': tags_dir.value, 'chk_img_tags': chk_img_tags.value, 'chk_vid_tags': chk_vid_tags.value,
+                        'tags_model': tags_model_sel.value, 'tags_batch_size': tags_batch_size.value, 
+                        'tags_video_frames': tags_video_frames.value
+                    })
+                    if not tags_dir.value: return ui.notify("Укажите папку!", type='warning')
+                    
+                    state.is_processing = True
+                    search_engine.cancel_flag = False
+                    btn_index_tags.disable()
+                    btn_search_tags.disable()
+                    
+                    search_engine._unload_embedding_model()
+                    aesthetic_engine.unload()
+                    nsfw_engine.unload()
+                    face_engine.unload()
+                    
+                    exts =[]
+                    if chk_img_tags.value: exts.extend(SUPPORTED_IMAGES)
+                    if chk_vid_tags.value: exts.extend(SUPPORTED_VIDEOS)
+
+                    def bg_task():
+                        try:
+                            state.add_log(f"Индексация тегов для папки: '{tags_dir.value}'")
+                            tag_engine.batch_size = int(tags_batch_size.value)
+                            tag_engine.video_frames = int(tags_video_frames.value)
+                            tag_engine.evaluate_media(tags_dir.value, tags_model_sel.value, tuple(exts))
+                            state.add_log("✅ Индексация тегов завершена!")
+                        except Exception as e: state.add_log(f"❌ Ошибка: {e}")
+                        finally:
+                            state.status_text = "Готово!"
+                            state.progress = 1.0
+                            state.is_processing = False
+
+                    await run.io_bound(bg_task)
+                    btn_index_tags.enable()
+                    btn_search_tags.enable()
+
+                async def search_tags_action():
+                    save_config({
+                        'tags_dir': tags_dir.value, 'pos_tags': pos_tags_sel.value, 'neg_tags': neg_tags_sel.value,
+                        'tags_threshold': tags_threshold.value, 'chk_txt_tags': chk_txt_tags.value
+                    })
+                    if not tags_dir.value: return ui.notify("Укажите папку!", type='warning')
+                    
+                    state.tags_base_dir = tags_dir.value
+                    state.tags_results.clear()
+                    state.sel_tags.clear()
+                    state.tags_page = 1
+                    tags_gallery_ui.refresh()
+                    
+                    exts =[]
+                    if chk_img_tags.value: exts.extend(SUPPORTED_IMAGES)
+                    if chk_vid_tags.value: exts.extend(SUPPORTED_VIDEOS)
+
+                    all_files = search_engine._gather_files(tags_dir.value, tuple(exts))
+                    cache_key = f"{tags_model_sel.value}_{int(tags_video_frames.value)}"
+                    
+                    res =[]
+                    thres = float(tags_threshold.value)
+                    pos = set(pos_tags_sel.value)
+                    neg = set(neg_tags_sel.value)
+                    
+                    for p in all_files:
+                        tags = search_engine.db_cache.get_tags(cache_key, p)
+                        if not tags: continue
+                        
+                        valid = True
+                        for pt in pos:
+                            if pt not in tags or tags[pt] < thres:
+                                valid = False; break
+                        if not valid: continue
+                        
+                        for nt in neg:
+                            if nt in tags and tags[nt] >= thres:
+                                valid = False; break
+                        if not valid: continue
+                        
+                        score = sum([tags[pt] for pt in pos]) if pos else max(tags.values()) if tags else 0
+                        res.append((score, p, tags))
+                        
+                    res.sort(key=lambda x: x[0], reverse=True)
+                    state.tags_results = res
+                    state.sel_tags = {p: False for s, p, t in res}
+                    tags_gallery_ui.refresh()
+                    
+                with ui.row().classes('w-full p-4 pt-2 shrink-0 border-t border-gray-800 bg-gray-900 z-10 gap-2'):
+                    btn_index_tags = ui.button('🔍 Индексировать', on_click=index_tags_action).classes('w-full bg-gray-700 hover:bg-gray-600 font-bold')
+                    btn_search_tags = ui.button('🎯 Искать', on_click=search_tags_action).classes('w-full bg-pink-700 hover:bg-pink-600 font-bold')
+
+            with ui.column().classes('flex-1 w-0 bg-gray-900 rounded-xl border border-gray-800 overflow-hidden h-full relative p-0'):
+                tags_gallery_ui()
+
+        # ВКЛАДКА 6: ИНДЕКСАТОР (Кэш)
         with ui.tab_panel(tab_cache).classes('w-full h-[calc(100vh-115px)] p-8 flex flex-col items-center overflow-y-auto pb-24'):
             with ui.card().classes('w-full max-w-[600px] p-6 flex flex-col gap-4 bg-gray-900 border border-gray-800 shrink-0 mb-12 mt-4'):
                 ui.label('Массовая Индексация (Предкэширование)').classes('text-xl font-bold text-blue-400')
@@ -2791,7 +3406,14 @@ def index_page():
                     nsfw_model_cache = ui.select(['prithivMLmods/siglip2-x256-explicit-content', 'strangerguardhf/nsfw-image-detection'], value=cfg.get('nsfw_model', 'prithivMLmods/siglip2-x256-explicit-content')).classes('flex-1')
                     cache_nsfw_quant = ui.select(['None', '8-bit', '4-bit'], value=cfg.get('nsfw_quant_mode', 'None'), label='Квант').classes('w-24')
 
-                # --- КЭШ ЛИЦ ---
+                chk_cache_tags = ui.checkbox('Тегирование (Danbooru)', value=cfg.get('chk_cache_tags', True)).classes('text-md font-bold text-pink-300')
+                with ui.row().classes('w-full pl-6 pr-6 items-center gap-2').bind_visibility_from(chk_cache_tags, 'value'):
+                    tags_model_cache = ui.select([
+                        'SmilingWolf/wd-swinv2-tagger-v3', 'SmilingWolf/wd-convnext-tagger-v3', 
+                        'SmilingWolf/wd-eva02-large-tagger-v3', 'SmilingWolf/wd-vit-tagger-v3', 
+                        'Camais03/camie-tagger-v2', 'fancyfeast/joytag'
+                    ], value=cfg.get('tags_model', 'SmilingWolf/wd-swinv2-tagger-v3')).classes('flex-1')
+
                 chk_cache_face = ui.checkbox('Поиск по лицу (InsightFace)', value=cfg.get('chk_cache_face', False)).classes('text-md font-bold text-teal-300')
 
                 with ui.expansion('Единые тонкие настройки', icon='tune').classes('w-full bg-gray-800/50 rounded-lg border border-gray-700 mt-4'):
@@ -2801,16 +3423,12 @@ def index_page():
                     with ui.row().classes('w-full gap-4 px-4 pb-4'):
                         cache_max_dim = ui.number('Лимит разрешения (размер)', value=cfg.get('emb_size', 512), format='%.0f').classes('flex-1')
                 
-                # --- НОВЫЙ БЛОК НАСТРОЕК ОПТИМИЗАЦИИ ПАМЯТИ ---
                 with ui.expansion('Оптимизация памяти (ОЗУ)', icon='memory').classes('w-full bg-gray-800/50 rounded-lg border border-gray-700 mt-2'):
                     with ui.column().classes('w-full gap-2 px-4 py-4'):
                         ui.label('Эти настройки предотвращают вылет программы (OOM) при больших папках.').classes('text-gray-400 text-xs')
-                        
-                        use_ram_compression = ui.checkbox('Сжатие кэша в ОЗУ (Экономит до 90% памяти ценой 5-10% нагрузки на CPU)', value=cfg.get('use_ram_compression', False)).classes('text-sm text-green-400 font-bold')
-                        
+                        use_ram_compression = ui.checkbox('Сжатие кэша в ОЗУ', value=cfg.get('use_ram_compression', False)).classes('text-sm text-green-400 font-bold')
                         ui.label('Блочная архитектура (Радикально спасает ОЗУ)').classes('font-bold text-sm mt-2')
                         cache_chunk_size = ui.number('Размер блока файлов (0 = выключено, рекомендуемое = 2000)', value=cfg.get('cache_chunk_size', 2000), format='%.0f').classes('w-full')
-                # --------------------------------------------------
 
                 async def run_cache_action():
                     save_config({
@@ -2818,6 +3436,7 @@ def index_page():
                         'chk_cache_vid': chk_cache_vid.value, 'chk_cache_txt': chk_cache_txt.value,
                         'chk_cache_search': chk_cache_search.value, 'chk_cache_aes': chk_cache_aes.value, 
                         'chk_cache_nsfw': chk_cache_nsfw.value, 'chk_cache_face': chk_cache_face.value,
+                        'chk_cache_tags': chk_cache_tags.value,
                         'search_quant_mode': cache_search_quant.value, 'aes_quant_mode': cache_aes_quant.value,
                         'nsfw_quant_mode': cache_nsfw_quant.value,
                         'use_ram_compression': use_ram_compression.value, 'cache_chunk_size': cache_chunk_size.value
@@ -2860,9 +3479,11 @@ def index_page():
                             nsfw_engine.video_frames = int(cache_video_frames.value)
                             nsfw_engine.quant_mode = cache_nsfw_quant.value
                             
+                            tag_engine.batch_size = max(1, int(cache_batch_size.value) // 2) # Теггеры едят больше VRAM, чуть урежем
+                            tag_engine.video_frames = int(cache_video_frames.value)
+
                             face_engine.batch_size = int(cache_batch_size.value)
 
-                            # --- НОВАЯ ЛОГИКА БЛОЧНОЙ ОБРАБОТКИ (Вариант 3) ---
                             all_allowed_exts = tuple(set(exts_search + exts_media))
                             all_files_for_index = search_engine._gather_files(cache_dir.value, all_allowed_exts)
                             
@@ -2891,6 +3512,7 @@ def index_page():
                                     nsfw_engine.unload()
                                     aesthetic_engine.unload()
                                     face_engine.unload()
+                                    tag_engine.unload()
                                     search_engine.build_cache(cache_dir.value, emb_model_cache.value, int(cache_batch_size.value), tuple(exts_search), override_files=chunk)
                                     
                                 if chk_cache_aes.value and not search_engine.cancel_flag:
@@ -2899,6 +3521,7 @@ def index_page():
                                     search_engine._unload_embedding_model()
                                     nsfw_engine.unload()
                                     face_engine.unload()
+                                    tag_engine.unload()
                                     aesthetic_engine.evaluate_media(cache_dir.value, tuple(exts_media), override_files=chunk)
                                     
                                 if chk_cache_nsfw.value and not search_engine.cancel_flag:
@@ -2907,24 +3530,33 @@ def index_page():
                                     search_engine._unload_embedding_model()
                                     aesthetic_engine.unload()
                                     face_engine.unload()
+                                    tag_engine.unload()
                                     nsfw_engine.evaluate_media(cache_dir.value, nsfw_model_cache.value, tuple(exts_media), override_files=chunk)
+
+                                if chk_cache_tags.value and not search_engine.cancel_flag:
+                                    if len(chunks) > 1: state.add_log(f"-> Блок {idx+1}: Тегирование (Danbooru)")
+                                    else: state.add_log(f"-> Этап 4: Тегирование (Danbooru)")
+                                    search_engine._unload_embedding_model()
+                                    aesthetic_engine.unload()
+                                    face_engine.unload()
+                                    nsfw_engine.unload()
+                                    tag_engine.evaluate_media(cache_dir.value, tags_model_cache.value, tuple(exts_media), override_files=chunk)
 
                                 if chk_cache_face.value and not search_engine.cancel_flag:
                                     if len(chunks) > 1: state.add_log(f"-> Блок {idx+1}: Кэширование Лиц (InsightFace)")
-                                    else: state.add_log(f"-> Этап 4: Кэширование Лиц (InsightFace)")
+                                    else: state.add_log(f"-> Этап 5: Кэширование Лиц (InsightFace)")
                                     search_engine._unload_embedding_model()
                                     aesthetic_engine.unload()
                                     nsfw_engine.unload()
+                                    tag_engine.unload()
                                     face_engine.build_cache(cache_dir.value, tuple(exts_media), override_files=chunk)
 
                             state.add_log("🎉 Полная индексация успешно завершена!")
                         except Exception as e: state.add_log(f"❌ Ошибка индексации: {e}")
                         finally:
-                            # Полная очистка по завершению
                             media_cache.enabled = False
                             media_cache.compress = False
                             media_cache.clear()
-                            
                             state.is_processing = False
                             state.progress = 1.0
                             state.status_text = "Готово!"
@@ -2934,18 +3566,14 @@ def index_page():
 
                 btn_cache = ui.button('🚀 Запустить полное кэширование', on_click=run_cache_action).classes('w-full bg-blue-600 hover:bg-blue-500 font-bold text-lg mt-4')
 
-
-    # Компактный подвал (Status bar) - строго в одну линию
     with ui.footer().classes('bg-gray-900 border-t border-gray-800 px-4 py-0 flex flex-row flex-nowrap items-center justify-between z-40 h-8 shadow-lg'):
         ui.label().bind_text_from(state, 'status_text').classes('text-blue-400 font-mono text-xs truncate max-w-[30%] shrink-0')
         ui.linear_progress(value=0, show_value=False).bind_value_from(state, 'progress').classes('flex-grow mx-4 h-1.5 rounded text-blue-600')
         
-        # --- КНОПКА ОТМЕНЫ (показывается только когда что-то запущено) ---
         ui.button('ПРЕРВАТЬ', icon='cancel', on_click=cancel_all_tasks) \
             .props('color=red size=sm dense outline') \
             .classes('shrink-0 py-0 min-h-0 text-xs font-bold mr-2 bg-red-900/20') \
             .bind_visibility_from(state, 'is_processing')
-        # ----------------------------------------------------------------
             
         ui.button('ЛОГИ', icon='terminal', on_click=log_drawer.toggle).props('flat text-color=white size=sm dense').classes('shrink-0 py-0 min-h-0 text-xs')
 
@@ -2957,7 +3585,6 @@ if __name__ in {"__main__", "__mp_main__"}:
     parser.add_argument('--host', type=str, default='127.0.0.1', help='IP адрес для сервера')
     parser.add_argument('--port', type=int, default=8190, help='Порт сервера')
     
-    # Считываем аргументы
     args, unknown = parser.parse_known_args()
 
     if args.server_only:
