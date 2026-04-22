@@ -2128,16 +2128,16 @@ def index_page():
         tags_debug_dialog.open()
 
     # --- ПОЛНОЭКРАННЫЙ ПЛЕЕР ---
-    with ui.dialog().on('value', lambda e: setattr(state, 'viewer_open', e.value)) as media_dialog:
-        with ui.card().classes('w-[95vw] h-[95vh] bg-transparent shadow-none p-0 flex flex-col relative items-center justify-center'):
-            ui.button(icon='close', on_click=media_dialog.close).classes('absolute top-2 right-2 z-50 bg-black/60 text-white').props('flat round dense')
+    with ui.dialog().on('value', lambda e: setattr(state, 'viewer_open', e.value)).props('maximized transition-show=fade transition-hide=fade') as media_dialog:
+        with ui.element('div').classes('w-full h-full bg-black/95 p-0 flex flex-col relative items-center justify-center overflow-hidden'):
+            ui.button(icon='close', on_click=media_dialog.close).classes('absolute top-4 right-4 z-50 bg-white/10 hover:bg-white/20 text-white').props('flat round')
             
-            ui.button(icon='chevron_left', on_click=lambda: change_media(-1)).classes('absolute left-2 top-1/2 -translate-y-1/2 z-50 bg-black/60 text-white text-3xl').props('flat round').tooltip('Предыдущий (←)')
-            ui.button(icon='chevron_right', on_click=lambda: change_media(1)).classes('absolute right-2 top-1/2 -translate-y-1/2 z-50 bg-black/60 text-white text-3xl').props('flat round').tooltip('Следующий (→)')
+            ui.button(icon='chevron_left', on_click=lambda: change_media(-1)).classes('absolute left-4 top-1/2 -translate-y-1/2 z-50 bg-white/10 hover:bg-white/20 text-white text-4xl p-2').props('flat round').tooltip('Предыдущий (←)')
+            ui.button(icon='chevron_right', on_click=lambda: change_media(1)).classes('absolute right-4 top-1/2 -translate-y-1/2 z-50 bg-white/10 hover:bg-white/20 text-white text-4xl p-2').props('flat round').tooltip('Следующий (→)')
             
-            media_container = ui.row().classes('w-full h-full flex items-center justify-center')
+            media_container = ui.element('div').classes('absolute inset-0 w-full h-full flex items-center justify-center z-0 p-8')
             
-            with ui.row().classes('absolute bottom-4 left-1/2 -translate-x-1/2 bg-black/60 px-3 py-1 rounded-full text-white flex-nowrap items-center gap-2 z-50 shadow-lg'):
+            with ui.row().classes('absolute bottom-6 left-1/2 -translate-x-1/2 bg-black/80 border border-gray-700 px-4 py-2 rounded-full text-white flex-nowrap items-center gap-3 z-50 shadow-lg'):
                 btn_viewer_select = ui.button(on_click=lambda: toggle_selection()).props('flat round dense size=sm').tooltip('Выделить (Space)')
                 lbl_media_name = ui.label().classes('font-mono text-xs text-center whitespace-nowrap overflow-hidden text-ellipsis min-w-[150px] max-w-[400px] px-2')
                 ui.button(icon='content_copy', on_click=lambda: copy_image_to_clipboard(state.viewer_items[state.viewer_index])).props('flat round dense size=sm color=white').tooltip('Копировать картинку в буфер (C)')
@@ -2207,9 +2207,14 @@ def index_page():
         
         with media_container:
             if ext in SUPPORTED_VIDEOS:
-                ui.video(f'/media/{safe_path}').classes('max-w-full max-h-full object-contain outline-none').props('autoplay controls loop')
+                ui.video(f'/media/{safe_path}') \
+                    .classes('outline-none') \
+                    .style('max-width: 100%; max-height: 90vh; width: auto; height: auto; object-fit: contain;') \
+                    .props('autoplay controls loop')
             elif ext in SUPPORTED_IMAGES:
-                ui.image(f'/media/{safe_path}').classes('max-w-full max-h-full object-contain outline-none')
+                ui.element('img').props(f'src="/media/{safe_path}"') \
+                    .classes('outline-none') \
+                    .style('max-width: 100%; max-height: 90vh; width: auto; height: auto; object-fit: contain;')
             else:
                 ui.icon('article', size='15rem').classes('text-gray-500')
 
