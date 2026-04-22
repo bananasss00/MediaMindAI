@@ -60,6 +60,15 @@ except Exception as e:
     print(f"⚠️ SageAttention недоступен. Используем стандартный PyTorch SDPA.")
     print(f"   (Детали: {e})")
 
+# --- ИНТЕГРАЦИЯ INSIGHTFACE ---
+try:
+    import insightface
+    from insightface.app import FaceAnalysis
+    INSIGHTFACE_AVAILABLE = True
+except ImportError:
+    INSIGHTFACE_AVAILABLE = False
+    print("⚠️ InsightFace недоступен. Для поиска по лицу установите insightface и onnxruntime-gpu.")
+
 from PIL import Image, ImageFile
 from huggingface_hub import snapshot_download
 from sentence_transformers import SentenceTransformer, CrossEncoder, util
@@ -166,10 +175,58 @@ class DatabaseCache:
         c.execute('''CREATE TABLE IF NOT EXISTS sim_cache (model TEXT, query TEXT, path TEXT, score REAL, PRIMARY KEY (model, query, path))''')
         c.execute('''CREATE TABLE IF NOT EXISTS nsfw_cache (model TEXT, path TEXT, top_label TEXT, danger_score REAL, details TEXT, PRIMARY KEY (model, path))''')
         
+        # Таблица для поиска по лицам
+        c.execute('''CREATE TABLE IF NOT EXISTS face_cache (path TEXT, face_idx INTEGER, embedding BLOB, PRIMARY KEY (path, face_idx))''')
+        
         # Создаем индексы для мгновенного поиска по пути файла (без Full Table Scan)
         c.execute('CREATE INDEX IF NOT EXISTS idx_nsfw_path ON nsfw_cache(path)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_emb_path ON emb_cache(path)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_face_path ON face_cache(path)')
 
+        self.conn.commit()
+
+    # --- Лица (Face Search) ---
+    def get_face_embeddings(self, path):
+        c = self.conn.cursor()
+        c.execute("SELECT embedding FROM face_cache WHERE path=?", (path,))
+        rows = c.fetchall()
+        if not rows: return None
+        embs =[]
+        for r in rows:
+            if len(r[0]) > 0:
+                embs.append(np.frombuffer(r[0], dtype=np.float32))
+        return embs
+
+    def save_face_embeddings(self, path, embeddings):
+        c = self.conn.cursor()
+        c.execute("DELETE FROM face_cache WHERE path=?", (path,))
+        if not embeddings:
+            c.execute("INSERT INTO face_cache (path, face_idx, embedding) VALUES (?, ?, ?)", (path, -1, b''))
+        else:
+            data =[(path, i, emb.tobytes()) for i, emb in enumerate(embeddings)]
+            c.executemany("INSERT INTO face_cache (path, face_idx, embedding) VALUES (?, ?, ?)", data)
+        self.conn.commit()
+
+    def save_face_embeddings_batch(self, batch_data):
+        """Пакетное сохранение для логического батчинга InsightFace (ускорение SQLite)"""
+        if not batch_data: return
+        c = self.conn.cursor()
+        
+        # 1. Удаляем старые записи для всего батча разом
+        paths = [(item[0],) for item in batch_data]
+        c.executemany("DELETE FROM face_cache WHERE path=?", paths)
+        
+        # 2. Подготавливаем новые векторы
+        insert_data =[]
+        for path, embs in batch_data:
+            if not embs:
+                insert_data.append((path, -1, b''))
+            else:
+                for i, emb in enumerate(embs):
+                    insert_data.append((path, i, emb.tobytes()))
+                    
+        # 3. Сохраняем всё одним запросом
+        c.executemany("INSERT INTO face_cache (path, face_idx, embedding) VALUES (?, ?, ?)", insert_data)
         self.conn.commit()
 
     # --- NSFW ---
@@ -250,14 +307,26 @@ class DatabaseCache:
                 c.execute(f"SELECT DISTINCT model FROM {table}")
                 models.update([r[0] for r in c.fetchall() if r[0]])
             except: pass
+            
+        # Искусственно добавляем пункт для лиц, если в кэше лиц есть хотя бы одна запись
+        try:
+            c.execute("SELECT 1 FROM face_cache LIMIT 1")
+            if c.fetchone() is not None:
+                models.add("InsightFace (Лица)")
+        except: pass
+        
         return list(models)
 
     def clear_model_cache(self, model_name=None):
         c = self.conn.cursor()
-        tables =['emb_cache', 'rerank_cache_v2', 'aes_cache', 'sim_cache', 'nsfw_cache']
+        tables =['emb_cache', 'rerank_cache_v2', 'aes_cache', 'sim_cache', 'nsfw_cache', 'face_cache']
         if model_name:
-            for table in tables:
-                c.execute(f"DELETE FROM {table} WHERE model=?", (model_name,))
+            if model_name == "InsightFace (Лица)":
+                c.execute("DELETE FROM face_cache")
+            else:
+                for table in tables:
+                    if table == 'face_cache': continue # У лиц нет колонки model
+                    c.execute(f"DELETE FROM {table} WHERE model=?", (model_name,))
         else:
             for table in tables:
                 c.execute(f"DELETE FROM {table}")
@@ -267,7 +336,7 @@ class DatabaseCache:
     def get_all_paths(self):
         c = self.conn.cursor()
         paths = set()
-        for table in ['emb_cache', 'aes_cache', 'nsfw_cache']:
+        for table in['emb_cache', 'aes_cache', 'nsfw_cache', 'face_cache']:
             try:
                 c.execute(f"SELECT DISTINCT path FROM {table}")
                 paths.update([r[0] for r in c.fetchall() if r[0]])
@@ -277,7 +346,7 @@ class DatabaseCache:
     def remove_paths(self, paths_to_remove):
         if not paths_to_remove: return
         c = self.conn.cursor()
-        tables =['emb_cache', 'rerank_cache_v2', 'aes_cache', 'sim_cache', 'nsfw_cache']
+        tables =['emb_cache', 'rerank_cache_v2', 'aes_cache', 'sim_cache', 'nsfw_cache', 'face_cache']
         chunk_size = 900
         for i in range(0, len(paths_to_remove), chunk_size):
             chunk = paths_to_remove[i:i+chunk_size]
@@ -353,7 +422,7 @@ class MediaCache:
         cache_key = (path, max_dim, video_frames)
         if self.enabled and cache_key in self.cache:
             cached = self.cache[cache_key]
-            return [self._decompress_img(b) for b in cached] if self.compress else cached
+            return[self._decompress_img(b) for b in cached] if self.compress else cached
         try:
             frames =[]
             with av.open(path) as container:
@@ -375,7 +444,7 @@ class MediaCache:
             new_w, new_h = self._get_bucket_size(extracted[0].width, extracted[0].height, max_dim)
             resized =[img.resize((new_w, new_h), Image.Resampling.BILINEAR) for img in extracted]
             if self.enabled:
-                self.cache[cache_key] = [self._compress_img(img) for img in resized] if self.compress else resized
+                self.cache[cache_key] =[self._compress_img(img) for img in resized] if self.compress else resized
             return resized
         except Exception:
             return None
@@ -599,7 +668,7 @@ class SearchEngine:
 
         # Проверяем, есть ли уже фичи картинок для тех файлов, где нет симиларов
         sims_to_save_paths = []
-        sims_to_save_scores = []
+        sims_to_save_scores =[]
         
         for file_path in paths_needing_sims:
             if self.cancel_flag: break
@@ -737,7 +806,7 @@ class SearchEngine:
         return final_results
 
 # ==========================================
-# 3. ДВИЖКИ ЭСТЕТИКИ И NSFW
+# 3. ДВИЖКИ ЭСТЕТИКИ, NSFW И ЛИЦ
 # ==========================================
 class AestheticEngine:
     def __init__(self, search_engine):
@@ -949,7 +1018,7 @@ class NsfwEngine:
                 state.add_log(f"Скачивание модели {model_name}...")
                 snapshot_download(repo_id=model_name, local_dir=local_dir, local_dir_use_symlinks=False)
                 
-                if ["strangerguardhf", "prithivmlmods"] in model_name.lower():
+                if["strangerguardhf", "prithivmlmods"] in model_name.lower():
                     for item in os.listdir(local_dir):
                         if item.startswith("checkpoint-"):
                             chk_path = os.path.join(local_dir, item)
@@ -1132,6 +1201,175 @@ class NsfwEngine:
         results.sort(key=lambda x: x[0], reverse=True)
         return results
 
+class FaceEngine:
+    def __init__(self, search_engine):
+        self.se = search_engine
+        self.db_cache = search_engine.db_cache
+        self.app = None
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.providers =['CUDAExecutionProvider', 'CPUExecutionProvider'] if self.device == "cuda" else['CPUExecutionProvider']
+        self.batch_size = 16
+
+    def load_model(self):
+        global INSIGHTFACE_AVAILABLE
+        if not INSIGHTFACE_AVAILABLE:
+            raise Exception("InsightFace не установлен! Установите: pip install insightface onnxruntime-gpu")
+            
+        if self.app is None:
+            state.add_log(f"Загрузка InsightFace (buffalo_l) на {self.device}...")
+            model_dir = os.path.join(current_dir, "models", "insightface")
+            os.makedirs(model_dir, exist_ok=True)
+            # Внимание: insightface сам создаст внутри подпапку models/buffalo_l
+            self.app = FaceAnalysis(name='buffalo_l', root=model_dir, providers=self.providers)
+            self.app.prepare(ctx_id=0 if self.device == "cuda" else -1, det_size=(640, 640))
+
+    def unload(self):
+        if self.app is not None:
+            state.add_log(f"Выгрузка InsightFace из VRAM...")
+            del self.app
+            self.app = None
+            gc.collect()
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
+
+    def extract_faces(self, img_path):
+        try:
+            # Читаем через PIL для обхода проблем с Unicode-путями (в отличие от cv2.imread)
+            img = Image.open(img_path).convert('RGB')
+            # Слегка уменьшаем гигантские фото, чтобы InsightFace не выпадал с ООМ
+            img.thumbnail((1920, 1920))
+            img_arr = np.array(img)
+            img_bgr = cv2.cvtColor(img_arr, cv2.COLOR_RGB2BGR)
+            faces = self.app.get(img_bgr)
+            return [f.embedding for f in faces]
+        except Exception as e:
+            state.add_log(f"Ошибка извлечения лиц {Path(img_path).name}: {e}")
+            return[]
+
+    def search_faces(self, ref_img_path, directory_path, allowed_exts, threshold, override_files=None):
+        self.load_model()
+        
+        ref_embs = self.extract_faces(ref_img_path)
+        if not ref_embs:
+            raise Exception("На референсном фото (шаблоне) не найдено лиц!")
+        
+        ref_emb = ref_embs[0] # Берем первое найденное лицо из референса
+        ref_n = ref_emb / np.linalg.norm(ref_emb)
+
+        all_files = self.se._gather_files(directory_path, allowed_exts) if override_files is None else[f for f in override_files if f.lower().endswith(allowed_exts)]
+        
+        results = []
+        images_to_process =[]
+        
+        # 1. Быстрый проход через кэш
+        for p in all_files:
+            cached = self.db_cache.get_face_embeddings(p)
+            if cached is not None:
+                if len(cached) > 0:
+                    max_sim = -1.0
+                    for emb in cached:
+                        emb_n = emb / np.linalg.norm(emb)
+                        sim = np.dot(emb_n, ref_n)
+                        if sim > max_sim: max_sim = sim
+                    if max_sim >= threshold:
+                        results.append((float(max_sim), p))
+            else:
+                images_to_process.append(p)
+                
+        # 2. Обработка новых файлов
+        if images_to_process:
+            state.add_log(f"Извлечение лиц для {len(images_to_process)} новых файлов...")
+            batch_paths =[]
+            for i, p in enumerate(images_to_process):
+                if not state.is_processing: break
+                
+                batch_paths.append(p)
+                
+                if len(batch_paths) >= self.batch_size or i == len(images_to_process) - 1:
+                    state.progress = (i + 1) / max(1, len(images_to_process))
+                    state.status_text = f"Анализ лиц ({i+1}/{len(images_to_process)})..."
+                    
+                    batch_db_data =[]
+                    for path in batch_paths:
+                        ext = os.path.splitext(path)[1].lower()
+                        if ext in SUPPORTED_IMAGES:
+                            embs = self.extract_faces(path)
+                        elif ext in SUPPORTED_VIDEOS:
+                            # Для видео берем лишь первый кадр
+                            frames = media_cache.get_video_frames(path, 640, 1)
+                            if frames and len(frames) > 0:
+                                img_arr = np.array(frames[0])
+                                img_bgr = cv2.cvtColor(img_arr, cv2.COLOR_RGB2BGR)
+                                faces = self.app.get(img_bgr)
+                                embs =[f.embedding for f in faces]
+                            else:
+                                embs =[]
+                        else:
+                            embs =[]
+                            
+                        batch_db_data.append((path, embs))
+                        
+                        if embs:
+                            max_sim = -1.0
+                            for emb in embs:
+                                emb_n = emb / np.linalg.norm(emb)
+                                sim = np.dot(emb_n, ref_n)
+                                if sim > max_sim: max_sim = sim
+                            if max_sim >= threshold:
+                                results.append((float(max_sim), path))
+                                
+                    self.db_cache.save_face_embeddings_batch(batch_db_data)
+                    batch_paths = []
+                        
+        results.sort(key=lambda x: x[0], reverse=True)
+        return results
+
+    def build_cache(self, directory_path, allowed_exts, override_files=None):
+        """ Метод для предкэширования лиц """
+        self.load_model()
+        all_files = self.se._gather_files(directory_path, allowed_exts) if override_files is None else[f for f in override_files if f.lower().endswith(allowed_exts)]
+        
+        images_to_process =[]
+        for p in all_files:
+            if self.db_cache.get_face_embeddings(p) is None:
+                images_to_process.append(p)
+                
+        if not images_to_process:
+            return
+            
+        state.add_log(f"Кэширование лиц для {len(images_to_process)} файлов...")
+        batch_paths =[]
+        for i, p in enumerate(images_to_process):
+            if not state.is_processing: break
+            
+            batch_paths.append(p)
+            
+            if len(batch_paths) >= self.batch_size or i == len(images_to_process) - 1:
+                state.progress = (i + 1) / max(1, len(images_to_process))
+                state.status_text = f"Кэш лиц ({i+1}/{len(images_to_process)})..."
+                
+                batch_db_data =[]
+                for path in batch_paths:
+                    ext = os.path.splitext(path)[1].lower()
+                    if ext in SUPPORTED_IMAGES:
+                        embs = self.extract_faces(path)
+                    elif ext in SUPPORTED_VIDEOS:
+                        frames = media_cache.get_video_frames(path, 640, 1)
+                        if frames and len(frames) > 0:
+                            img_arr = np.array(frames[0])
+                            img_bgr = cv2.cvtColor(img_arr, cv2.COLOR_RGB2BGR)
+                            faces = self.app.get(img_bgr)
+                            embs = [f.embedding for f in faces]
+                        else:
+                            embs =[]
+                    else:
+                        embs =[]
+                        
+                    batch_db_data.append((path, embs))
+                    
+                self.db_cache.save_face_embeddings_batch(batch_db_data)
+                batch_paths =[]
+
+
 # ==========================================
 # 4. СОСТОЯНИЕ И UI УТИЛИТЫ
 # ==========================================
@@ -1140,22 +1378,27 @@ class AppState:
         self.search_results =[]
         self.aesthetic_results =[]
         self.nsfw_results =[]
+        self.face_results =[]
         
         self.sel_search = {}
         self.sel_aes = {}
         self.sel_nsfw = {}
+        self.sel_face = {}
         
         self.search_page = 1
         self.aes_page = 1
         self.nsfw_page = 1
+        self.face_page = 1
         
         self.search_base_dir = ""
         self.aes_base_dir = ""
         self.nsfw_base_dir = ""
+        self.face_base_dir = ""
         
         self.search_res_filter = 'Все'
         self.aes_res_filter = 'Все'
         self.nsfw_res_filter = 'Все'
+        self.face_res_filter = 'Все'
         
         self.viewer_open = False
         self.viewer_items =[]
@@ -1188,6 +1431,7 @@ search_engine = SearchEngine(
 )
 aesthetic_engine = AestheticEngine(search_engine)
 nsfw_engine = NsfwEngine(search_engine)
+face_engine = FaceEngine(search_engine)
 
 def open_file_native(filepath):
     try: os.startfile(filepath) if os.name == 'nt' else subprocess.call(('xdg-open', filepath))
@@ -1223,6 +1467,20 @@ def pick_folder_native():
 async def select_folder(input_element):
     folder = await run.io_bound(pick_folder_native)
     if folder: input_element.value = folder
+
+def pick_file_native():
+    import tkinter as tk
+    from tkinter import filedialog
+    root = tk.Tk()
+    root.attributes('-topmost', True)
+    root.withdraw()
+    file = filedialog.askopenfilename(filetypes=[("Image files", "*.jpg *.jpeg *.png *.webp *.bmp *.tiff")])
+    root.destroy()
+    return file
+
+async def select_file(input_element):
+    file = await run.io_bound(pick_file_native)
+    if file: input_element.value = file
 
 def clear_folder_cache(folder_path):
     if not folder_path: return
@@ -1276,7 +1534,7 @@ def copy_image_to_clipboard(path):
             
             # Явно указываем типы, чтобы 64-битные указатели не обрезались до 32-битных
             ctypes.windll.kernel32.GlobalAlloc.restype = ctypes.c_void_p
-            ctypes.windll.kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+            ctypes.windll.kernel32.GlobalAlloc.argtypes =[ctypes.c_uint, ctypes.c_size_t]
             ctypes.windll.kernel32.GlobalLock.restype = ctypes.c_void_p
             ctypes.windll.kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
             ctypes.windll.kernel32.GlobalUnlock.restype = ctypes.c_int
@@ -1345,6 +1603,7 @@ def index_page():
             tab_search = ui.tab('Search', label='Умный Поиск', icon='search')
             tab_aesthetic = ui.tab('Aesthetic', label='Оценка Эстетики', icon='star')
             tab_nsfw = ui.tab('NSFW', label='NSFW Детектор', icon='visibility_off')
+            tab_face = ui.tab('Face', label='Поиск по лицу', icon='face')
             tab_cache = ui.tab('Cache', label='Индексатор', icon='storage')
             
         ui.button(icon='settings', on_click=lambda: global_settings_dialog.open()).props('flat round dense text-color=white').classes('shrink-0').tooltip('Глобальные настройки')
@@ -1428,6 +1687,7 @@ def index_page():
                 search_gallery_ui.refresh()
                 aesthetic_gallery_ui.refresh()
                 nsfw_gallery_ui.refresh()
+                face_gallery_ui.refresh()
                 global_settings_dialog.close()
                 
             ui.button('Сохранить и закрыть', on_click=save_global_settings).classes('w-full mt-6 bg-blue-600 hover:bg-blue-500 font-bold')
@@ -1485,6 +1745,7 @@ def index_page():
         if state.current_tab == 'Search' and path in state.sel_search: is_selected = state.sel_search[path]
         elif state.current_tab == 'Aesthetic' and path in state.sel_aes: is_selected = state.sel_aes[path]
         elif state.current_tab == 'NSFW' and path in state.sel_nsfw: is_selected = state.sel_nsfw[path]
+        elif state.current_tab == 'Face' and path in state.sel_face: is_selected = state.sel_face[path]
             
         btn_viewer_select._props['icon'] = 'check_box' if is_selected else 'check_box_outline_blank'
         btn_viewer_select._props['color'] = 'green' if is_selected else 'white'
@@ -1499,13 +1760,15 @@ def index_page():
             state.sel_aes[path] = not state.sel_aes[path]
         elif state.current_tab == 'NSFW' and path in state.sel_nsfw:
             state.sel_nsfw[path] = not state.sel_nsfw[path]
+        elif state.current_tab == 'Face' and path in state.sel_face:
+            state.sel_face[path] = not state.sel_face[path]
         update_viewer_selection_ui()
 
     def download_current_item():
         if not state.viewer_items: return
         path = state.viewer_items[state.viewer_index]
         tab = state.current_tab.lower()
-        base_dir = state.search_base_dir if tab == 'search' else (state.aes_base_dir if tab == 'aesthetic' else state.nsfw_base_dir)
+        base_dir = state.search_base_dir if tab == 'search' else (state.aes_base_dir if tab == 'aesthetic' else (state.face_base_dir if tab == 'face' else state.nsfw_base_dir))
         try:
             dl_dir = os.path.join(str(Path.home()), 'Downloads')
             try:
@@ -1577,7 +1840,7 @@ def index_page():
             "<div style='display:flex; flex-wrap:wrap; gap:15px;'>"
         ]
         
-        items = state.search_results if tab == 'search' else (state.aesthetic_results if tab == 'aes' else state.nsfw_results)
+        items = state.search_results if tab == 'search' else (state.aesthetic_results if tab == 'aes' else (state.face_results if tab == 'face' else state.nsfw_results))
         for item in items:
             path = item[1]
             
@@ -1593,6 +1856,10 @@ def index_page():
                 if state.nsfw_res_filter == 'Картинки' and not path.lower().endswith(SUPPORTED_IMAGES): continue
                 if state.nsfw_res_filter == 'Видео' and not path.lower().endswith(SUPPORTED_VIDEOS): continue
                 label_text = f"🚨 Danger: {item[0]*100:.1f}% | {item[2].upper()}"
+            elif tab == 'face':
+                if state.face_res_filter == 'Картинки' and not path.lower().endswith(SUPPORTED_IMAGES): continue
+                if state.face_res_filter == 'Видео' and not path.lower().endswith(SUPPORTED_VIDEOS): continue
+                label_text = f"Match: {item[0]*100:.1f}%"
                 
             uri = Path(path).absolute().as_uri()
             ext = os.path.splitext(path)[1].lower()
@@ -1640,7 +1907,7 @@ def index_page():
 
     # --- ПАКЕТНЫЕ ДЕЙСТВИЯ ---
     async def execute_batch(action='copy', tab='search', prepend_score=False):
-        sel_dict = state.sel_search if tab == 'search' else (state.sel_aes if tab == 'aes' else state.sel_nsfw)
+        sel_dict = state.sel_search if tab == 'search' else (state.sel_aes if tab == 'aes' else (state.sel_face if tab == 'face' else state.sel_nsfw))
         selected_paths =[p for p, checked in sel_dict.items() if checked]
         if not selected_paths:
             return ui.notify('Ничего не выбрано!', type='warning')
@@ -1648,7 +1915,7 @@ def index_page():
         folder = await run.io_bound(pick_folder_native)
         if not folder: return
         
-        base_dir = state.search_base_dir if tab == 'search' else (state.aes_base_dir if tab == 'aes' else state.nsfw_base_dir)
+        base_dir = state.search_base_dir if tab == 'search' else (state.aes_base_dir if tab == 'aes' else (state.face_base_dir if tab == 'face' else state.nsfw_base_dir))
         success = 0
         moved_paths = set()
         
@@ -1673,6 +1940,9 @@ def index_page():
                 elif tab == 'nsfw':
                     danger_s = next((d for d, p, l, dt in state.nsfw_results if p == path), 0)
                     prefix = f"{danger_s*100:05.1f}_"
+                elif tab == 'face':
+                    match_s = next((s for s, p in state.face_results if p == path), 0)
+                    prefix = f"{match_s*100:05.1f}_"
                     
             dest = os.path.join(folder, rel_dir, prefix + fname)
             os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -1697,6 +1967,9 @@ def index_page():
             elif tab == 'nsfw':
                 state.nsfw_results =[i for i in state.nsfw_results if i[1] not in moved_paths]
                 nsfw_gallery_ui.refresh()
+            elif tab == 'face':
+                state.face_results =[i for i in state.face_results if i[1] not in moved_paths]
+                face_gallery_ui.refresh()
 
     async def handle_shift_click(e, idx, path, tab):
         # Проверяем, зажат ли Shift
@@ -1712,7 +1985,10 @@ def index_page():
             all_p =[p for a, p, m in state.aesthetic_results]
         elif tab == 'nsfw':
             sel_dict = state.sel_nsfw
-            all_p = [p for d, p, l, dt in state.nsfw_results]
+            all_p =[p for d, p, l, dt in state.nsfw_results]
+        elif tab == 'face':
+            sel_dict = state.sel_face
+            all_p = [p for s, p in state.face_results]
 
         # Получаем индекс прошлого клика (создастся автоматически, если его еще нет)
         last_idx = getattr(state, f'last_clicked_{tab}', None)
@@ -1747,6 +2023,11 @@ def index_page():
                 if state.nsfw_res_filter == 'Картинки' and not p.lower().endswith(SUPPORTED_IMAGES): continue
                 if state.nsfw_res_filter == 'Видео' and not p.lower().endswith(SUPPORTED_VIDEOS): continue
                 if p in state.sel_nsfw: state.sel_nsfw[p] = value
+        elif tab == 'face':
+            for _, p in state.face_results:
+                if state.face_res_filter == 'Картинки' and not p.lower().endswith(SUPPORTED_IMAGES): continue
+                if state.face_res_filter == 'Видео' and not p.lower().endswith(SUPPORTED_VIDEOS): continue
+                if p in state.sel_face: state.sel_face[p] = value
 
     # --- КОМПОНЕНТЫ ГАЛЕРЕИ ---
     @ui.refreshable
@@ -1836,7 +2117,7 @@ def index_page():
         if not state.aesthetic_results:
             return ui.label("Здесь появятся топовые фото/видео...").classes("text-gray-400 m-4")
 
-        filtered_results = []
+        filtered_results =[]
         for item in state.aesthetic_results:
             p = item[1].lower()
             if state.aes_res_filter == 'Картинки' and not p.endswith(SUPPORTED_IMAGES): continue
@@ -1991,6 +2272,84 @@ def index_page():
             # Плавающая кнопка "Наверх"
             ui.button(icon='keyboard_arrow_up', on_click=lambda: ui.run_javascript(f'document.getElementById("{scroll_id}").scrollTo({{top: 0, behavior: "smooth"}})')).props('round color=red-800').classes('absolute bottom-6 right-6 z-50 shadow-lg').tooltip('Наверх')
 
+    @ui.refreshable
+    def face_gallery_ui():
+        if not state.face_results:
+            return ui.label("Здесь появятся найденные фотографии с искомым лицом...").classes("text-gray-400 m-4")
+
+        filtered_results = []
+        for item in state.face_results:
+            p = item[1].lower()
+            if state.face_res_filter == 'Картинки' and not p.endswith(SUPPORTED_IMAGES): continue
+            if state.face_res_filter == 'Видео' and not p.endswith(SUPPORTED_VIDEOS): continue
+            filtered_results.append(item)
+
+        total_pages = max(1, (len(filtered_results) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+        if state.face_page > total_pages: state.face_page = 1
+
+        def change_page(d):
+            state.face_page = max(1, min(total_pages, state.face_page + d))
+            face_gallery_ui.refresh()
+
+        def apply_filter(e):
+            state.face_res_filter = e.value
+            state.face_page = 1
+            face_gallery_ui.refresh()
+
+        def render_pagination():
+            with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
+                ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
+                ui.label(f'Страница {state.face_page} из {total_pages}').classes('text-gray-300 font-bold')
+                ui.button(icon='chevron_right', on_click=lambda: change_page(1)).props('flat outline color=white')
+
+        with ui.column().classes('w-full h-full flex flex-col p-0 m-0 gap-0 relative'):
+            # Фиксированная верхняя панель
+            with ui.column().classes('w-full shrink-0 bg-gray-900 p-4 pb-2 border-b border-gray-800 z-20 gap-0 shadow-md'):
+                with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
+                    with ui.row().classes('gap-2 items-center'):
+                        ui.button('Выбрать всё', on_click=lambda: set_all('face', True)).props('outline color=white dense')
+                        ui.button('Снять всё', on_click=lambda: set_all('face', False)).props('outline color=white dense')
+                        ui.toggle(['Все', 'Картинки', 'Видео'], value=state.face_res_filter, on_change=apply_filter).classes('text-xs ml-2')
+                    with ui.row().classes('gap-2 items-center'):
+                        ui.button('HTML Экспорт', icon='html', on_click=lambda: export_html_action('face')).props('color=purple dense outline')
+                        ui.button('Копировать ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'face', chk_prefix_face.value)).props('color=teal-800 dense')
+                        ui.button('Переместить ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'face', chk_prefix_face.value)).props('color=red dense')
+
+                render_pagination()
+
+            # Прокручиваемая область с результатами
+            scroll_id = 'face_scroll_area'
+            with ui.column().classes('w-full flex-1 overflow-y-auto p-4 relative').props(f'id="{scroll_id}"'):
+                start_idx = (state.face_page - 1) * ITEMS_PER_PAGE
+                page_items = filtered_results[start_idx : start_idx + ITEMS_PER_PAGE]
+                all_paths =[p for s, p in filtered_results]
+
+                if not page_items:
+                    ui.label("Нет файлов, подходящих под выбранный фильтр.").classes("text-gray-400 m-4")
+
+                with ui.grid(columns=int(state.grid_columns)).classes('w-full gap-6 pb-10'):
+                    for sim_score, path in page_items:
+                        safe_path = urllib.parse.quote(path)
+                        global_index = all_paths.index(path)
+                        
+                        with ui.card().classes('bg-gray-800 border border-gray-700 hover:border-teal-500 transition-colors p-0 overflow-hidden relative'):
+                            with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
+                                ui.checkbox().bind_value(state.sel_face, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'face'), ['shiftKey'])
+
+                            with ui.context_menu():
+                                ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
+                                ui.menu_item('Копировать картинку', on_click=lambda p=path: copy_image_to_clipboard(p))
+                                ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
+
+                            ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
+                            
+                            with ui.row().classes('w-full justify-between items-center p-2 bg-gray-800'):
+                                ui.label(f"Сходство: {sim_score*100:.1f}%").classes('text-teal-400 font-bold text-sm')
+                                ui.button(icon='folder', on_click=lambda p=path: reveal_file_native(p)).props('flat round dense color=white')
+                            ui.label(os.path.basename(path)).classes('text-xs text-gray-400 px-2 pb-2 truncate w-full').tooltip(path)
+
+            # Плавающая кнопка "Наверх"
+            ui.button(icon='keyboard_arrow_up', on_click=lambda: ui.run_javascript(f'document.getElementById("{scroll_id}").scrollTo({{top: 0, behavior: "smooth"}})')).props('round color=teal-800').classes('absolute bottom-6 right-6 z-50 shadow-lg').tooltip('Наверх')
 
     # --- ОСНОВНАЯ РАБОЧАЯ ОБЛАСТЬ ---
     with ui.tab_panels(tabs).bind_value(state, 'current_tab').classes('w-full bg-[#121212] p-0'):
@@ -2063,6 +2422,7 @@ def index_page():
                     btn_search.disable()
                     aesthetic_engine.unload()
                     nsfw_engine.unload()
+                    face_engine.unload()
                     
                     exts =[]
                     if chk_img.value: exts.extend(SUPPORTED_IMAGES)
@@ -2176,6 +2536,7 @@ def index_page():
                     btn_rate.disable()
                     search_engine._unload_embedding_model()
                     nsfw_engine.unload()
+                    face_engine.unload()
                     
                     exts =[]
                     if chk_img_aes.value: exts.extend(SUPPORTED_IMAGES)
@@ -2196,7 +2557,7 @@ def index_page():
 
                             # --- ЛОГИКА ФИЛЬТРАЦИИ NSFW ---
                             if aes_nsfw_filter.value != 'Все':
-                                filtered_res = []
+                                filtered_res =[]
                                 for item in res:
                                     path = item[1] # В эстетике структура: (avg_score, path, max_score)
                                     danger = aesthetic_engine.db_cache.get_max_danger_score(path)
@@ -2281,6 +2642,7 @@ def index_page():
                     btn_nsfw.disable()
                     search_engine._unload_embedding_model()
                     aesthetic_engine.unload()
+                    face_engine.unload()
                     
                     exts =[]
                     if chk_img_nsfw.value: exts.extend(SUPPORTED_IMAGES)
@@ -2318,7 +2680,86 @@ def index_page():
             with ui.column().classes('flex-1 w-0 bg-gray-900 rounded-xl border border-gray-800 overflow-hidden h-full relative p-0'):
                 nsfw_gallery_ui()
 
-        # ВКЛАДКА 4: ИНДЕКСАТОР (Кэш)
+        # ВКЛАДКА 4: ПОИСК ПО ЛИЦУ (FACE SEARCH)
+        with ui.tab_panel(tab_face).classes('w-full h-[calc(100vh-115px)] p-4 flex flex-row flex-nowrap items-stretch gap-4'):
+            with ui.column().classes('w-[350px] shrink-0 bg-gray-900 rounded-xl border border-gray-800 shadow-lg flex flex-col overflow-hidden p-0 gap-0'):
+                with ui.row().classes('w-full p-4 pb-2 shrink-0 border-b border-gray-800 bg-gray-900 z-10'):
+                    ui.label('Поиск по лицу').classes('text-lg font-bold')
+                
+                with ui.column().classes('w-full flex-1 overflow-y-auto p-4 gap-2 min-h-0'):
+                    with ui.row().classes('w-full items-center gap-1 flex-nowrap'):
+                        face_dir = ui.input('Папка для поиска', value=cfg.get('face_dir', '')).classes('flex-grow')
+                        ui.button(icon='folder', on_click=lambda: select_folder(face_dir)).props('flat round dense')
+                        ui.button(icon='delete_sweep', on_click=lambda: clear_folder_cache(face_dir.value)).props('flat round dense text-color=red').tooltip('Очистить индекс файлов папки')
+                        
+                    with ui.row().classes('w-full items-center gap-1 flex-nowrap mt-2'):
+                        ref_img = ui.input('Фото с лицом (Референс)', value=cfg.get('ref_img', '')).classes('flex-grow')
+                        ui.button(icon='image', on_click=lambda: select_file(ref_img)).props('flat round dense')
+                        
+                    with ui.row().classes('w-full gap-2 mt-2'):
+                        chk_img_face = ui.checkbox('Картинки', value=cfg.get('chk_img_face', True))
+                        chk_vid_face = ui.checkbox('Видео (1-й кадр)', value=cfg.get('chk_vid_face', False))
+                    
+                    face_threshold = ui.number('Мин. Сходство (0.0 - 1.0)', value=cfg.get('face_threshold', 0.40), format='%.2f', step=0.05).classes('w-full mt-2')
+                    chk_prefix_face = ui.checkbox('Писать Сходство в имя при копировании', value=cfg.get('chk_prefix_face', False)).classes('text-sm text-gray-300 w-full mt-2')
+
+                    with ui.expansion('Тонкие настройки', icon='tune').classes('w-full bg-gray-800/50 rounded-lg border border-gray-700 mt-2'):
+                        with ui.row().classes('w-full gap-2 px-2 pt-2 pb-2'):
+                            face_batch_size = ui.number('Батч', value=cfg.get('face_batch_size', 16), format='%.0f').classes('w-[45%]')
+
+                async def run_face_action():
+                    save_config({
+                        'face_dir': face_dir.value, 'ref_img': ref_img.value,
+                        'chk_img_face': chk_img_face.value, 'chk_vid_face': chk_vid_face.value,
+                        'face_threshold': face_threshold.value, 'chk_prefix_face': chk_prefix_face.value,
+                        'face_batch_size': face_batch_size.value
+                    })
+                    if not face_dir.value or not ref_img.value: return ui.notify("Укажите папку и референсное фото!", type='warning')
+                    
+                    state.is_processing = True
+                    search_engine.cancel_flag = False
+                    state.face_results.clear()
+                    state.sel_face.clear()
+                    state.face_page = 1
+                    face_gallery_ui.refresh()
+                    btn_face.disable()
+                    
+                    search_engine._unload_embedding_model()
+                    aesthetic_engine.unload()
+                    nsfw_engine.unload()
+                    
+                    exts =[]
+                    if chk_img_face.value: exts.extend(SUPPORTED_IMAGES)
+                    if chk_vid_face.value: exts.extend(SUPPORTED_VIDEOS)
+
+                    def bg_task():
+                        try:
+                            state.add_log(f"Запуск поиска лиц для папки: '{face_dir.value}'")
+                            face_engine.batch_size = int(face_batch_size.value)
+                            state.face_base_dir = face_dir.value
+                            
+                            res = face_engine.search_faces(ref_img.value, face_dir.value, tuple(exts), float(face_threshold.value))
+                                
+                            state.face_results = res
+                            state.sel_face = {path: False for _, path in state.face_results}
+                            state.add_log("✅ Поиск лиц завершен!")
+                        except Exception as e: state.add_log(f"❌ Ошибка поиска лиц: {e}")
+                        finally:
+                            state.status_text = "Готово!"
+                            state.progress = 1.0
+                            state.is_processing = False
+
+                    await run.io_bound(bg_task)
+                    face_gallery_ui.refresh()
+                    btn_face.enable()
+                    
+                with ui.row().classes('w-full p-4 pt-2 shrink-0 border-t border-gray-800 bg-gray-900 z-10'):
+                    btn_face = ui.button('🕵️ Искать Лицо', on_click=run_face_action).classes('w-full bg-teal-600 hover:bg-teal-500 font-bold text-lg')
+
+            with ui.column().classes('flex-1 w-0 bg-gray-900 rounded-xl border border-gray-800 overflow-hidden h-full relative p-0'):
+                face_gallery_ui()
+
+        # ВКЛАДКА 5: ИНДЕКСАТОР (Кэш)
         with ui.tab_panel(tab_cache).classes('w-full h-[calc(100vh-115px)] p-8 flex flex-col items-center overflow-y-auto pb-24'):
             with ui.card().classes('w-full max-w-[600px] p-6 flex flex-col gap-4 bg-gray-900 border border-gray-800 shrink-0 mb-12 mt-4'):
                 ui.label('Массовая Индексация (Предкэширование)').classes('text-xl font-bold text-blue-400')
@@ -2350,6 +2791,9 @@ def index_page():
                     nsfw_model_cache = ui.select(['prithivMLmods/siglip2-x256-explicit-content', 'strangerguardhf/nsfw-image-detection'], value=cfg.get('nsfw_model', 'prithivMLmods/siglip2-x256-explicit-content')).classes('flex-1')
                     cache_nsfw_quant = ui.select(['None', '8-bit', '4-bit'], value=cfg.get('nsfw_quant_mode', 'None'), label='Квант').classes('w-24')
 
+                # --- КЭШ ЛИЦ ---
+                chk_cache_face = ui.checkbox('Поиск по лицу (InsightFace)', value=cfg.get('chk_cache_face', False)).classes('text-md font-bold text-teal-300')
+
                 with ui.expansion('Единые тонкие настройки', icon='tune').classes('w-full bg-gray-800/50 rounded-lg border border-gray-700 mt-4'):
                     with ui.row().classes('w-full gap-4 px-4 pt-4'):
                         cache_batch_size = ui.number('Размер Батча', value=cfg.get('batch_size', 16), format='%.0f').classes('flex-1')
@@ -2373,7 +2817,7 @@ def index_page():
                         'cache_dir': cache_dir.value, 'chk_cache_img': chk_cache_img.value, 
                         'chk_cache_vid': chk_cache_vid.value, 'chk_cache_txt': chk_cache_txt.value,
                         'chk_cache_search': chk_cache_search.value, 'chk_cache_aes': chk_cache_aes.value, 
-                        'chk_cache_nsfw': chk_cache_nsfw.value,
+                        'chk_cache_nsfw': chk_cache_nsfw.value, 'chk_cache_face': chk_cache_face.value,
                         'search_quant_mode': cache_search_quant.value, 'aes_quant_mode': cache_aes_quant.value,
                         'nsfw_quant_mode': cache_nsfw_quant.value,
                         'use_ram_compression': use_ram_compression.value, 'cache_chunk_size': cache_chunk_size.value
@@ -2415,6 +2859,8 @@ def index_page():
                             nsfw_engine.max_dim = int(cache_max_dim.value)
                             nsfw_engine.video_frames = int(cache_video_frames.value)
                             nsfw_engine.quant_mode = cache_nsfw_quant.value
+                            
+                            face_engine.batch_size = int(cache_batch_size.value)
 
                             # --- НОВАЯ ЛОГИКА БЛОЧНОЙ ОБРАБОТКИ (Вариант 3) ---
                             all_allowed_exts = tuple(set(exts_search + exts_media))
@@ -2444,6 +2890,7 @@ def index_page():
                                     else: state.add_log(f"-> Этап 1: Кэширование Умного поиска")
                                     nsfw_engine.unload()
                                     aesthetic_engine.unload()
+                                    face_engine.unload()
                                     search_engine.build_cache(cache_dir.value, emb_model_cache.value, int(cache_batch_size.value), tuple(exts_search), override_files=chunk)
                                     
                                 if chk_cache_aes.value and not search_engine.cancel_flag:
@@ -2451,6 +2898,7 @@ def index_page():
                                     else: state.add_log(f"-> Этап 2: Оценка Эстетики")
                                     search_engine._unload_embedding_model()
                                     nsfw_engine.unload()
+                                    face_engine.unload()
                                     aesthetic_engine.evaluate_media(cache_dir.value, tuple(exts_media), override_files=chunk)
                                     
                                 if chk_cache_nsfw.value and not search_engine.cancel_flag:
@@ -2458,8 +2906,17 @@ def index_page():
                                     else: state.add_log(f"-> Этап 3: NSFW Детектор")
                                     search_engine._unload_embedding_model()
                                     aesthetic_engine.unload()
+                                    face_engine.unload()
                                     nsfw_engine.evaluate_media(cache_dir.value, nsfw_model_cache.value, tuple(exts_media), override_files=chunk)
-                                    
+
+                                if chk_cache_face.value and not search_engine.cancel_flag:
+                                    if len(chunks) > 1: state.add_log(f"-> Блок {idx+1}: Кэширование Лиц (InsightFace)")
+                                    else: state.add_log(f"-> Этап 4: Кэширование Лиц (InsightFace)")
+                                    search_engine._unload_embedding_model()
+                                    aesthetic_engine.unload()
+                                    nsfw_engine.unload()
+                                    face_engine.build_cache(cache_dir.value, tuple(exts_media), override_files=chunk)
+
                             state.add_log("🎉 Полная индексация успешно завершена!")
                         except Exception as e: state.add_log(f"❌ Ошибка индексации: {e}")
                         finally:
