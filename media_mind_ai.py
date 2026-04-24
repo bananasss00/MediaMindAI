@@ -4480,7 +4480,7 @@ def index_page():
                     cluster_algo.on_value_change(update_cluster_visibility)
                     update_cluster_visibility()
 
-                async def execute_cluster_move_action():
+                async def execute_cluster_action(action='copy'):
                     selected_paths =[p for p, checked in state.sel_cluster.items() if checked]
                     if not selected_paths: return ui.notify('Ничего не выбрано!', type='warning')
                         
@@ -4499,15 +4499,23 @@ def index_page():
                                 os.makedirs(dest_folder, exist_ok=True)
                                 fname = os.path.basename(path)
                                 dest = os.path.join(dest_folder, fname)
+                                
+                                # Защита, если исходный файл и цель совпадают
+                                if os.path.abspath(path) == os.path.abspath(dest):
+                                    continue
+                                
                                 try:
-                                    shutil.move(path, dest)
-                                    moved_paths.add(path)
+                                    if action == 'copy':
+                                        shutil.copy2(path, dest)
+                                    else:
+                                        shutil.move(path, dest)
+                                        moved_paths.add(path)
                                     success += 1
                                 except Exception as e: state.add_log(f"Ошибка {path}: {e}")
                                     
-                    ui.notify(f'Успешно отсортировано файлов: {success}', type='positive')
+                    ui.notify(f'Успешно {action}: {success} файлов', type='positive')
                     
-                    if moved_paths:
+                    if action == 'move' and moved_paths:
                         new_clusters =[]
                         for c in state.cluster_results:
                             new_paths = [item for item in c["paths"] if item not in moved_paths]
@@ -4587,10 +4595,11 @@ def index_page():
                     with ui.column().classes('w-full shrink-0 bg-gray-900 p-4 pb-2 border-b border-gray-800 z-20 gap-0 shadow-md'):
                         with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
                             with ui.row().classes('gap-2 items-center'):
-                                ui.button('Выбрать всё вообще', on_click=lambda: set_all('cluster', True)).props('outline color=white dense')
-                                ui.button('Снять всё вообще', on_click=lambda: set_all('cluster', False)).props('outline color=white dense')
+                                ui.button('Выбрать всё', on_click=lambda: set_all('cluster', True)).props('outline color=white dense')
+                                ui.button('Снять всё', on_click=lambda: set_all('cluster', False)).props('outline color=white dense')
                             with ui.row().classes('gap-2 items-center'):
-                                ui.button('📂 РАСФАСОВАТЬ ПО ПАПКАМ', icon='drive_file_move', on_click=execute_cluster_move_action).props('color=purple-600 text-white font-bold dense')
+                                ui.button('Копировать по папкам ✔', icon='content_copy', on_click=lambda: execute_cluster_action('copy')).props('color=purple-800 text-white font-bold dense')
+                                ui.button('Переместить по папкам ✔', icon='drive_file_move', on_click=lambda: execute_cluster_action('move')).props('color=purple-600 text-white font-bold dense')
                                 ui.button('УДАЛИТЬ ✔', icon='delete_forever', on_click=lambda: delete_items([p for p, c in state.sel_cluster.items() if c], 'cluster')).props('color=red-10 text-white dense')
                         
                         with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
