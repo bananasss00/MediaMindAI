@@ -4221,11 +4221,19 @@ def index_page():
                             ui.button(icon='delete_sweep', on_click=lambda: clear_folder_cache_multi(dupes_dir.value)).props('flat round dense text-color=red').tooltip('Очистить кэш')
                     
                     dupes_mode = ui.select(['Точные (Быстрый Хеш)', 'Похожие картинки (pHash)'], value=cfg.get('dupes_mode', 'Точные (Быстрый Хеш)'), label='Режим поиска').classes('w-full mt-2 text-lg font-bold')
-                    phash_threshold = ui.number('Порог СХОЖЕСТИ (0-15, больше = шире допуск)', value=cfg.get('phash_threshold', 4), format='%.0f').classes('w-full mt-2 text-orange-400 font-bold').bind_visibility_from(dupes_mode, 'value', value=lambda v: v == 'Похожие картинки (pHash)')
+                    phash_threshold = ui.number('Порог СХОЖЕСТИ (0-15, больше = шире допуск)', value=cfg.get('phash_threshold', 4), format='%.0f').classes('w-full mt-2 text-orange-400 font-bold')
                     
-                    with ui.row().classes('w-full gap-2 mt-2'):
+                    with ui.row().classes('w-full gap-2 mt-2 mb-2'):
                         chk_img_dupes = ui.checkbox('Картинки', value=cfg.get('chk_img_dupes', True))
-                        chk_vid_dupes = ui.checkbox('Видео', value=cfg.get('chk_vid_dupes', True)).bind_visibility_from(dupes_mode, 'value', value=lambda v: v == 'Точные (Быстрый Хеш)')
+                        chk_vid_dupes = ui.checkbox('Видео', value=cfg.get('chk_vid_dupes', True))
+
+                    def update_dupes_visibility(e=None):
+                        is_phash = (dupes_mode.value == 'Похожие картинки (pHash)')
+                        phash_threshold.set_visibility(is_phash)
+                        chk_vid_dupes.set_visibility(not is_phash)
+                        
+                    dupes_mode.on_value_change(update_dupes_visibility)
+                    update_dupes_visibility()
 
                 async def run_dupes_action():
                     save_config({
