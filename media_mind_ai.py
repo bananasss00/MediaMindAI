@@ -29,6 +29,14 @@ try:
 except ImportError:
     print("⚠️ Библиотека imagehash не найдена. Установите: pip install ImageHash")
 
+try:
+    from sklearn.cluster import KMeans, DBSCAN
+    from sklearn.preprocessing import normalize
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+    print("⚠️ Библиотека scikit-learn не найдена. Установите: pip install scikit-learn")
+
 import argparse
 import sys
 import asyncio
@@ -1918,7 +1926,100 @@ class DuplicatesEngine:
         results.sort(key=lambda g: len(g), reverse=True)
         for g in results: g.sort()
         return results
-    
+
+class ClusteringEngine:
+    def __init__(self, search_engine):
+        self.se = search_engine
+        self.db_cache = search_engine.db_cache
+
+    def build_clusters(self, dir_paths, allowed_exts, algo, n_clusters, eps, emb_model_name, emb_size):
+        if not SKLEARN_AVAILABLE:
+            raise Exception("Установите библиотеку scikit-learn: pip install scikit-learn")
+
+        files = self.se._gather_files(dir_paths, allowed_exts)
+        path_to_hash = self.db_cache.get_or_create_hashes(files)
+        
+        cache_key = emb_model_name if emb_size == 512 else f"{emb_model_name}_{emb_size}"
+        
+        c = self.db_cache.conn.cursor()
+        hashes = list(set(path_to_hash.values()))
+        
+        state.add_log(f"Сбор нейросетевых признаков (эмбеддингов) из БД для {len(hashes)} файлов...")
+        
+        emb_dict = {}
+        chunk_size = 900
+        for i in range(0, len(hashes), chunk_size):
+            chunk = hashes[i:i+chunk_size]
+            ph = ','.join(['?']*len(chunk))
+            c.execute(f"SELECT hash, features FROM emb_cache WHERE model=? AND hash IN ({ph})", [cache_key] + chunk)
+            for row in c.fetchall():
+                try:
+                    feat_tensor = torch.load(io.BytesIO(row[1]), weights_only=False)
+                    emb_dict[row[0]] = feat_tensor.numpy().flatten()
+                except Exception: pass
+
+        valid_paths =[]
+        valid_embs =[]
+        for p in files:
+            h = path_to_hash.get(p)
+            if h in emb_dict:
+                valid_paths.append(p)
+                valid_embs.append(emb_dict[h])
+
+        if not valid_paths:
+            raise Exception("Эмбеддинги не найдены! Сначала запустите 'Индексатор -> Умный Поиск' для этой папки.")
+
+        state.add_log(f"Найдено {len(valid_paths)} файлов с кэшем. Запуск алгоритма {algo}...")
+        
+        X = np.array(valid_embs)
+        X = normalize(X) # L2 нормализация (косинусное сходство)
+
+        if algo == 'K-Means':
+            n_c = min(n_clusters, len(X))
+            model = KMeans(n_clusters=n_c, random_state=42, n_init='auto')
+            labels = model.fit_predict(X)
+        else:
+            # DBSCAN: используем евклидову метрику на нормализованных векторах (~косинусное расстояние)
+            model = DBSCAN(eps=eps, min_samples=2, metric='euclidean')
+            labels = model.fit_predict(X)
+
+        state.add_log("Кластеризация завершена. Генерация названий папок на основе тегов...")
+        
+        clusters = defaultdict(list)
+        for p, lbl in zip(valid_paths, labels):
+            clusters[lbl].append(p)
+
+        # Выгружаем все доступные теги (от любого теггера) для участвующих файлов
+        tags_dict_global = {}
+        for i in range(0, len(hashes), chunk_size):
+            chunk = hashes[i:i+chunk_size]
+            ph = ','.join(['?']*len(chunk))
+            # Группируем теги, чтобы взять хотя бы одни (последние обновленные)
+            c.execute(f"SELECT hash, tags FROM tags_cache WHERE hash IN ({ph})", chunk)
+            for row in c.fetchall():
+                if row[1]: tags_dict_global[row[0]] = json.loads(row[1])
+
+        results =[]
+        for lbl, paths in clusters.items():
+            if lbl == -1:
+                name = "Outliers_Noise" # Для DBSCAN, если файл никуда не подошел
+            else:
+                tag_counts = defaultdict(float)
+                for p in paths:
+                    h = path_to_hash.get(p)
+                    if h in tags_dict_global:
+                        for t, prob in tags_dict_global[h].items():
+                            tag_counts[t] += prob
+                
+                sorted_tags = sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)
+                top_tags = [t[0].replace(' ', '_').replace(':', '') for t in sorted_tags[:3]]
+                name = f"Cluster_{lbl:03d}" + ("_" + "_".join(top_tags) if top_tags else "")
+                
+            results.append({"name": name, "paths": paths})
+
+        results.sort(key=lambda x: len(x["paths"]), reverse=True)
+        return results
+        
 # ==========================================
 # 4. СОСТОЯНИЕ И UI УТИЛИТЫ
 # ==========================================
@@ -1930,6 +2031,11 @@ class AppState:
         self.face_results =[]
         self.tags_results =[]
         self.dupes_results =[]
+        self.cluster_results =[]
+        self.sel_cluster = {}
+        self.cluster_page = 1
+        self.cluster_base_dir = ""
+        self.cluster_res_filter = 'Все'
         
         self.sel_search = {}
         self.sel_aes = {}
@@ -1995,6 +2101,7 @@ nsfw_engine = NsfwEngine(search_engine)
 face_engine = FaceEngine(search_engine)
 tag_engine = TagEngine(search_engine)
 dupes_engine = DuplicatesEngine(search_engine)
+cluster_engine = ClusteringEngine(search_engine)
 
 def open_file_native(filepath):
     try: os.startfile(filepath) if os.name == 'nt' else subprocess.call(('xdg-open', filepath))
@@ -2188,6 +2295,7 @@ def index_page():
             tab_face = ui.tab('Face', label='Поиск по лицу', icon='face')
             tab_tags = ui.tab('Tags', label='Danbooru Теги', icon='label')
             tab_dupes = ui.tab('Dupes', label='Дубликаты', icon='content_copy')
+            tab_cluster = ui.tab('Cluster', label='AI Сортировка', icon='auto_awesome_mosaic')
             tab_cache = ui.tab('Cache', label='Индексатор', icon='storage')
             
         ui.button(icon='settings', on_click=lambda: global_settings_dialog.open()).props('flat round dense text-color=white').classes('shrink-0').tooltip('Глобальные настройки')
@@ -2357,6 +2465,11 @@ def index_page():
             tags_gallery_ui.refresh()
             changed = True
             scroll_id = "tags_scroll_area"
+        elif state.current_tab == 'Cluster' and state.cluster_page != target_page:
+            state.cluster_page = target_page
+            cluster_gallery_ui.refresh()
+            changed = True
+            scroll_id = "cluster_scroll_area"
 
         # Если страница изменилась, прокручиваем список в самое начало
         if changed:
@@ -2394,6 +2507,7 @@ def index_page():
         elif state.current_tab == 'NSFW' and path in state.sel_nsfw: is_selected = state.sel_nsfw[path]
         elif state.current_tab == 'Face' and path in state.sel_face: is_selected = state.sel_face[path]
         elif state.current_tab == 'Tags' and path in state.sel_tags: is_selected = state.sel_tags[path]
+        elif state.current_tab == 'Cluster' and path in state.sel_cluster: is_selected = state.sel_cluster[path]
             
         btn_viewer_select._props['icon'] = 'check_box' if is_selected else 'check_box_outline_blank'
         btn_viewer_select._props['color'] = 'green' if is_selected else 'white'
@@ -2412,6 +2526,8 @@ def index_page():
             state.sel_face[path] = not state.sel_face[path]
         elif state.current_tab == 'Tags' and path in state.sel_tags:
             state.sel_tags[path] = not state.sel_tags[path]
+        elif state.current_tab == 'Cluster' and path in state.sel_cluster:
+            state.sel_cluster[path] = not state.sel_cluster[path]
         update_viewer_selection_ui()
 
     def download_current_item():
@@ -2489,6 +2605,8 @@ def index_page():
             elif tab == 'nsfw': tab_name = 'nsfw'
             elif tab == 'face': tab_name = 'face'
             elif tab == 'tags': tab_name = 'tags'
+            elif tab == 'dupes': tab_name = 'dupes'
+            elif tab == 'cluster': tab_name = 'cluster'
             
             # Закрываем плеер, если удалили последний файл
             if len(state.viewer_items) <= 1:
@@ -2578,6 +2696,7 @@ def index_page():
         elif tab_name == 'face': face_gallery_ui.refresh()
         elif tab_name == 'tags': tags_gallery_ui.refresh()
         elif tab_name == 'dupes': dupes_gallery_ui.refresh()
+        elif tab_name == 'cluster': cluster_gallery_ui.refresh()
 
     def get_physical_info(p):
         try:
@@ -2652,11 +2771,17 @@ def index_page():
                 
                 # В дубликатах результаты хранятся как список списков
                 if tab_name == 'dupes':
-                    new_dupes = []
+                    new_dupes =[]
                     for g in res_list:
                         new_g =[item for item in g if item != p]
                         if len(new_g) > 1: new_dupes.append(new_g)
                     setattr(state, attr_name, new_dupes)
+                elif tab_name == 'cluster':
+                    new_clusters = []
+                    for c in res_list:
+                        new_paths = [item for item in c["paths"] if item != p]
+                        if len(new_paths) > 0: new_clusters.append({"name": c["name"], "paths": new_paths})
+                    setattr(state, attr_name, new_clusters)
                 else:
                     setattr(state, attr_name, [item for item in res_list if item[1] != p])
             except Exception as e:
@@ -2755,6 +2880,10 @@ def index_page():
             for g in state.dupes_results:
                 for p in g: state.sel_dupes[p] = value
             return dupes_gallery_ui.refresh()
+        if tab == 'cluster':
+            for c in state.cluster_results:
+                for p in c["paths"]: state.sel_cluster[p] = value
+            return cluster_gallery_ui.refresh()
             
         filter_val = getattr(state, f"{tab}_res_filter")
         sel_dict = getattr(state, f"sel_{tab}")
@@ -4314,6 +4443,197 @@ def index_page():
             with ui.column().classes('flex-1 w-0 bg-gray-900 rounded-xl border border-gray-800 overflow-hidden h-full relative p-0'):
                 dupes_gallery_ui()
 
+        # ВКЛАДКА: AI КЛАСТЕРИЗАЦИЯ
+        with ui.tab_panel(tab_cluster).classes('w-full h-[calc(100vh-115px)] p-4 flex flex-row flex-nowrap items-stretch gap-4'):
+            with ui.column().classes('w-[350px] shrink-0 bg-gray-900 rounded-xl border border-gray-800 shadow-lg flex flex-col overflow-hidden p-0 gap-0'):
+                with ui.row().classes('w-full p-4 pb-2 shrink-0 border-b border-gray-800 bg-gray-900 z-10'):
+                    ui.label('Магия Кластеризации').classes('text-lg font-bold')
+                
+                with ui.column().classes('w-full flex-1 overflow-y-auto p-4 gap-2 min-h-0'):
+                    ui.label('ВНИМАНИЕ: Сначала проиндексируйте файлы через "Умный поиск" или "Индексатор" (Умный поиск + Тегирование).').classes('text-xs text-orange-400 font-bold mb-2')
+                    
+                    with ui.row().classes('w-full items-start gap-1 flex-nowrap'):
+                        cluster_dir = ui.textarea('Папки (с новой строки)', value=cfg.get('cluster_dir', '')).classes('flex-grow').props('rows=2')
+                        with ui.column().classes('gap-0 pt-2'):
+                            ui.button(icon='create_new_folder', on_click=lambda: select_folder_multi(cluster_dir)).props('flat round dense').tooltip('Добавить папку')
+                            ui.button(icon='delete_sweep', on_click=lambda: clear_folder_cache_multi(cluster_dir.value)).props('flat round dense text-color=red').tooltip('Очистить кэш')
+                    
+                    cluster_algo = ui.select(['K-Means', 'DBSCAN'], value=cfg.get('cluster_algo', 'K-Means'), label='Алгоритм (K-Means - кол-во папок, DBSCAN - авто)').classes('w-full mt-2 font-bold')
+                    cluster_k = ui.number('Желаемое кол-во папок (K-Means)', value=cfg.get('cluster_k', 10), format='%.0f').classes('w-full')
+                    cluster_eps = ui.number('Чувствительность (DBSCAN 0.1 - 1.0)', value=cfg.get('cluster_eps', 0.4), format='%.2f', step=0.05).classes('w-full')
+                    
+                    with ui.row().classes('w-full gap-2 mt-2 mb-2'):
+                        chk_img_cluster = ui.checkbox('Картинки', value=cfg.get('chk_img_cluster', True))
+                        chk_vid_cluster = ui.checkbox('Видео', value=cfg.get('chk_vid_cluster', False))
+                        
+                    cluster_emb_model = ui.select(['Qwen/Qwen3-VL-Embedding-2B', 'Qwen/Qwen3-VL-Embedding-8B'], value=cfg.get('cluster_emb_model', 'Qwen/Qwen3-VL-Embedding-2B'), label='Модель (из которой брать вектора)').classes('w-full text-xs')
+                    cluster_emb_size = ui.number('Разрешение при кэше', value=cfg.get('emb_size', 512), format='%.0f').classes('w-full')
+
+                    def update_cluster_visibility(e=None):
+                        is_kmeans = (cluster_algo.value == 'K-Means')
+                        cluster_k.set_visibility(is_kmeans)
+                        cluster_eps.set_visibility(not is_kmeans)
+                        
+                    cluster_algo.on_value_change(update_cluster_visibility)
+                    update_cluster_visibility()
+
+                async def execute_cluster_move_action():
+                    selected_paths =[p for p, checked in state.sel_cluster.items() if checked]
+                    if not selected_paths: return ui.notify('Ничего не выбрано!', type='warning')
+                        
+                    base_dest = await run.io_bound(pick_folder_native)
+                    if not base_dest: return
+                    
+                    success = 0
+                    moved_paths = set()
+                    
+                    for cluster in state.cluster_results:
+                        cluster_name = cluster["name"]
+                        dest_folder = os.path.join(base_dest, cluster_name)
+                        
+                        for path in cluster["paths"]:
+                            if state.sel_cluster.get(path):
+                                os.makedirs(dest_folder, exist_ok=True)
+                                fname = os.path.basename(path)
+                                dest = os.path.join(dest_folder, fname)
+                                try:
+                                    shutil.move(path, dest)
+                                    moved_paths.add(path)
+                                    success += 1
+                                except Exception as e: state.add_log(f"Ошибка {path}: {e}")
+                                    
+                    ui.notify(f'Успешно отсортировано файлов: {success}', type='positive')
+                    
+                    if moved_paths:
+                        new_clusters =[]
+                        for c in state.cluster_results:
+                            new_paths = [item for item in c["paths"] if item not in moved_paths]
+                            if new_paths: new_clusters.append({"name": c["name"], "paths": new_paths})
+                        state.cluster_results = new_clusters
+                        cluster_gallery_ui.refresh()
+
+                async def run_cluster_action():
+                    save_config({
+                        'cluster_dir': cluster_dir.value, 'cluster_algo': cluster_algo.value,
+                        'cluster_k': cluster_k.value, 'cluster_eps': cluster_eps.value,
+                        'chk_img_cluster': chk_img_cluster.value, 'chk_vid_cluster': chk_vid_cluster.value,
+                        'cluster_emb_model': cluster_emb_model.value
+                    })
+                    if not cluster_dir.value: return ui.notify("Укажите папки!", type='warning')
+                    
+                    state.is_processing = True
+                    search_engine.cancel_flag = False
+                    state.cluster_results.clear()
+                    state.sel_cluster.clear()
+                    setattr(state, 'cluster_page', 1)
+                    cluster_gallery_ui.refresh()
+                    btn_cluster.disable()
+                    
+                    exts =[]
+                    if chk_img_cluster.value: exts.extend(SUPPORTED_IMAGES)
+                    if chk_vid_cluster.value: exts.extend(SUPPORTED_VIDEOS)
+
+                    def bg_task():
+                        try:
+                            state.add_log(f"Начат процесс AI сортировки...")
+                            res = cluster_engine.build_clusters(
+                                cluster_dir.value, tuple(exts), cluster_algo.value,
+                                int(cluster_k.value), float(cluster_eps.value),
+                                cluster_emb_model.value, int(cluster_emb_size.value)
+                            )
+                            state.cluster_results = res
+                            for cluster in res:
+                                for p in cluster["paths"]: state.sel_cluster[p] = False
+                            state.add_log(f"✅ Кластеризация завершена! Сформировано папок: {len(res)}")
+                        except Exception as e: state.add_log(f"❌ Ошибка: {e}")
+                        finally:
+                            state.status_text = "Готово!"
+                            state.progress = 1.0
+                            state.is_processing = False
+
+                    await run.io_bound(bg_task)
+                    cluster_gallery_ui.refresh()
+                    btn_cluster.enable()
+                    
+                with ui.row().classes('w-full p-4 pt-2 shrink-0 border-t border-gray-800 bg-gray-900 z-10'):
+                    btn_cluster = ui.button('✨ Раскидать по папкам', on_click=run_cluster_action).classes('w-full bg-purple-700 hover:bg-purple-600 font-bold text-lg')
+
+            @ui.refreshable
+            def cluster_gallery_ui():
+                if not state.cluster_results:
+                    return ui.label("Здесь появятся сгруппированные нейросетью файлы...").classes("text-gray-400 m-4")
+                    
+                GROUPS_PER_PAGE = 3  
+                MAX_ITEMS_PER_GROUP = 40  
+                
+                total_pages = max(1, (len(state.cluster_results) + GROUPS_PER_PAGE - 1) // GROUPS_PER_PAGE)
+                if getattr(state, 'cluster_page', 1) > total_pages: state.cluster_page = 1
+                
+                def change_page(d):
+                    state.cluster_page = max(1, min(total_pages, getattr(state, 'cluster_page', 1) + d))
+                    cluster_gallery_ui.refresh()
+
+                with ui.column().classes('w-full h-full flex flex-col p-0 m-0 gap-0 relative'):
+                    with ui.column().classes('w-full shrink-0 bg-gray-900 p-4 pb-2 border-b border-gray-800 z-20 gap-0 shadow-md'):
+                        with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
+                            with ui.row().classes('gap-2 items-center'):
+                                ui.button('Выбрать всё', on_click=lambda: set_all('cluster', True)).props('outline color=white dense')
+                                ui.button('Снять всё', on_click=lambda: set_all('cluster', False)).props('outline color=white dense')
+                            with ui.row().classes('gap-2 items-center'):
+                                ui.button('📂 РАСФАСОВАТЬ ПО ПАПКАМ', icon='drive_file_move', on_click=execute_cluster_move_action).props('color=purple-600 text-white font-bold dense')
+                                ui.button('УДАЛИТЬ ✔', icon='delete_forever', on_click=lambda: delete_items([p for p, c in state.sel_cluster.items() if c], 'cluster')).props('color=red-10 text-white dense')
+                        
+                        with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
+                            ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
+                            ui.label(f'Страница {getattr(state, "cluster_page", 1)} из {total_pages}').classes('text-gray-300 font-bold')
+                            ui.button(icon='chevron_right', on_click=lambda: change_page(1)).props('flat outline color=white')
+                    
+                    scroll_id = 'cluster_scroll_area'
+                    with ui.column().classes('w-full flex-1 overflow-y-auto p-4 relative').props(f'id="{scroll_id}"'):
+                        start_idx = (getattr(state, 'cluster_page', 1) - 1) * GROUPS_PER_PAGE
+                        page_groups = state.cluster_results[start_idx : start_idx + GROUPS_PER_PAGE]
+                        
+                        visible_cluster_paths =[]
+                        for g in page_groups: visible_cluster_paths.extend(g["paths"][:MAX_ITEMS_PER_GROUP])
+                        
+                        for group in page_groups:
+                            with ui.card().classes('w-full bg-gray-800 border border-gray-700 p-2 mb-4'):
+                                ui.label(f'📁 {group["name"]} (Файлов: {len(group["paths"])})').classes('font-bold text-purple-400 mb-2 px-2')
+                                
+                                visible_group = group["paths"][:MAX_ITEMS_PER_GROUP]
+                                hidden_count = len(group["paths"]) - MAX_ITEMS_PER_GROUP
+                                
+                                with ui.row().classes('w-full gap-4 overflow-x-auto pb-2 flex-nowrap items-center'):
+                                    for path in visible_group:
+                                        safe_path = urllib.parse.quote(path)
+                                        global_index = visible_cluster_paths.index(path)
+                                        
+                                        with ui.column().classes('w-[200px] shrink-0 relative bg-gray-900 rounded overflow-hidden border border-gray-700 hover:border-purple-500 transition-colors'):
+                                            with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
+                                                ui.checkbox().bind_value(state.sel_cluster, path).on('click', lambda e, i=global_index, p=path, paths=visible_cluster_paths: handle_shift_click(e, i, p, 'cluster', paths),['shiftKey'])
+                                            
+                                            with ui.context_menu():
+                                                ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
+                                                ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
+                                                ui.separator()
+                                                ui.menu_item('Удалить файл', on_click=lambda p=path: delete_items([p], 'cluster')).classes('text-red-400')
+
+                                            ui.image(f"/thumb/{safe_path}").classes('w-full h-[150px] object-contain cursor-pointer bg-black').props('fit=contain loading="lazy"').on('click', lambda e, idx=global_index, paths=visible_cluster_paths: open_media(idx, paths))
+                                            
+                                            with ui.column().classes('p-2 gap-0 w-full'):
+                                                ui.label(os.path.basename(path)).classes('text-gray-400 text-[10px] truncate w-full').tooltip(path)
+
+                                    if hidden_count > 0:
+                                        with ui.card().classes('w-[200px] h-[190px] shrink-0 flex flex-col items-center justify-center bg-gray-900 border border-dashed border-gray-600 gap-2 p-4'):
+                                            ui.icon('more_horiz', size='3rem').classes('text-gray-500')
+                                            ui.label(f"+ еще {hidden_count} шт.").classes('text-center font-bold text-gray-300 text-lg')
+                                            ui.label("Скрыты для стабильности").classes('text-[10px] text-center text-gray-500')
+
+                    ui.button(icon='keyboard_arrow_up', on_click=lambda: ui.run_javascript(f'document.getElementById("{scroll_id}").scrollTo({{top: 0, behavior: "smooth"}})')).props('round color=purple-800').classes('absolute bottom-6 right-6 z-50 shadow-lg').tooltip('Наверх')
+
+            with ui.column().classes('flex-1 w-0 bg-gray-900 rounded-xl border border-gray-800 overflow-hidden h-full relative p-0'):
+                cluster_gallery_ui()
+                
     with ui.footer().classes('bg-gray-900 border-t border-gray-800 px-4 py-0 flex flex-row flex-nowrap items-center justify-between z-40 h-8 shadow-lg'):
         ui.label().bind_text_from(state, 'status_text').classes('text-blue-400 font-mono text-xs truncate max-w-[30%] shrink-0')
         ui.linear_progress(value=0, show_value=False).bind_value_from(state, 'progress').classes('flex-grow mx-4 h-1.5 rounded text-blue-600')
