@@ -1834,7 +1834,7 @@ class DuplicatesEngine:
 
     def find_similar(self, dir_paths, allowed_exts, threshold):
         files = self.se._gather_files(dir_paths, allowed_exts)
-        files =[f for f in files if f.lower().endswith(SUPPORTED_IMAGES)] # pHash только для картинок
+        files =[f for f in files if f.lower().endswith(SUPPORTED_IMAGES)]
         path_to_hash = self.db_cache.get_or_create_hashes(files)
         
         c = self.db_cache.conn.cursor()
@@ -1861,7 +1861,11 @@ class DuplicatesEngine:
                         phash_dict[h] = ph
                         to_insert.append((h, ph))
                 except Exception: pass
-                if i % 100 == 0: state.progress = i / max(1, len(missing_paths))
+                
+                # МИКРО-ПАУЗА: Защита от обрыва соединения (WebSocket Timeout)
+                if i % 50 == 0: 
+                    state.progress = i / max(1, len(missing_paths))
+                    time.sleep(0.005)
             
             if to_insert:
                 c.executemany("INSERT OR REPLACE INTO phash_cache (hash, phash) VALUES (?, ?)", to_insert)
@@ -1888,10 +1892,15 @@ class DuplicatesEngine:
         for i in range(total):
             if self.se.cancel_flag: break
             h1 = hash_list[i]
+            obj1 = hash_objs[h1]
             for j in range(i+1, total):
                 h2 = hash_list[j]
-                if hash_objs[h1] - hash_objs[h2] <= threshold:
+                if obj1 - hash_objs[h2] <= threshold:
                     union(h1, h2)
+                    
+            # МИКРО-ПАУЗА: Предотвращает зависание UI при огромном количестве файлов
+            if i % 200 == 0:
+                time.sleep(0.002)
                     
         groups = defaultdict(list)
         for p in files:
@@ -2836,7 +2845,7 @@ def index_page():
                             if os.path.splitext(path)[1].lower() in SUPPORTED_TEXTS:
                                 ui.icon('article', size='4rem').classes('w-full aspect-square flex items-center justify-center bg-gray-900 cursor-pointer text-gray-500').on('click', lambda p=path: open_file_native(p))
                             else:
-                                ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
+                                ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain loading="lazy"').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
                             
                             with ui.row().classes('w-full justify-between items-center p-2 bg-gray-800'):
                                 ui.label(f"Score: {score:.3f}").classes('text-green-400 font-bold text-sm')
@@ -2929,7 +2938,7 @@ def index_page():
                                 ui.separator()
                                 ui.menu_item('Удалить файл (В корзину)', on_click=lambda p=path: delete_items([p], 'aes')).classes('text-red-400')
 
-                            ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
+                            ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain loading="lazy"').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
                             
                             with ui.row().classes('w-full justify-between items-center p-2'):
                                 ui.label(f"★ {avg_score:.2f}").classes('text-yellow-400 font-bold text-lg')
@@ -3022,7 +3031,7 @@ def index_page():
                                 ui.separator()
                                 ui.menu_item('Удалить файл (В корзину)', on_click=lambda p=path: delete_items([p], 'nsfw')).classes('text-red-400')
 
-                            ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
+                            ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain loading="lazy"').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
                             
                             with ui.row().classes('w-full justify-between items-center p-2'):
                                 ui.label(f"🚨 {danger_score*100:.1f}%").classes('text-red-500 font-bold text-lg')
@@ -3117,7 +3126,7 @@ def index_page():
                                 ui.separator()
                                 ui.menu_item('Удалить файл (В корзину)', on_click=lambda p=path: delete_items([p], 'face')).classes('text-red-400')
 
-                            ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
+                            ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain loading="lazy"').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
                             
                             with ui.row().classes('w-full justify-between items-center p-2 bg-gray-800'):
                                 ui.label(f"Сходство: {sim_score*100:.1f}%").classes('text-teal-400 font-bold text-sm')
@@ -3215,7 +3224,7 @@ def index_page():
                                 ui.separator()
                                 ui.menu_item('Удалить файл (В корзину)', on_click=lambda p=path: delete_items([p], 'tags')).classes('text-red-400')
 
-                            ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
+                            ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain loading="lazy"').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
                             
                             with ui.row().classes('w-full justify-between items-center p-2 bg-gray-800'):
                                 ui.label(top_tags_str).classes('text-pink-400 font-bold text-xs truncate max-w-[80%]').tooltip(", ".join([f"{k} ({v:.2f})" for k, v in top_tags]))
@@ -3224,32 +3233,41 @@ def index_page():
 
             ui.button(icon='keyboard_arrow_up', on_click=lambda: ui.run_javascript(f'document.getElementById("{scroll_id}").scrollTo({{top: 0, behavior: "smooth"}})')).props('round color=pink-800').classes('absolute bottom-6 right-6 z-50 shadow-lg').tooltip('Наверх')
 
-    def auto_select_worst_dupes():
-        c = search_engine.db_cache.conn.cursor()
-        c.execute("SELECT path, size_mb, width, height FROM files")
-        info = {r[0]: (r[1], r[2], r[3]) for r in c.fetchall()}
+    async def auto_select_worst_dupes():
+        ui.notify("Анализ файлов...", type="info")
         
-        for group in state.dupes_results:
-            scored =[]
-            for p in group:
-                size, w, h = info.get(p, (0, 0, 0))
-                res = (w or 0) * (h or 0)
-                scored.append((res, size or 0, p))
+        def task():
+            c = search_engine.db_cache.conn.cursor()
+            c.execute("SELECT path, size_mb, width, height FROM files")
+            info = {r[0]: (r[1], r[2], r[3]) for r in c.fetchall()}
             
-            scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
-            # Оставляем галочку снятой у самого лучшего файла, а всем копиям ставим галочку на удаление
-            state.sel_dupes[scored[0][2]] = False
-            for item in scored[1:]:
-                state.sel_dupes[item[2]] = True
+            updates = {}
+            for group in state.dupes_results:
+                scored =[]
+                for p in group:
+                    size, w, h = info.get(p, (0, 0, 0))
+                    res = (w or 0) * (h or 0)
+                    scored.append((res, size or 0, p))
                 
+                scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+                updates[scored[0][2]] = False
+                for item in scored[1:]:
+                    updates[item[2]] = True
+            return updates
+            
+        updates = await run.io_bound(task)
+        state.sel_dupes.update(updates)
         dupes_gallery_ui.refresh()
+        ui.notify("Худшие дубликаты выделены!", type="positive")
 
     @ui.refreshable
     def dupes_gallery_ui():
         if not state.dupes_results:
             return ui.label("Найденные дубликаты появятся здесь...").classes("text-gray-400 m-4")
             
-        total_pages = max(1, (len(state.dupes_results) + 15 - 1) // 15)
+        # ИЗМЕНЕНИЕ: Снизили кол-во групп на странице с 15 до 5, чтобы не вешать сервер!
+        GROUPS_PER_PAGE = 5
+        total_pages = max(1, (len(state.dupes_results) + GROUPS_PER_PAGE - 1) // GROUPS_PER_PAGE)
         if getattr(state, 'dupes_page', 1) > total_pages: state.dupes_page = 1
         
         def change_page(d):
@@ -3262,6 +3280,7 @@ def index_page():
                     with ui.row().classes('gap-2 items-center'):
                         ui.button('АВТО-ВЫБОР ХУДШИХ', icon='auto_awesome', on_click=auto_select_worst_dupes).props('color=orange text-black font-bold dense')
                         ui.button('Снять всё', on_click=lambda: set_all('dupes', False)).props('outline color=white dense')
+                        ui.label('💡 Измените порог слева и нажмите "Искать" для перегруппировки (это мгновенно)').classes('text-[10px] text-gray-500 ml-4')
                     with ui.row().classes('gap-2 items-center'):
                         ui.button('УДАЛИТЬ ВЫДЕЛЕННЫЕ ✔', icon='delete_forever', on_click=lambda: delete_items([p for p, c in state.sel_dupes.items() if c], 'dupes')).props('color=red-10 text-white dense')
                 
@@ -3272,8 +3291,11 @@ def index_page():
             
             scroll_id = 'dupes_scroll_area'
             with ui.column().classes('w-full flex-1 overflow-y-auto p-4 relative').props(f'id="{scroll_id}"'):
-                start_idx = (getattr(state, 'dupes_page', 1) - 1) * 15
-                page_groups = state.dupes_results[start_idx : start_idx + 15]
+                start_idx = (getattr(state, 'dupes_page', 1) - 1) * GROUPS_PER_PAGE
+                page_groups = state.dupes_results[start_idx : start_idx + GROUPS_PER_PAGE]
+                
+                # СОЗДАЕМ ЕДИНЫЙ СПИСОК ДЛЯ СКРОЛЛИНГА В ПЛЕЕРЕ
+                all_dupes_paths =[p for group in state.dupes_results for p in group]
                 
                 for group_idx, group in enumerate(page_groups):
                     with ui.card().classes('w-full bg-gray-800 border border-gray-700 p-2 mb-4'):
@@ -3281,10 +3303,21 @@ def index_page():
                         with ui.row().classes('w-full gap-4 overflow-x-auto pb-2 flex-nowrap'):
                             for path in group:
                                 safe_path = urllib.parse.quote(path)
-                                with ui.column().classes('w-[200px] shrink-0 relative bg-gray-900 rounded overflow-hidden border border-gray-700'):
+                                global_index = all_dupes_paths.index(path)
+                                
+                                with ui.column().classes('w-[200px] shrink-0 relative bg-gray-900 rounded overflow-hidden border border-gray-700 hover:border-orange-500 transition-colors'):
                                     with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
-                                        ui.checkbox().bind_value(state.sel_dupes, path)
-                                    ui.image(f"/thumb/{safe_path}").classes('w-full h-[150px] object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda p=path: reveal_file_native(p))
+                                        ui.checkbox().bind_value(state.sel_dupes, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'dupes'),['shiftKey'])
+                                    
+                                    with ui.context_menu():
+                                        ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
+                                        ui.menu_item('Копировать картинку', on_click=lambda p=path: copy_image_to_clipboard(p))
+                                        ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
+                                        ui.separator()
+                                        ui.menu_item('Удалить файл (В корзину)', on_click=lambda p=path: delete_items([p], 'dupes')).classes('text-red-400')
+
+                                    # ИЗМЕНЕНИЕ: Включен loading="lazy" и ЖЕСТКО зафиксированы переменные для плеера!
+                                    ui.image(f"/thumb/{safe_path}").classes('w-full h-[150px] object-contain cursor-pointer bg-black').props('fit=contain loading="lazy"').on('click', lambda e, idx=global_index, paths=all_dupes_paths: open_media(idx, paths))
                                     
                                     c = search_engine.db_cache.conn.cursor()
                                     c.execute("SELECT size_mb, width, height FROM files WHERE path=?", (path,))
@@ -3293,7 +3326,9 @@ def index_page():
                                     res_str = f"{info[1]}x{info[2]}" if info and info[1] else "N/A"
                                     
                                     with ui.column().classes('p-2 gap-0 w-full'):
-                                        ui.label(res_str).classes('text-green-400 font-bold text-xs')
+                                        with ui.row().classes('w-full justify-between items-center'):
+                                            ui.label(res_str).classes('text-green-400 font-bold text-xs')
+                                            ui.button(icon='folder', on_click=lambda p=path: reveal_file_native(p)).props('flat round dense color=white size=xs').tooltip('Показать в папке')
                                         ui.label(size_str).classes('text-yellow-400 font-bold text-xs')
                                         ui.label(os.path.basename(path)).classes('text-gray-400 text-[10px] truncate w-full').tooltip(path)
 
@@ -4185,8 +4220,8 @@ def index_page():
                             ui.button(icon='create_new_folder', on_click=lambda: select_folder_multi(dupes_dir)).props('flat round dense').tooltip('Добавить папку')
                             ui.button(icon='delete_sweep', on_click=lambda: clear_folder_cache_multi(dupes_dir.value)).props('flat round dense text-color=red').tooltip('Очистить кэш')
                     
-                    dupes_mode = ui.select(['Точные (Быстрый Хеш)', 'Похожие картинки (pHash)'], value=cfg.get('dupes_mode', 'Точные (Быстрый Хеш)'), label='Режим поиска').classes('w-full mt-2')
-                    phash_threshold = ui.number('Порог pHash (Допуск разницы, 1-10)', value=cfg.get('phash_threshold', 4), format='%.0f').classes('w-full').bind_visibility_from(dupes_mode, 'value', value=lambda v: v == 'Похожие картинки (pHash)')
+                    dupes_mode = ui.select(['Точные (Быстрый Хеш)', 'Похожие картинки (pHash)'], value=cfg.get('dupes_mode', 'Точные (Быстрый Хеш)'), label='Режим поиска').classes('w-full mt-2 text-lg font-bold')
+                    phash_threshold = ui.number('Порог СХОЖЕСТИ (0-15, больше = шире допуск)', value=cfg.get('phash_threshold', 4), format='%.0f').classes('w-full mt-2 text-orange-400 font-bold').bind_visibility_from(dupes_mode, 'value', value=lambda v: v == 'Похожие картинки (pHash)')
                     
                     with ui.row().classes('w-full gap-2 mt-2'):
                         chk_img_dupes = ui.checkbox('Картинки', value=cfg.get('chk_img_dupes', True))
