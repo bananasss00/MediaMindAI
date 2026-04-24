@@ -1869,30 +1869,7 @@ nsfw_engine = NsfwEngine(search_engine)
 face_engine = FaceEngine(search_engine)
 tag_engine = TagEngine(search_engine)
 
-# --- ЛОГИКА УДАЛЕНИЯ И ФИЛЬТРАЦИИ ---
-def delete_items(paths, tab_name):
-    if not paths: return
-    deleted = 0
-    for p in paths:
-        try:
-            send2trash(os.path.normpath(p))
-            deleted += 1
-            search_engine.db_cache.remove_paths([p])
-            
-            # Удаляем визуально из текущих результатов
-            res_list = getattr(state, f"{tab_name}_results")
-            setattr(state, f"{tab_name}_results",[item for item in res_list if item[1] != p])
-        except Exception as e:
-            state.add_log(f"Ошибка удаления {p}: {e}")
-            
-    ui.notify(f"🗑️ Отправлено в корзину: {deleted} шт.", type='positive', color='red')
-    # Снимаем выделение
-    sel_dict = getattr(state, f"sel_{tab_name}")
-    for p in paths:
-        if p in sel_dict: del sel_dict[p]
-        
-    globals()[f"{tab_name}_gallery_ui"].refresh()
-
+# --- ЛОГИКА ФИЛЬТРАЦИИ ---
 def apply_physical_filters(results_list):
     """ Принимает список туплов, где index 1 = path, и возвращает отфильтрованный список """
     if not results_list: return[]
@@ -2485,6 +2462,39 @@ def index_page():
             ui.notify(f"Галерея сохранена: {html_path}", type='positive')
         except Exception as e: ui.notify(f"Ошибка экспорта: {e}", type='negative')
 
+    # --- БЕЗОПАСНОЕ ОБНОВЛЕНИЕ UI ---
+    def refresh_tab_ui(tab_name):
+        if tab_name == 'search': search_gallery_ui.refresh()
+        elif tab_name == 'aes': aesthetic_gallery_ui.refresh()
+        elif tab_name == 'nsfw': nsfw_gallery_ui.refresh()
+        elif tab_name == 'face': face_gallery_ui.refresh()
+        elif tab_name == 'tags': tags_gallery_ui.refresh()
+
+    # --- ЛОГИКА УДАЛЕНИЯ В КОРЗИНУ ---
+    def delete_items(paths, tab_name):
+        if not paths: return
+        deleted = 0
+        for p in paths:
+            try:
+                send2trash(os.path.normpath(p))
+                deleted += 1
+                search_engine.db_cache.remove_paths([p])
+                
+                # Удаляем визуально из текущих результатов
+                res_list = getattr(state, f"{tab_name}_results")
+                setattr(state, f"{tab_name}_results",[item for item in res_list if item[1] != p])
+            except Exception as e:
+                state.add_log(f"Ошибка удаления {p}: {e}")
+                
+        ui.notify(f"🗑️ Отправлено в корзину: {deleted} шт.", type='positive', color='red')
+        
+        # Снимаем выделение
+        sel_dict = getattr(state, f"sel_{tab_name}")
+        for p in paths:
+            if p in sel_dict: del sel_dict[p]
+            
+        refresh_tab_ui(tab_name)
+
     # --- ПАКЕТНЫЕ ДЕЙСТВИЯ ---
     async def execute_batch(action='copy', tab='search', prepend_score=False, export_txt=False, txt_threshold=0.1):
         sel_dict = getattr(state, f"sel_{tab}")
@@ -2542,8 +2552,8 @@ def index_page():
         ui.notify(f'Успешно {action}: {success} файлов', type='positive')
         
         if action == 'move' and moved_paths:
-            setattr(state, f"{tab}_results", [i for i in getattr(state, f"{tab}_results") if i[1] not in moved_paths])
-            globals()[f"{tab}_gallery_ui"].refresh()
+            setattr(state, f"{tab}_results",[i for i in getattr(state, f"{tab}_results") if i[1] not in moved_paths])
+            refresh_tab_ui(tab)
 
     async def handle_shift_click(e, idx, path, tab):
         is_shift = isinstance(e.args, dict) and e.args.get('shiftKey', False)
@@ -2690,7 +2700,7 @@ def index_page():
                         ui.button('HTML Экспорт', icon='html', on_click=lambda: export_html_action('aes')).props('color=purple dense outline')
                         ui.button('Копировать ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'aes', chk_prefix_aes.value)).props('color=yellow-800 dense')
                         ui.button('Переместить ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'aes', chk_prefix_aes.value)).props('color=red dense')
-                        ui.button('УДАЛИТЬ ✔', icon='delete_forever', on_click=lambda: delete_items([p for p, c in state.sel_search.items() if c], 'search')).props('color=red-10 text-white dense')
+                        ui.button('УДАЛИТЬ ✔', icon='delete_forever', on_click=lambda: delete_items([p for p, c in state.sel_aes.items() if c], 'aes')).props('color=red-10 text-white dense')
 
                 with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
                     ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
@@ -2720,7 +2730,7 @@ def index_page():
                                 ui.menu_item('Копировать картинку', on_click=lambda p=path: copy_image_to_clipboard(p))
                                 ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
                                 ui.separator()
-                                ui.menu_item('Удалить файл (В корзину)', on_click=lambda p=path: delete_items([p], 'search')).classes('text-red-400')
+                                ui.menu_item('Удалить файл (В корзину)', on_click=lambda p=path: delete_items([p], 'aes')).classes('text-red-400')
 
                             ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
                             
@@ -2767,7 +2777,7 @@ def index_page():
                         ui.button('HTML Экспорт', icon='html', on_click=lambda: export_html_action('nsfw')).props('color=purple dense outline')
                         ui.button('Копировать ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'nsfw', chk_prefix_nsfw.value)).props('color=red-800 dense')
                         ui.button('Переместить ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'nsfw', chk_prefix_nsfw.value)).props('color=red dense')
-                        ui.button('УДАЛИТЬ ✔', icon='delete_forever', on_click=lambda: delete_items([p for p, c in state.sel_search.items() if c], 'search')).props('color=red-10 text-white dense')
+                        ui.button('УДАЛИТЬ ✔', icon='delete_forever', on_click=lambda: delete_items([p for p, c in state.sel_nsfw.items() if c], 'nsfw')).props('color=red-10 text-white dense')
 
                 with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
                     ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
@@ -2797,7 +2807,7 @@ def index_page():
                                 ui.menu_item('Копировать картинку', on_click=lambda p=path: copy_image_to_clipboard(p))
                                 ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
                                 ui.separator()
-                                ui.menu_item('Удалить файл (В корзину)', on_click=lambda p=path: delete_items([p], 'search')).classes('text-red-400')
+                                ui.menu_item('Удалить файл (В корзину)', on_click=lambda p=path: delete_items([p], 'nsfw')).classes('text-red-400')
 
                             ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
                             
@@ -2846,7 +2856,7 @@ def index_page():
                         ui.button('HTML Экспорт', icon='html', on_click=lambda: export_html_action('face')).props('color=purple dense outline')
                         ui.button('Копировать ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'face', chk_prefix_face.value)).props('color=teal-800 dense')
                         ui.button('Переместить ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'face', chk_prefix_face.value)).props('color=red dense')
-                        ui.button('УДАЛИТЬ ✔', icon='delete_forever', on_click=lambda: delete_items([p for p, c in state.sel_search.items() if c], 'search')).props('color=red-10 text-white dense')
+                        ui.button('УДАЛИТЬ ✔', icon='delete_forever', on_click=lambda: delete_items([p for p, c in state.sel_face.items() if c], 'face')).props('color=red-10 text-white dense')
 
                 with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
                     ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
@@ -2876,7 +2886,7 @@ def index_page():
                                 ui.menu_item('Копировать картинку', on_click=lambda p=path: copy_image_to_clipboard(p))
                                 ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
                                 ui.separator()
-                                ui.menu_item('Удалить файл (В корзину)', on_click=lambda p=path: delete_items([p], 'search')).classes('text-red-400')
+                                ui.menu_item('Удалить файл (В корзину)', on_click=lambda p=path: delete_items([p], 'face')).classes('text-red-400')
 
                             ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
                             
@@ -2925,7 +2935,7 @@ def index_page():
                         # Добавляем галочку экспорта txt только для копирования тегов
                         ui.button('Копировать ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'tags', False, chk_txt_tags.value, tags_threshold.value)).props('color=pink-800 dense')
                         ui.button('Переместить ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'tags', False, chk_txt_tags.value, tags_threshold.value)).props('color=red dense')
-                        ui.button('УДАЛИТЬ ✔', icon='delete_forever', on_click=lambda: delete_items([p for p, c in state.sel_search.items() if c], 'search')).props('color=red-10 text-white dense')
+                        ui.button('УДАЛИТЬ ✔', icon='delete_forever', on_click=lambda: delete_items([p for p, c in state.sel_tags.items() if c], 'tags')).props('color=red-10 text-white dense')
 
                 with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
                     ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
@@ -2959,7 +2969,7 @@ def index_page():
                                 ui.menu_item('Копировать картинку', on_click=lambda p=path: copy_image_to_clipboard(p))
                                 ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
                                 ui.separator()
-                                ui.menu_item('Удалить файл (В корзину)', on_click=lambda p=path: delete_items([p], 'search')).classes('text-red-400')
+                                ui.menu_item('Удалить файл (В корзину)', on_click=lambda p=path: delete_items([p], 'tags')).classes('text-red-400')
 
                             ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
                             
