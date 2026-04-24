@@ -3260,6 +3260,10 @@ def index_page():
 
                     ui.button('🔄 Загрузить доступные теги из БД', on_click=load_available_tags).props('outline color=pink size=sm').classes('w-full')
 
+                    # --- БЛОК LAZY ПОИСКА ---
+                    ui.label('Частичное совпадение (Lazy Search)').classes('text-sm font-bold text-green-400 mt-2')
+                    lazy_tags_input = ui.input('Например: girl black hair', value=cfg.get('lazy_tags', '')).classes('w-full')
+
                     # --- БЛОК ПОЗИТИВНЫХ ТЕГОВ ---
                     with ui.row().classes('w-full items-center justify-between mt-2 mb-[-12px]'):
                         ui.label('Включая (Positive - AND)').classes('text-sm font-bold text-blue-400')
@@ -3355,7 +3359,8 @@ def index_page():
                 async def search_tags_action():
                     save_config({
                         'tags_dir': tags_dir.value, 'pos_tags': pos_tags_sel.value, 'neg_tags': neg_tags_sel.value,
-                        'tags_threshold': tags_threshold.value, 'chk_txt_tags': chk_txt_tags.value
+                        'tags_threshold': tags_threshold.value, 'chk_txt_tags': chk_txt_tags.value,
+                        'lazy_tags': lazy_tags_input.value  # <--- Добавили сохранение
                     })
                     if not tags_dir.value: return ui.notify("Укажите папку!", type='warning')
                     
@@ -3371,13 +3376,14 @@ def index_page():
                     thres_val = float(tags_threshold.value)
                     pos_val = set(pos_tags_sel.value)
                     neg_val = set(neg_tags_sel.value)
+                    lazy_val = lazy_tags_input.value.strip().lower() # <--- Подготовка lazy
                     cache_key = f"{tags_model_sel.value}_{int(tags_video_frames.value)}"
                     
                     exts =[]
                     if chk_img_tags.value: exts.extend(SUPPORTED_IMAGES)
                     if chk_vid_tags.value: exts.extend(SUPPORTED_VIDEOS)
 
-                    def process_search(directory, extensions, key, thres, pos, neg):
+                    def process_search(directory, extensions, key, thres, pos, neg, lazy_str): # <--- Добавили аргумент lazy_str
                         all_files = search_engine._gather_files(directory, tuple(extensions))
                         
                         c = search_engine.db_cache.conn.cursor()
@@ -3387,29 +3393,66 @@ def index_page():
                         valid_paths = set(all_files)
                         res =[]
                         
+                        valid_paths = set(all_files)
+                        res =[]
+                        
+                        # Разбиваем строку lazy-поиска на отдельные слова (запятые игнорируем)
+                        lazy_words =[w for w in lazy_str.replace(',', ' ').split() if w] if lazy_str else[]
+                        
                         for row in db_data:
                             path, tags_json = row[0], row[1]
                             if path not in valid_paths or not tags_json: continue
                             
                             tags = json.loads(tags_json)
                             valid = True
+                            
+                            # 1. Точные позитивные теги (AND)
                             for pt in pos:
                                 if pt not in tags or tags[pt] < thres:
                                     valid = False; break
                             if not valid: continue
                             
+                            # 2. Точные негативные теги (NOT)
                             for nt in neg:
                                 if nt in tags and tags[nt] >= thres:
                                     valid = False; break
                             if not valid: continue
                             
-                            score = sum([tags[pt] for pt in pos]) if pos else max(tags.values()) if tags else 0
+                            # 3. Lazy Search (Частичное совпадение)
+                            lazy_score = 0.0
+                            if lazy_words:
+                                # Оставляем теги выше порога, заменяем '_' на пробел для гибкости поиска
+                                valid_tags_dict = {t.lower().replace('_', ' '): prob for t, prob in tags.items() if prob >= thres}
+                                # Объединяем все теги изображения в единую строку для сверхбыстрого поиска
+                                joined_tags = " | ".join(valid_tags_dict.keys())
+                                
+                                # Проверяем, что ВСЕ введенные слова (girl, black, hair) присутствуют в тегах
+                                for w in lazy_words:
+                                    if w not in joined_tags:
+                                        valid = False
+                                        break
+                                if not valid: continue
+                                
+                                # Подсчитываем Score: суммируем вероятности тех тегов, внутри которых нашлись наши lazy слова
+                                matched_probs =[prob for t, prob in valid_tags_dict.items() if any(w in t for w in lazy_words)]
+                                if matched_probs:
+                                    lazy_score = sum(matched_probs)
+                            
+                            # Итоговый Score для сортировки
+                            if pos:
+                                score = sum([tags[pt] for pt in pos]) + lazy_score
+                            elif lazy_words:
+                                score = lazy_score
+                            else:
+                                score = max(tags.values()) if tags else 0
+                                
                             res.append((score, path, tags))
                             
                         res.sort(key=lambda x: x[0], reverse=True)
                         return res
 
-                    res = await run.io_bound(process_search, dir_val, exts, cache_key, thres_val, pos_val, neg_val)
+                    # Вызов функции в отдельном потоке (передаем lazy_val)
+                    res = await run.io_bound(process_search, dir_val, exts, cache_key, thres_val, pos_val, neg_val, lazy_val)
                     
                     state.tags_results = res
                     state.sel_tags = {p: False for s, p, t in res}
