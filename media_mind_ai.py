@@ -4568,6 +4568,10 @@ def index_page():
                 GROUPS_PER_PAGE = 3  
                 MAX_ITEMS_PER_GROUP = 40  
                 
+                # Инициализация состояния развернутых групп (чтобы запоминать, какие открыты)
+                if not hasattr(state, 'expanded_clusters'):
+                    state.expanded_clusters = set()
+                
                 total_pages = max(1, (len(state.cluster_results) + GROUPS_PER_PAGE - 1) // GROUPS_PER_PAGE)
                 if getattr(state, 'cluster_page', 1) > total_pages: state.cluster_page = 1
                 
@@ -4579,8 +4583,8 @@ def index_page():
                     with ui.column().classes('w-full shrink-0 bg-gray-900 p-4 pb-2 border-b border-gray-800 z-20 gap-0 shadow-md'):
                         with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
                             with ui.row().classes('gap-2 items-center'):
-                                ui.button('Выбрать всё', on_click=lambda: set_all('cluster', True)).props('outline color=white dense')
-                                ui.button('Снять всё', on_click=lambda: set_all('cluster', False)).props('outline color=white dense')
+                                ui.button('Выбрать всё вообще', on_click=lambda: set_all('cluster', True)).props('outline color=white dense')
+                                ui.button('Снять всё вообще', on_click=lambda: set_all('cluster', False)).props('outline color=white dense')
                             with ui.row().classes('gap-2 items-center'):
                                 ui.button('📂 РАСФАСОВАТЬ ПО ПАПКАМ', icon='drive_file_move', on_click=execute_cluster_move_action).props('color=purple-600 text-white font-bold dense')
                                 ui.button('УДАЛИТЬ ✔', icon='delete_forever', on_click=lambda: delete_items([p for p, c in state.sel_cluster.items() if c], 'cluster')).props('color=red-10 text-white dense')
@@ -4596,16 +4600,46 @@ def index_page():
                         page_groups = state.cluster_results[start_idx : start_idx + GROUPS_PER_PAGE]
                         
                         visible_cluster_paths =[]
-                        for g in page_groups: visible_cluster_paths.extend(g["paths"][:MAX_ITEMS_PER_GROUP])
+                        for g in page_groups:
+                            if g["name"] in state.expanded_clusters:
+                                visible_cluster_paths.extend(g["paths"])
+                            else:
+                                visible_cluster_paths.extend(g["paths"][:MAX_ITEMS_PER_GROUP])
                         
                         for group in page_groups:
+                            cluster_name = group["name"]
+                            is_expanded = cluster_name in state.expanded_clusters
+                            
                             with ui.card().classes('w-full bg-gray-800 border border-gray-700 p-2 mb-4'):
-                                ui.label(f'📁 {group["name"]} (Файлов: {len(group["paths"])})').classes('font-bold text-purple-400 mb-2 px-2')
+                                # --- ШАПКА КЛАСТЕРА И КНОПКИ УПРАВЛЕНИЯ ---
+                                with ui.row().classes('w-full justify-between items-center px-2 mb-2'):
+                                    ui.label(f'📁 {cluster_name} (Файлов: {len(group["paths"])})').classes('font-bold text-purple-400')
+                                    
+                                    with ui.row().classes('gap-2 items-center'):
+                                        def select_cluster(paths, val):
+                                            for p in paths: state.sel_cluster[p] = val
+                                            cluster_gallery_ui.refresh()
+
+                                        ui.button('Выделить группу', on_click=lambda p=group["paths"]: select_cluster(p, True)).props('outline size=sm color=green')
+                                        ui.button('Снять выделение', on_click=lambda p=group["paths"]: select_cluster(p, False)).props('outline size=sm color=red')
+                                        
+                                        def toggle_expand(c_name=cluster_name):
+                                            if c_name in state.expanded_clusters:
+                                                state.expanded_clusters.remove(c_name)
+                                            else:
+                                                state.expanded_clusters.add(c_name)
+                                            cluster_gallery_ui.refresh()
+                                            
+                                        if len(group["paths"]) > MAX_ITEMS_PER_GROUP:
+                                            ui.button('Свернуть' if is_expanded else 'Показать все', on_click=toggle_expand).props(f'size=sm color={"gray" if is_expanded else "purple"}')
+
+                                visible_group = group["paths"] if is_expanded else group["paths"][:MAX_ITEMS_PER_GROUP]
+                                hidden_count = 0 if is_expanded else len(group["paths"]) - MAX_ITEMS_PER_GROUP
                                 
-                                visible_group = group["paths"][:MAX_ITEMS_PER_GROUP]
-                                hidden_count = len(group["paths"]) - MAX_ITEMS_PER_GROUP
+                                # Если группа развернута — делаем сетку (flex-wrap), если свернута — горизонтальную ленту
+                                row_classes = 'w-full gap-4 pb-2 items-start ' + ('flex-wrap' if is_expanded else 'overflow-x-auto flex-nowrap')
                                 
-                                with ui.row().classes('w-full gap-4 overflow-x-auto pb-2 flex-nowrap items-center'):
+                                with ui.row().classes(row_classes):
                                     for path in visible_group:
                                         safe_path = urllib.parse.quote(path)
                                         global_index = visible_cluster_paths.index(path)
@@ -4626,10 +4660,10 @@ def index_page():
                                                 ui.label(os.path.basename(path)).classes('text-gray-400 text-[10px] truncate w-full').tooltip(path)
 
                                     if hidden_count > 0:
-                                        with ui.card().classes('w-[200px] h-[190px] shrink-0 flex flex-col items-center justify-center bg-gray-900 border border-dashed border-gray-600 gap-2 p-4'):
+                                        with ui.card().classes('w-[200px] h-[190px] shrink-0 flex flex-col items-center justify-center bg-gray-900 border border-dashed border-gray-600 gap-2 p-4 cursor-pointer hover:border-purple-500 transition-colors').on('click', toggle_expand):
                                             ui.icon('more_horiz', size='3rem').classes('text-gray-500')
                                             ui.label(f"+ еще {hidden_count} шт.").classes('text-center font-bold text-gray-300 text-lg')
-                                            ui.label("Скрыты для стабильности").classes('text-[10px] text-center text-gray-500')
+                                            ui.label("Нажмите, чтобы развернуть").classes('text-[10px] text-center text-purple-400')
 
                     ui.button(icon='keyboard_arrow_up', on_click=lambda: ui.run_javascript(f'document.getElementById("{scroll_id}").scrollTo({{top: 0, behavior: "smooth"}})')).props('round color=purple-800').classes('absolute bottom-6 right-6 z-50 shadow-lg').tooltip('Наверх')
 
