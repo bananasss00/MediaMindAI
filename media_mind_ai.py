@@ -17,6 +17,13 @@ try:
 except ImportError:
     pass
 
+try:
+    from send2trash import send2trash
+except ImportError:
+    print("⚠️ Библиотека send2trash не найдена. Установите: pip install send2trash")
+    # Фолбэк на безвозвратное удаление, если библиотеки нет
+    send2trash = os.remove
+
 import argparse
 import sys
 import asyncio
@@ -274,7 +281,6 @@ class DatabaseCache:
         print("✅ База данных успешно обновлена до версии с HASH ключами!")
 
     def get_or_create_hashes(self, paths):
-        """Возвращает словарь {path: hash}. Автоматически хеширует новые файлы."""
         c = self.conn.cursor()
         result = {}
         chunk_size = 900
@@ -290,9 +296,21 @@ class DatabaseCache:
             if p not in result and os.path.exists(p):
                 h = get_fast_hash(p)
                 result[p] = h
-                try: size_mb = os.path.getsize(p) / (1024 * 1024)
-                except: size_mb = 0.0
-                insert_data.append((h, p, size_mb, None, None))
+                try: 
+                    size_mb = os.path.getsize(p) / (1024 * 1024)
+                    w, h_dim = 0, 0
+                    ext = os.path.splitext(p)[1].lower()
+                    if ext in SUPPORTED_IMAGES:
+                        with Image.open(p) as img:
+                            w, h_dim = img.size
+                    elif ext in SUPPORTED_VIDEOS:
+                        with av.open(p) as container:
+                            stream = container.streams.video[0]
+                            w, h_dim = stream.width, stream.height
+                except Exception:
+                    size_mb, w, h_dim = 0.0, 0, 0
+                    
+                insert_data.append((h, p, size_mb, w, h_dim))
                 
         if insert_data:
             c.executemany("INSERT OR IGNORE INTO files (hash, path, size_mb, width, height) VALUES (?, ?, ?, ?, ?)", insert_data)
@@ -1829,6 +1847,11 @@ class AppState:
         self.flatten_structure = False
         self.grid_columns = 4
 
+        self.filter_min_res = 0
+        self.filter_max_res = 10000
+        self.filter_max_size = 10000.0
+        self.filter_orientation = 'Любая'
+
     def add_log(self, msg):
         ts = datetime.datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] {msg}"
@@ -1845,6 +1868,67 @@ aesthetic_engine = AestheticEngine(search_engine)
 nsfw_engine = NsfwEngine(search_engine)
 face_engine = FaceEngine(search_engine)
 tag_engine = TagEngine(search_engine)
+
+# --- ЛОГИКА УДАЛЕНИЯ И ФИЛЬТРАЦИИ ---
+def delete_items(paths, tab_name):
+    if not paths: return
+    deleted = 0
+    for p in paths:
+        try:
+            send2trash(os.path.normpath(p))
+            deleted += 1
+            search_engine.db_cache.remove_paths([p])
+            
+            # Удаляем визуально из текущих результатов
+            res_list = getattr(state, f"{tab_name}_results")
+            setattr(state, f"{tab_name}_results",[item for item in res_list if item[1] != p])
+        except Exception as e:
+            state.add_log(f"Ошибка удаления {p}: {e}")
+            
+    ui.notify(f"🗑️ Отправлено в корзину: {deleted} шт.", type='positive', color='red')
+    # Снимаем выделение
+    sel_dict = getattr(state, f"sel_{tab_name}")
+    for p in paths:
+        if p in sel_dict: del sel_dict[p]
+        
+    globals()[f"{tab_name}_gallery_ui"].refresh()
+
+def apply_physical_filters(results_list):
+    """ Принимает список туплов, где index 1 = path, и возвращает отфильтрованный список """
+    if not results_list: return[]
+    if state.filter_min_res == 0 and state.filter_max_res >= 10000 and state.filter_max_size >= 10000 and state.filter_orientation == 'Любая':
+        return results_list # Быстрый выход, если фильтры не трогали
+        
+    c = search_engine.db_cache.conn.cursor()
+    # Получаем данные о файлах разом (Оптимизация N+1)
+    c.execute("SELECT path, size_mb, width, height FROM files")
+    file_infos = {row[0]: (row[1], row[2], row[3]) for row in c.fetchall()}
+    
+    filtered =[]
+    for item in results_list:
+        p = item[1]
+        info = file_infos.get(p)
+        if not info: 
+            filtered.append(item)
+            continue
+            
+        size, w, h = info
+        if size is None or w is None or h is None or (w == 0 and h == 0):
+            filtered.append(item)
+            continue
+            
+        if size > state.filter_max_size: continue
+        
+        max_dim = max(w, h)
+        if max_dim < state.filter_min_res or max_dim > state.filter_max_res: continue
+        
+        if state.filter_orientation != 'Любая':
+            if state.filter_orientation == 'Горизонтальная' and w <= h * 1.05: continue
+            if state.filter_orientation == 'Вертикальная' and h <= w * 1.05: continue
+            if state.filter_orientation == 'Квадрат' and (w > h * 1.05 or h > w * 1.05): continue
+            
+        filtered.append(item)
+    return filtered
 
 def open_file_native(filepath):
     try: os.startfile(filepath) if os.name == 'nt' else subprocess.call(('xdg-open', filepath))
@@ -2312,6 +2396,22 @@ def index_page():
         elif e.key.space: toggle_selection()
         elif e.key.name and e.key.name.lower() == 'd': download_current_item()
         elif e.key.name and e.key.name.lower() == 'c': copy_image_to_clipboard(state.viewer_items[state.viewer_index])
+        elif e.key.name == 'Delete': # <--- НОВОЕ
+            path = state.viewer_items[state.viewer_index]
+            tab = state.current_tab.lower()
+            if tab == 'search': tab_name = 'search'
+            elif tab == 'aesthetic': tab_name = 'aes'
+            elif tab == 'nsfw': tab_name = 'nsfw'
+            elif tab == 'face': tab_name = 'face'
+            elif tab == 'tags': tab_name = 'tags'
+            
+            # Закрываем плеер, если удалили последний файл
+            if len(state.viewer_items) <= 1:
+                media_dialog.close()
+            else:
+                change_media(1 if state.viewer_index < len(state.viewer_items)-1 else -1)
+            
+            delete_items([path], tab_name)
 
     ui.keyboard(on_key=handle_keyboard, ignore=['input', 'textarea', 'select'])
 
@@ -2485,6 +2585,7 @@ def index_page():
             if state.search_res_filter == 'Картинки' and not p.endswith(SUPPORTED_IMAGES): continue
             if state.search_res_filter == 'Видео' and not p.endswith(SUPPORTED_VIDEOS): continue
             filtered_results.append(item)
+        filtered_results = apply_physical_filters(filtered_results)
 
         total_pages = max(1, (len(filtered_results) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
         if state.search_page > total_pages: state.search_page = 1
@@ -2509,6 +2610,7 @@ def index_page():
                         ui.button('HTML Экспорт', icon='html', on_click=lambda: export_html_action('search')).props('color=purple dense outline')
                         ui.button('Копировать ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'search', chk_prefix_search.value)).props('color=blue dense')
                         ui.button('Переместить ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'search', chk_prefix_search.value)).props('color=red dense')
+                        ui.button('УДАЛИТЬ ✔', icon='delete_forever', on_click=lambda: delete_items([p for p, c in state.sel_search.items() if c], 'search')).props('color=red-10 text-white dense')
                 
                 with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
                     ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
@@ -2537,6 +2639,8 @@ def index_page():
                                 ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
                                 ui.menu_item('Копировать картинку', on_click=lambda p=path: copy_image_to_clipboard(p))
                                 ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
+                                ui.separator()
+                                ui.menu_item('Удалить файл (В корзину)', on_click=lambda p=path: delete_items([p], 'search')).classes('text-red-400')
 
                             if os.path.splitext(path)[1].lower() in SUPPORTED_TEXTS:
                                 ui.icon('article', size='4rem').classes('w-full aspect-square flex items-center justify-center bg-gray-900 cursor-pointer text-gray-500').on('click', lambda p=path: open_file_native(p))
@@ -2561,6 +2665,7 @@ def index_page():
             if state.aes_res_filter == 'Картинки' and not p.endswith(SUPPORTED_IMAGES): continue
             if state.aes_res_filter == 'Видео' and not p.endswith(SUPPORTED_VIDEOS): continue
             filtered_results.append(item)
+        filtered_results = apply_physical_filters(filtered_results)
 
         total_pages = max(1, (len(filtered_results) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
         if state.aes_page > total_pages: state.aes_page = 1
@@ -2585,6 +2690,7 @@ def index_page():
                         ui.button('HTML Экспорт', icon='html', on_click=lambda: export_html_action('aes')).props('color=purple dense outline')
                         ui.button('Копировать ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'aes', chk_prefix_aes.value)).props('color=yellow-800 dense')
                         ui.button('Переместить ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'aes', chk_prefix_aes.value)).props('color=red dense')
+                        ui.button('УДАЛИТЬ ✔', icon='delete_forever', on_click=lambda: delete_items([p for p, c in state.sel_search.items() if c], 'search')).props('color=red-10 text-white dense')
 
                 with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
                     ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
@@ -2613,6 +2719,8 @@ def index_page():
                                 ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
                                 ui.menu_item('Копировать картинку', on_click=lambda p=path: copy_image_to_clipboard(p))
                                 ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
+                                ui.separator()
+                                ui.menu_item('Удалить файл (В корзину)', on_click=lambda p=path: delete_items([p], 'search')).classes('text-red-400')
 
                             ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
                             
@@ -2634,6 +2742,7 @@ def index_page():
             if state.nsfw_res_filter == 'Картинки' and not p.endswith(SUPPORTED_IMAGES): continue
             if state.nsfw_res_filter == 'Видео' and not p.endswith(SUPPORTED_VIDEOS): continue
             filtered_results.append(item)
+        filtered_results = apply_physical_filters(filtered_results)
 
         total_pages = max(1, (len(filtered_results) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
         if state.nsfw_page > total_pages: state.nsfw_page = 1
@@ -2658,6 +2767,7 @@ def index_page():
                         ui.button('HTML Экспорт', icon='html', on_click=lambda: export_html_action('nsfw')).props('color=purple dense outline')
                         ui.button('Копировать ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'nsfw', chk_prefix_nsfw.value)).props('color=red-800 dense')
                         ui.button('Переместить ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'nsfw', chk_prefix_nsfw.value)).props('color=red dense')
+                        ui.button('УДАЛИТЬ ✔', icon='delete_forever', on_click=lambda: delete_items([p for p, c in state.sel_search.items() if c], 'search')).props('color=red-10 text-white dense')
 
                 with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
                     ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
@@ -2686,6 +2796,8 @@ def index_page():
                                 ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
                                 ui.menu_item('Копировать картинку', on_click=lambda p=path: copy_image_to_clipboard(p))
                                 ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
+                                ui.separator()
+                                ui.menu_item('Удалить файл (В корзину)', on_click=lambda p=path: delete_items([p], 'search')).classes('text-red-400')
 
                             ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
                             
@@ -2709,6 +2821,7 @@ def index_page():
             if state.face_res_filter == 'Картинки' and not p.endswith(SUPPORTED_IMAGES): continue
             if state.face_res_filter == 'Видео' and not p.endswith(SUPPORTED_VIDEOS): continue
             filtered_results.append(item)
+        filtered_results = apply_physical_filters(filtered_results)
 
         total_pages = max(1, (len(filtered_results) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
         if state.face_page > total_pages: state.face_page = 1
@@ -2733,6 +2846,7 @@ def index_page():
                         ui.button('HTML Экспорт', icon='html', on_click=lambda: export_html_action('face')).props('color=purple dense outline')
                         ui.button('Копировать ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'face', chk_prefix_face.value)).props('color=teal-800 dense')
                         ui.button('Переместить ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'face', chk_prefix_face.value)).props('color=red dense')
+                        ui.button('УДАЛИТЬ ✔', icon='delete_forever', on_click=lambda: delete_items([p for p, c in state.sel_search.items() if c], 'search')).props('color=red-10 text-white dense')
 
                 with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
                     ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
@@ -2761,6 +2875,8 @@ def index_page():
                                 ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
                                 ui.menu_item('Копировать картинку', on_click=lambda p=path: copy_image_to_clipboard(p))
                                 ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
+                                ui.separator()
+                                ui.menu_item('Удалить файл (В корзину)', on_click=lambda p=path: delete_items([p], 'search')).classes('text-red-400')
 
                             ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
                             
@@ -2783,6 +2899,7 @@ def index_page():
             if state.tags_res_filter == 'Картинки' and not p.endswith(SUPPORTED_IMAGES): continue
             if state.tags_res_filter == 'Видео' and not p.endswith(SUPPORTED_VIDEOS): continue
             filtered_results.append(item)
+        filtered_results = apply_physical_filters(filtered_results)
 
         total_pages = max(1, (len(filtered_results) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
         if state.tags_page > total_pages: state.tags_page = 1
@@ -2808,6 +2925,7 @@ def index_page():
                         # Добавляем галочку экспорта txt только для копирования тегов
                         ui.button('Копировать ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'tags', False, chk_txt_tags.value, tags_threshold.value)).props('color=pink-800 dense')
                         ui.button('Переместить ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'tags', False, chk_txt_tags.value, tags_threshold.value)).props('color=red dense')
+                        ui.button('УДАЛИТЬ ✔', icon='delete_forever', on_click=lambda: delete_items([p for p, c in state.sel_search.items() if c], 'search')).props('color=red-10 text-white dense')
 
                 with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
                     ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
@@ -2840,6 +2958,8 @@ def index_page():
                                 ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
                                 ui.menu_item('Копировать картинку', on_click=lambda p=path: copy_image_to_clipboard(p))
                                 ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
+                                ui.separator()
+                                ui.menu_item('Удалить файл (В корзину)', on_click=lambda p=path: delete_items([p], 'search')).classes('text-red-400')
 
                             ui.image(f"/thumb/{safe_path}").classes('w-full aspect-square object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda e, idx=global_index: open_media(idx, all_paths))
                             
@@ -2878,6 +2998,19 @@ def index_page():
                     rerank_model = ui.select(['Qwen/Qwen3-VL-Reranker-2B', 'Qwen/Qwen3-VL-Reranker-8B'], value=cfg.get('rerank_model', 'Qwen/Qwen3-VL-Reranker-2B')).classes('w-full').bind_visibility_from(use_reranker, 'value')
                     
                     chk_prefix_search = ui.checkbox('Писать Score в имя при копировании', value=cfg.get('chk_prefix_search', False)).classes('text-sm text-gray-300 w-full mt-2')
+
+                    with ui.expansion('Физические фильтры', icon='filter_alt').classes('w-full bg-gray-800/50 rounded-lg border border-gray-700 mt-2'):
+                        with ui.column().classes('w-full px-2 py-2 gap-1'):
+                            ui.label('Разрешение (Max сторона, px):').classes('text-xs text-gray-400')
+                            with ui.row().classes('w-full gap-2'):
+                                ui.number('Мин', value=0, format='%.0f').bind_value(state, 'filter_min_res').classes('w-[45%]')
+                                ui.number('Макс', value=10000, format='%.0f').bind_value(state, 'filter_max_res').classes('w-[45%]')
+                            
+                            ui.number('Макс. вес (МБ)', value=10000, format='%.0f').bind_value(state, 'filter_max_size').classes('w-full mt-1')
+                            
+                            ui.select(['Любая', 'Горизонтальная', 'Вертикальная', 'Квадрат'], label='Ориентация', value='Любая').bind_value(state, 'filter_orientation').classes('w-full mt-1')
+                            
+                            ui.button('Применить фильтры', on_click=search_gallery_ui.refresh).props('outline size=sm color=blue').classes('w-full mt-2')
 
                     with ui.expansion('Тонкие настройки поиска', icon='tune').classes('w-full bg-gray-800/50 rounded-lg border border-gray-700 mt-2'):
                         with ui.row().classes('w-full gap-2 px-2 pt-2'):
@@ -2995,6 +3128,19 @@ def index_page():
                     top_n_rate = ui.number('Оставить ТОП (шт)', value=cfg.get('top_n_rate', 100), format='%.0f').classes('w-full')
                     chk_prefix_aes = ui.checkbox('Писать Оценку в имя при копировании', value=cfg.get('chk_prefix_aes', False)).classes('text-sm text-gray-300 w-full mt-2')
 
+                    with ui.expansion('Физические фильтры', icon='filter_alt').classes('w-full bg-gray-800/50 rounded-lg border border-gray-700 mt-2'):
+                        with ui.column().classes('w-full px-2 py-2 gap-1'):
+                            ui.label('Разрешение (Max сторона, px):').classes('text-xs text-gray-400')
+                            with ui.row().classes('w-full gap-2'):
+                                ui.number('Мин', value=0, format='%.0f').bind_value(state, 'filter_min_res').classes('w-[45%]')
+                                ui.number('Макс', value=10000, format='%.0f').bind_value(state, 'filter_max_res').classes('w-[45%]')
+                            
+                            ui.number('Макс. вес (МБ)', value=10000, format='%.0f').bind_value(state, 'filter_max_size').classes('w-full mt-1')
+                            
+                            ui.select(['Любая', 'Горизонтальная', 'Вертикальная', 'Квадрат'], label='Ориентация', value='Любая').bind_value(state, 'filter_orientation').classes('w-full mt-1')
+                            
+                            ui.button('Применить фильтры', on_click=aesthetic_gallery_ui.refresh).props('outline size=sm color=blue').classes('w-full mt-2')
+
                     with ui.expansion('Тонкие настройки', icon='tune').classes('w-full bg-gray-800/50 rounded-lg border border-gray-700 mt-2'):
                         with ui.row().classes('w-full gap-2 px-2 pt-2'):
                             aes_batch_size = ui.number('Батч', value=cfg.get('aes_batch_size', 16), format='%.0f').classes('w-[45%]')
@@ -3104,6 +3250,19 @@ def index_page():
                     top_n_nsfw = ui.number('Оставить ТОП (шт)', value=cfg.get('top_n_nsfw', 100), format='%.0f').classes('w-full')
                     chk_prefix_nsfw = ui.checkbox('Писать Датчик Опасности в имя', value=cfg.get('chk_prefix_nsfw', False)).classes('text-sm text-gray-300 w-full mt-2')
 
+                    with ui.expansion('Физические фильтры', icon='filter_alt').classes('w-full bg-gray-800/50 rounded-lg border border-gray-700 mt-2'):
+                        with ui.column().classes('w-full px-2 py-2 gap-1'):
+                            ui.label('Разрешение (Max сторона, px):').classes('text-xs text-gray-400')
+                            with ui.row().classes('w-full gap-2'):
+                                ui.number('Мин', value=0, format='%.0f').bind_value(state, 'filter_min_res').classes('w-[45%]')
+                                ui.number('Макс', value=10000, format='%.0f').bind_value(state, 'filter_max_res').classes('w-[45%]')
+                            
+                            ui.number('Макс. вес (МБ)', value=10000, format='%.0f').bind_value(state, 'filter_max_size').classes('w-full mt-1')
+                            
+                            ui.select(['Любая', 'Горизонтальная', 'Вертикальная', 'Квадрат'], label='Ориентация', value='Любая').bind_value(state, 'filter_orientation').classes('w-full mt-1')
+                            
+                            ui.button('Применить фильтры', on_click=nsfw_gallery_ui.refresh).props('outline size=sm color=blue').classes('w-full mt-2')
+
                     with ui.expansion('Тонкие настройки', icon='tune').classes('w-full bg-gray-800/50 rounded-lg border border-gray-700 mt-2'):
                         with ui.row().classes('w-full gap-2 px-2 pt-2'):
                             nsfw_batch_size = ui.number('Батч', value=cfg.get('nsfw_batch_size', 16), format='%.0f').classes('w-[45%]')
@@ -3192,6 +3351,19 @@ def index_page():
                     
                     face_threshold = ui.number('Мин. Сходство (0.0 - 1.0)', value=cfg.get('face_threshold', 0.40), format='%.2f', step=0.05).classes('w-full mt-2')
                     chk_prefix_face = ui.checkbox('Писать Сходство в имя при копировании', value=cfg.get('chk_prefix_face', False)).classes('text-sm text-gray-300 w-full mt-2')
+
+                    with ui.expansion('Физические фильтры', icon='filter_alt').classes('w-full bg-gray-800/50 rounded-lg border border-gray-700 mt-2'):
+                        with ui.column().classes('w-full px-2 py-2 gap-1'):
+                            ui.label('Разрешение (Max сторона, px):').classes('text-xs text-gray-400')
+                            with ui.row().classes('w-full gap-2'):
+                                ui.number('Мин', value=0, format='%.0f').bind_value(state, 'filter_min_res').classes('w-[45%]')
+                                ui.number('Макс', value=10000, format='%.0f').bind_value(state, 'filter_max_res').classes('w-[45%]')
+                            
+                            ui.number('Макс. вес (МБ)', value=10000, format='%.0f').bind_value(state, 'filter_max_size').classes('w-full mt-1')
+                            
+                            ui.select(['Любая', 'Горизонтальная', 'Вертикальная', 'Квадрат'], label='Ориентация', value='Любая').bind_value(state, 'filter_orientation').classes('w-full mt-1')
+                            
+                            ui.button('Применить фильтры', on_click=face_gallery_ui.refresh).props('outline size=sm color=blue').classes('w-full mt-2')
 
                     with ui.expansion('Тонкие настройки', icon='tune').classes('w-full bg-gray-800/50 rounded-lg border border-gray-700 mt-2'):
                         with ui.row().classes('w-full gap-2 px-2 pt-2 pb-2'):
@@ -3376,6 +3548,19 @@ def index_page():
                     
                     tags_threshold = ui.number('Порог уверенности (0.1 - 1.0)', value=cfg.get('tags_threshold', 0.4), format='%.2f', step=0.05).classes('w-full mt-4')
                     chk_txt_tags = ui.checkbox('Сохранять .txt файл с тегами при копировании', value=cfg.get('chk_txt_tags', True)).classes('text-sm text-gray-300 w-full')
+
+                    with ui.expansion('Физические фильтры', icon='filter_alt').classes('w-full bg-gray-800/50 rounded-lg border border-gray-700 mt-2'):
+                        with ui.column().classes('w-full px-2 py-2 gap-1'):
+                            ui.label('Разрешение (Max сторона, px):').classes('text-xs text-gray-400')
+                            with ui.row().classes('w-full gap-2'):
+                                ui.number('Мин', value=0, format='%.0f').bind_value(state, 'filter_min_res').classes('w-[45%]')
+                                ui.number('Макс', value=10000, format='%.0f').bind_value(state, 'filter_max_res').classes('w-[45%]')
+                            
+                            ui.number('Макс. вес (МБ)', value=10000, format='%.0f').bind_value(state, 'filter_max_size').classes('w-full mt-1')
+                            
+                            ui.select(['Любая', 'Горизонтальная', 'Вертикальная', 'Квадрат'], label='Ориентация', value='Любая').bind_value(state, 'filter_orientation').classes('w-full mt-1')
+                            
+                            ui.button('Применить фильтры', on_click=tags_gallery_ui.refresh).props('outline size=sm color=blue').classes('w-full mt-2')
 
                     with ui.expansion('Тонкие настройки', icon='tune').classes('w-full bg-gray-800/50 rounded-lg border border-gray-700 mt-2'):
                         with ui.row().classes('w-full gap-2 px-2 pt-2'):
