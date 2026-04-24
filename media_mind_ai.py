@@ -1951,12 +1951,14 @@ class ClusteringEngine:
         for i in range(0, len(hashes), chunk_size):
             chunk = hashes[i:i+chunk_size]
             ph = ','.join(['?']*len(chunk))
-            c.execute(f"SELECT hash, features FROM emb_cache WHERE model=? AND hash IN ({ph})", [cache_key] + chunk)
+            c.execute(f"SELECT hash, features FROM emb_cache WHERE model=? AND hash IN ({ph})",[cache_key] + chunk)
             for row in c.fetchall():
                 try:
                     feat_tensor = torch.load(io.BytesIO(row[1]), weights_only=False)
-                    emb_dict[row[0]] = feat_tensor.numpy().flatten()
-                except Exception: pass
+                    # ИСПРАВЛЕНИЕ: Конвертируем bfloat16/float16 в float32, т.к. numpy не поддерживает bfloat16
+                    emb_dict[row[0]] = feat_tensor.float().cpu().numpy().flatten()
+                except Exception as e: 
+                    state.add_log(f"⚠️ Ошибка загрузки вектора: {e}")
 
         valid_paths =[]
         valid_embs =[]
@@ -1967,7 +1969,7 @@ class ClusteringEngine:
                 valid_embs.append(emb_dict[h])
 
         if not valid_paths:
-            raise Exception("Эмбеддинги не найдены! Сначала запустите 'Индексатор -> Умный Поиск' для этой папки.")
+            raise Exception(f"Эмбеддинги не найдены! Проверьте, что в Индексаторе вы выбрали ту же модель '{emb_model_name}' и то же разрешение '{emb_size}'.")
 
         state.add_log(f"Найдено {len(valid_paths)} файлов с кэшем. Запуск алгоритма {algo}...")
         
@@ -2012,7 +2014,7 @@ class ClusteringEngine:
                             tag_counts[t] += prob
                 
                 sorted_tags = sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)
-                top_tags = [t[0].replace(' ', '_').replace(':', '') for t in sorted_tags[:3]]
+                top_tags =[t[0].replace(' ', '_').replace(':', '') for t in sorted_tags[:3]]
                 name = f"Cluster_{lbl:03d}" + ("_" + "_".join(top_tags) if top_tags else "")
                 
             results.append({"name": name, "paths": paths})
@@ -4633,7 +4635,7 @@ def index_page():
 
             with ui.column().classes('flex-1 w-0 bg-gray-900 rounded-xl border border-gray-800 overflow-hidden h-full relative p-0'):
                 cluster_gallery_ui()
-                
+
     with ui.footer().classes('bg-gray-900 border-t border-gray-800 px-4 py-0 flex flex-row flex-nowrap items-center justify-between z-40 h-8 shadow-lg'):
         ui.label().bind_text_from(state, 'status_text').classes('text-blue-400 font-mono text-xs truncate max-w-[30%] shrink-0')
         ui.linear_progress(value=0, show_value=False).bind_value_from(state, 'progress').classes('flex-grow mx-4 h-1.5 rounded text-blue-600')
