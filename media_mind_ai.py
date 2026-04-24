@@ -2437,6 +2437,12 @@ def index_page():
     # --- ПОЛНОЭКРАННЫЙ ПЛЕЕР ---
     def sync_gallery_page():
         if not state.viewer_items: return
+        
+        # Для кластеров и дубликатов логика плеера работает иначе (внутри группы).
+        # Поэтому мы отключаем синхронизацию главной страницы для этих вкладок.
+        if state.current_tab in ['Cluster', 'Dupes']:
+            return
+
         target_page = (state.viewer_index // ITEMS_PER_PAGE) + 1
         changed = False
         scroll_id = ""
@@ -2467,11 +2473,6 @@ def index_page():
             tags_gallery_ui.refresh()
             changed = True
             scroll_id = "tags_scroll_area"
-        elif state.current_tab == 'Cluster' and state.cluster_page != target_page:
-            state.cluster_page = target_page
-            cluster_gallery_ui.refresh()
-            changed = True
-            scroll_id = "cluster_scroll_area"
 
         # Если страница изменилась, прокручиваем список в самое начало
         if changed:
