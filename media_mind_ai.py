@@ -4566,11 +4566,14 @@ def index_page():
                     return ui.label("Здесь появятся сгруппированные нейросетью файлы...").classes("text-gray-400 m-4")
                     
                 GROUPS_PER_PAGE = 3  
-                MAX_ITEMS_PER_GROUP = 40  
+                MAX_ITEMS_PER_GROUP = 30  # В свернутом виде
+                ITEMS_PER_PAGE_CLUSTER = 60 # Во внутреннем развернутом виде (безопасно для DOM)
                 
-                # Инициализация состояния развернутых групп (чтобы запоминать, какие открыты)
+                # Инициализация состояния: кто развернут и на какой внутренней странице находится
                 if not hasattr(state, 'expanded_clusters'):
                     state.expanded_clusters = set()
+                if not hasattr(state, 'expanded_pages'):
+                    state.expanded_pages = {}
                 
                 total_pages = max(1, (len(state.cluster_results) + GROUPS_PER_PAGE - 1) // GROUPS_PER_PAGE)
                 if getattr(state, 'cluster_page', 1) > total_pages: state.cluster_page = 1
@@ -4599,24 +4602,19 @@ def index_page():
                         start_idx = (getattr(state, 'cluster_page', 1) - 1) * GROUPS_PER_PAGE
                         page_groups = state.cluster_results[start_idx : start_idx + GROUPS_PER_PAGE]
                         
-                        visible_cluster_paths =[]
-                        for g in page_groups:
-                            if g["name"] in state.expanded_clusters:
-                                visible_cluster_paths.extend(g["paths"])
-                            else:
-                                visible_cluster_paths.extend(g["paths"][:MAX_ITEMS_PER_GROUP])
-                        
                         for group in page_groups:
                             cluster_name = group["name"]
                             is_expanded = cluster_name in state.expanded_clusters
+                            c_page = state.expanded_pages.get(cluster_name, 1)
                             
                             with ui.card().classes('w-full bg-gray-800 border border-gray-700 p-2 mb-4'):
-                                # --- ШАПКА КЛАСТЕРА И КНОПКИ УПРАВЛЕНИЯ ---
+                                # --- ШАПКА КЛАСТЕРА ---
                                 with ui.row().classes('w-full justify-between items-center px-2 mb-2'):
-                                    ui.label(f'📁 {cluster_name} (Файлов: {len(group["paths"])})').classes('font-bold text-purple-400')
+                                    ui.label(f'📁 {cluster_name} (Всего файлов: {len(group["paths"])})').classes('font-bold text-purple-400')
                                     
                                     with ui.row().classes('gap-2 items-center'):
                                         def select_cluster(paths, val):
+                                            # Мгновенно выделяет ВСЮ группу в памяти (600+ файлов)
                                             for p in paths: state.sel_cluster[p] = val
                                             cluster_gallery_ui.refresh()
 
@@ -4628,25 +4626,33 @@ def index_page():
                                                 state.expanded_clusters.remove(c_name)
                                             else:
                                                 state.expanded_clusters.add(c_name)
+                                                state.expanded_pages[c_name] = 1 # Сброс на 1-ю страницу группы
                                             cluster_gallery_ui.refresh()
                                             
                                         if len(group["paths"]) > MAX_ITEMS_PER_GROUP:
-                                            ui.button('Свернуть' if is_expanded else 'Показать все', on_click=toggle_expand).props(f'size=sm color={"gray" if is_expanded else "purple"}')
+                                            ui.button('Свернуть' if is_expanded else 'Развернуть', on_click=toggle_expand).props(f'size=sm color={"gray" if is_expanded else "purple"}')
 
-                                visible_group = group["paths"] if is_expanded else group["paths"][:MAX_ITEMS_PER_GROUP]
+                                # --- ЛОГИКА ОТОБРАЖЕНИЯ (DOM VIRTUALIZATION) ---
+                                if is_expanded:
+                                    start_i = (c_page - 1) * ITEMS_PER_PAGE_CLUSTER
+                                    end_i = start_i + ITEMS_PER_PAGE_CLUSTER
+                                    visible_group = group["paths"][start_i:end_i]
+                                else:
+                                    visible_group = group["paths"][:MAX_ITEMS_PER_GROUP]
+                                    
                                 hidden_count = 0 if is_expanded else len(group["paths"]) - MAX_ITEMS_PER_GROUP
-                                
-                                # Если группа развернута — делаем сетку (flex-wrap), если свернута — горизонтальную ленту
                                 row_classes = 'w-full gap-4 pb-2 items-start ' + ('flex-wrap' if is_expanded else 'overflow-x-auto flex-nowrap')
                                 
                                 with ui.row().classes(row_classes):
                                     for path in visible_group:
                                         safe_path = urllib.parse.quote(path)
-                                        global_index = visible_cluster_paths.index(path)
+                                        # Используем индекс в рамках всего кластера для Шифт-клика и плеера!
+                                        local_index = group["paths"].index(path)
                                         
                                         with ui.column().classes('w-[200px] shrink-0 relative bg-gray-900 rounded overflow-hidden border border-gray-700 hover:border-purple-500 transition-colors'):
                                             with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
-                                                ui.checkbox().bind_value(state.sel_cluster, path).on('click', lambda e, i=global_index, p=path, paths=visible_cluster_paths: handle_shift_click(e, i, p, 'cluster', paths),['shiftKey'])
+                                                # Shift-Click теперь работает через всю группу group["paths"]
+                                                ui.checkbox().bind_value(state.sel_cluster, path).on('click', lambda e, i=local_index, p=path, paths=group["paths"]: handle_shift_click(e, i, p, 'cluster', paths),['shiftKey'])
                                             
                                             with ui.context_menu():
                                                 ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
@@ -4654,19 +4660,34 @@ def index_page():
                                                 ui.separator()
                                                 ui.menu_item('Удалить файл', on_click=lambda p=path: delete_items([p], 'cluster')).classes('text-red-400')
 
-                                            ui.image(f"/thumb/{safe_path}").classes('w-full h-[150px] object-contain cursor-pointer bg-black').props('fit=contain loading="lazy"').on('click', lambda e, idx=global_index, paths=visible_cluster_paths: open_media(idx, paths))
+                                            # В ПЛЕЕР ПЕРЕДАЕТСЯ ВЕСЬ КЛАСТЕР, а не только видимые
+                                            ui.image(f"/thumb/{safe_path}").classes('w-full h-[150px] object-contain cursor-pointer bg-black').props('fit=contain loading="lazy"').on('click', lambda e, idx=local_index, paths=group["paths"]: open_media(idx, paths))
                                             
                                             with ui.column().classes('p-2 gap-0 w-full'):
                                                 ui.label(os.path.basename(path)).classes('text-gray-400 text-[10px] truncate w-full').tooltip(path)
 
-                                    if hidden_count > 0:
+                                    if hidden_count > 0 and not is_expanded:
                                         with ui.card().classes('w-[200px] h-[190px] shrink-0 flex flex-col items-center justify-center bg-gray-900 border border-dashed border-gray-600 gap-2 p-4 cursor-pointer hover:border-purple-500 transition-colors').on('click', toggle_expand):
                                             ui.icon('more_horiz', size='3rem').classes('text-gray-500')
                                             ui.label(f"+ еще {hidden_count} шт.").classes('text-center font-bold text-gray-300 text-lg')
                                             ui.label("Нажмите, чтобы развернуть").classes('text-[10px] text-center text-purple-400')
 
-                    ui.button(icon='keyboard_arrow_up', on_click=lambda: ui.run_javascript(f'document.getElementById("{scroll_id}").scrollTo({{top: 0, behavior: "smooth"}})')).props('round color=purple-800').classes('absolute bottom-6 right-6 z-50 shadow-lg').tooltip('Наверх')
+                                # --- ВНУТРЕННЯЯ ПАГИНАЦИЯ (Показывается только когда развернуто) ---
+                                if is_expanded and len(group["paths"]) > ITEMS_PER_PAGE_CLUSTER:
+                                    tot_c_pages = max(1, (len(group["paths"]) + ITEMS_PER_PAGE_CLUSTER - 1) // ITEMS_PER_PAGE_CLUSTER)
+                                    
+                                    def change_c_page(d, c_name=cluster_name, max_p=tot_c_pages):
+                                        new_p = max(1, min(max_p, state.expanded_pages.get(c_name, 1) + d))
+                                        state.expanded_pages[c_name] = new_p
+                                        cluster_gallery_ui.refresh()
 
+                                    with ui.row().classes('w-full justify-center items-center gap-4 py-2 border-t border-gray-700 mt-4'):
+                                        ui.button(icon='chevron_left', on_click=lambda: change_c_page(-1)).props('flat outline color=purple size=sm')
+                                        ui.label(f'Под-страница {c_page} из {tot_c_pages}').classes('text-gray-400 text-xs font-bold')
+                                        ui.button(icon='chevron_right', on_click=lambda: change_c_page(1)).props('flat outline color=purple size=sm')
+
+                    ui.button(icon='keyboard_arrow_up', on_click=lambda: ui.run_javascript(f'document.getElementById("{scroll_id}").scrollTo({{top: 0, behavior: "smooth"}})')).props('round color=purple-800').classes('absolute bottom-6 right-6 z-50 shadow-lg').tooltip('Наверх')
+            
             with ui.column().classes('flex-1 w-0 bg-gray-900 rounded-xl border border-gray-800 overflow-hidden h-full relative p-0'):
                 cluster_gallery_ui()
 
