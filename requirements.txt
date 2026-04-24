@@ -17,6 +17,9 @@ accelerate
 opencv-python
 python-dotenv
 aesthetic_predictor_v2_5
+send2trash
+ImageHash
+scikit-learn
 
 # Danbooru Tags dependencies:
 pandas
