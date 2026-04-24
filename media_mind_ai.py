@@ -2129,7 +2129,45 @@ def index_page():
         tags_debug_dialog.open()
 
     # --- ПОЛНОЭКРАННЫЙ ПЛЕЕР ---
-    with ui.dialog().on('value', lambda e: setattr(state, 'viewer_open', e.value)).props('maximized transition-show=fade transition-hide=fade') as media_dialog:
+    def sync_gallery_page():
+        if not state.viewer_items: return
+        target_page = (state.viewer_index // ITEMS_PER_PAGE) + 1
+        changed = False
+        scroll_id = ""
+
+        # Проверяем, изменилась ли страница, и обновляем интерфейс
+        if state.current_tab == 'Search' and state.search_page != target_page:
+            state.search_page = target_page
+            search_gallery_ui.refresh()
+            changed = True
+            scroll_id = "search_scroll_area"
+        elif state.current_tab == 'Aesthetic' and state.aes_page != target_page:
+            state.aes_page = target_page
+            aesthetic_gallery_ui.refresh()
+            changed = True
+            scroll_id = "aes_scroll_area"
+        elif state.current_tab == 'NSFW' and state.nsfw_page != target_page:
+            state.nsfw_page = target_page
+            nsfw_gallery_ui.refresh()
+            changed = True
+            scroll_id = "nsfw_scroll_area"
+        elif state.current_tab == 'Face' and state.face_page != target_page:
+            state.face_page = target_page
+            face_gallery_ui.refresh()
+            changed = True
+            scroll_id = "face_scroll_area"
+        elif state.current_tab == 'Tags' and state.tags_page != target_page:
+            state.tags_page = target_page
+            tags_gallery_ui.refresh()
+            changed = True
+            scroll_id = "tags_scroll_area"
+
+        # Если страница изменилась, прокручиваем список в самое начало
+        if changed:
+            ui.run_javascript(f'setTimeout(() => {{ let el = document.getElementById("{scroll_id}"); if(el) el.scrollTo({{top: 0, behavior: "instant"}}); }}, 100);')
+
+    # Привязываем функцию sync_gallery_page к событию hide (закрытие диалога)
+    with ui.dialog().on('value', lambda e: setattr(state, 'viewer_open', e.value)).on('hide', sync_gallery_page).props('maximized transition-show=fade transition-hide=fade') as media_dialog:
         with ui.element('div') \
             .classes('w-full h-full bg-black/95 p-0 flex flex-col relative items-center justify-center overflow-hidden') \
             .on('wheel.prevent', lambda e: change_media(1 if e.args['deltaY'] > 0 else -1),['deltaY']) \
