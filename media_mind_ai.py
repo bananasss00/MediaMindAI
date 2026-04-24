@@ -1852,6 +1852,7 @@ class DuplicatesEngine:
         if missing_paths:
             state.add_log(f"Вычисление pHash для {len(missing_paths)} новых изображений...")
             to_insert =[]
+            last_update = time.time()
             for i, p in enumerate(missing_paths):
                 if state.is_processing == False or self.se.cancel_flag: break
                 try:
@@ -1862,10 +1863,11 @@ class DuplicatesEngine:
                         to_insert.append((h, ph))
                 except Exception: pass
                 
-                # МИКРО-ПАУЗА: Защита от обрыва соединения (WebSocket Timeout)
-                if i % 50 == 0: 
+                # Защита от обрыва: обновляем UI раз в полсекунды и отдаем процессор
+                if time.time() - last_update > 0.5:
                     state.progress = i / max(1, len(missing_paths))
-                    time.sleep(0.005)
+                    last_update = time.time()
+                    time.sleep(0.001)
             
             if to_insert:
                 c.executemany("INSERT OR REPLACE INTO phash_cache (hash, phash) VALUES (?, ?)", to_insert)
@@ -1889,6 +1891,7 @@ class DuplicatesEngine:
         
         hash_list = list(hash_objs.keys())
         total = len(hash_list)
+        last_update = time.time()
         for i in range(total):
             if self.se.cancel_flag: break
             h1 = hash_list[i]
@@ -1898,8 +1901,10 @@ class DuplicatesEngine:
                 if obj1 - hash_objs[h2] <= threshold:
                     union(h1, h2)
                     
-            # МИКРО-ПАУЗА: Предотвращает зависание UI при огромном количестве файлов
-            if i % 200 == 0:
+            # Отпускаем процессор и UI каждые 0.5 сек (спасает от зависания сервака при N^2 нагрузке)
+            if time.time() - last_update > 0.5:
+                state.progress = i / max(1, total)
+                last_update = time.time()
                 time.sleep(0.002)
                     
         groups = defaultdict(list)
@@ -2724,19 +2729,21 @@ def index_page():
             setattr(state, f"{tab}_results",[i for i in getattr(state, f"{tab}_results") if i[1] not in moved_paths])
             refresh_tab_ui(tab)
 
-    async def handle_shift_click(e, idx, path, tab):
+    async def handle_shift_click(e, idx, path, tab, custom_paths=None):
         is_shift = isinstance(e.args, dict) and e.args.get('shiftKey', False)
         await asyncio.sleep(0.05) 
         
         sel_dict = getattr(state, f"sel_{tab}")
-        all_p = [p for i in getattr(state, f"{tab}_results") for p in[i[1]]]
+        
+        # Если передали кастомный список (для вкладок со сложной структурой вроде dupes)
+        all_p = custom_paths if custom_paths is not None else [p for i in getattr(state, f"{tab}_results") for p in[i[1]]]
 
         last_idx = getattr(state, f'last_clicked_{tab}', None)
 
         if not is_shift:
             setattr(state, f'last_clicked_{tab}', idx)
         else:
-            if last_idx is not None:
+            if last_idx is not None and last_idx < len(all_p) and idx < len(all_p):
                 start = min(idx, last_idx)
                 end = max(idx, last_idx)
                 target_val = sel_dict.get(path, True)
@@ -3234,7 +3241,7 @@ def index_page():
             ui.button(icon='keyboard_arrow_up', on_click=lambda: ui.run_javascript(f'document.getElementById("{scroll_id}").scrollTo({{top: 0, behavior: "smooth"}})')).props('round color=pink-800').classes('absolute bottom-6 right-6 z-50 shadow-lg').tooltip('Наверх')
 
     async def auto_select_worst_dupes():
-        ui.notify("Анализ файлов...", type="info")
+        ui.notify("Анализ всех файлов (в т.ч. скрытых)...", type="info")
         
         def task():
             c = search_engine.db_cache.conn.cursor()
@@ -3249,24 +3256,27 @@ def index_page():
                     res = (w or 0) * (h or 0)
                     scored.append((res, size or 0, p))
                 
+                # Сортируем: сначала самое большое разрешение, потом самый большой вес
                 scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
-                updates[scored[0][2]] = False
+                updates[scored[0][2]] = False # Лучший файл - оставляем (снимаем галочку)
                 for item in scored[1:]:
-                    updates[item[2]] = True
+                    updates[item[2]] = True   # Все остальные (в т.ч. скрытые) - помечаем на удаление
             return updates
             
         updates = await run.io_bound(task)
         state.sel_dupes.update(updates)
         dupes_gallery_ui.refresh()
-        ui.notify("Худшие дубликаты выделены!", type="positive")
+        ui.notify("Худшие дубликаты (включая скрытые) помечены на удаление!", type="positive", color="green")
 
     @ui.refreshable
     def dupes_gallery_ui():
         if not state.dupes_results:
             return ui.label("Найденные дубликаты появятся здесь...").classes("text-gray-400 m-4")
             
-        # ИЗМЕНЕНИЕ: Снизили кол-во групп на странице с 15 до 5, чтобы не вешать сервер!
-        GROUPS_PER_PAGE = 5
+        # ЖЕСТКИЕ ЛИМИТЫ ДЛЯ АБСОЛЮТНОЙ СТАБИЛЬНОСТИ
+        GROUPS_PER_PAGE = 3  
+        MAX_ITEMS_PER_GROUP = 40  
+        
         total_pages = max(1, (len(state.dupes_results) + GROUPS_PER_PAGE - 1) // GROUPS_PER_PAGE)
         if getattr(state, 'dupes_page', 1) > total_pages: state.dupes_page = 1
         
@@ -3280,7 +3290,6 @@ def index_page():
                     with ui.row().classes('gap-2 items-center'):
                         ui.button('АВТО-ВЫБОР ХУДШИХ', icon='auto_awesome', on_click=auto_select_worst_dupes).props('color=orange text-black font-bold dense')
                         ui.button('Снять всё', on_click=lambda: set_all('dupes', False)).props('outline color=white dense')
-                        ui.label('💡 Измените порог слева и нажмите "Искать" для перегруппировки (это мгновенно)').classes('text-[10px] text-gray-500 ml-4')
                     with ui.row().classes('gap-2 items-center'):
                         ui.button('УДАЛИТЬ ВЫДЕЛЕННЫЕ ✔', icon='delete_forever', on_click=lambda: delete_items([p for p, c in state.sel_dupes.items() if c], 'dupes')).props('color=red-10 text-white dense')
                 
@@ -3294,20 +3303,26 @@ def index_page():
                 start_idx = (getattr(state, 'dupes_page', 1) - 1) * GROUPS_PER_PAGE
                 page_groups = state.dupes_results[start_idx : start_idx + GROUPS_PER_PAGE]
                 
-                # СОЗДАЕМ ЕДИНЫЙ СПИСОК ДЛЯ СКРОЛЛИНГА В ПЛЕЕРЕ
-                all_dupes_paths =[p for group in state.dupes_results for p in group]
+                # Список только видимых файлов на этой странице для листания в полноэкранном плеере
+                visible_dupes_paths =[]
+                for g in page_groups:
+                    visible_dupes_paths.extend(g[:MAX_ITEMS_PER_GROUP])
                 
                 for group_idx, group in enumerate(page_groups):
                     with ui.card().classes('w-full bg-gray-800 border border-gray-700 p-2 mb-4'):
-                        ui.label(f"Группа {start_idx + group_idx + 1} (Файлов: {len(group)})").classes('font-bold text-orange-400 mb-2 px-2')
-                        with ui.row().classes('w-full gap-4 overflow-x-auto pb-2 flex-nowrap'):
-                            for path in group:
+                        ui.label(f"Группа {start_idx + group_idx + 1} (Всего файлов в группе: {len(group)})").classes('font-bold text-orange-400 mb-2 px-2')
+                        
+                        visible_group = group[:MAX_ITEMS_PER_GROUP]
+                        hidden_count = len(group) - MAX_ITEMS_PER_GROUP
+                        
+                        with ui.row().classes('w-full gap-4 overflow-x-auto pb-2 flex-nowrap items-center'):
+                            for path in visible_group:
                                 safe_path = urllib.parse.quote(path)
-                                global_index = all_dupes_paths.index(path)
+                                global_index = visible_dupes_paths.index(path)
                                 
                                 with ui.column().classes('w-[200px] shrink-0 relative bg-gray-900 rounded overflow-hidden border border-gray-700 hover:border-orange-500 transition-colors'):
                                     with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
-                                        ui.checkbox().bind_value(state.sel_dupes, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'dupes'),['shiftKey'])
+                                        ui.checkbox().bind_value(state.sel_dupes, path).on('click', lambda e, i=global_index, p=path, paths=visible_dupes_paths: handle_shift_click(e, i, p, 'dupes', paths),['shiftKey'])
                                     
                                     with ui.context_menu():
                                         ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
@@ -3316,8 +3331,8 @@ def index_page():
                                         ui.separator()
                                         ui.menu_item('Удалить файл (В корзину)', on_click=lambda p=path: delete_items([p], 'dupes')).classes('text-red-400')
 
-                                    # ИЗМЕНЕНИЕ: Включен loading="lazy" и ЖЕСТКО зафиксированы переменные для плеера!
-                                    ui.image(f"/thumb/{safe_path}").classes('w-full h-[150px] object-contain cursor-pointer bg-black').props('fit=contain loading="lazy"').on('click', lambda e, idx=global_index, paths=all_dupes_paths: open_media(idx, paths))
+                                    # ПОЛНОЭКРАННЫЙ ПЛЕЕР ТЕПЕРЬ АКТИВЕН:
+                                    ui.image(f"/thumb/{safe_path}").classes('w-full h-[150px] object-contain cursor-pointer bg-black').props('fit=contain loading="lazy"').on('click', lambda e, idx=global_index, paths=visible_dupes_paths: open_media(idx, paths))
                                     
                                     c = search_engine.db_cache.conn.cursor()
                                     c.execute("SELECT size_mb, width, height FROM files WHERE path=?", (path,))
@@ -3328,9 +3343,19 @@ def index_page():
                                     with ui.column().classes('p-2 gap-0 w-full'):
                                         with ui.row().classes('w-full justify-between items-center'):
                                             ui.label(res_str).classes('text-green-400 font-bold text-xs')
-                                            ui.button(icon='folder', on_click=lambda p=path: reveal_file_native(p)).props('flat round dense color=white size=xs').tooltip('Показать в папке')
+                                            ui.button(icon='folder', on_click=lambda p=path: reveal_file_native(p)).props('flat round dense color=white size=xs').tooltip('Открыть папку')
                                         ui.label(size_str).classes('text-yellow-400 font-bold text-xs')
                                         ui.label(os.path.basename(path)).classes('text-gray-400 text-[10px] truncate w-full').tooltip(path)
+
+                            # ПЛАШКА ЗАЩИТЫ, ЕСЛИ ФАЙЛОВ В ГРУППЕ СЛИШКОМ МНОГО:
+                            if hidden_count > 0:
+                                with ui.card().classes('w-[200px] h-[210px] shrink-0 flex flex-col items-center justify-center bg-gray-900 border border-dashed border-gray-600 gap-2 p-4'):
+                                    ui.icon('more_horiz', size='3rem').classes('text-gray-500')
+                                    ui.label(f"+ еще {hidden_count} шт.").classes('text-center font-bold text-gray-300 text-lg')
+                                    ui.label("Скрыты для защиты от лагов").classes('text-[10px] text-center text-gray-500')
+                                    ui.label("Автовыбор обработает их все!").classes('text-[10px] text-center text-orange-600 font-bold')
+
+            ui.button(icon='keyboard_arrow_up', on_click=lambda: ui.run_javascript(f'document.getElementById("{scroll_id}").scrollTo({{top: 0, behavior: "smooth"}})')).props('round color=orange-800').classes('absolute bottom-6 right-6 z-50 shadow-lg').tooltip('Наверх')
 
     # --- ОСНОВНАЯ РАБОЧАЯ ОБЛАСТЬ ---
     with ui.tab_panels(tabs).bind_value(state, 'current_tab').classes('w-full bg-[#121212] p-0'):
