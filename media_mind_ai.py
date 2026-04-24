@@ -24,6 +24,11 @@ except ImportError:
     # Фолбэк на безвозвратное удаление, если библиотеки нет
     send2trash = os.remove
 
+try:
+    import imagehash
+except ImportError:
+    print("⚠️ Библиотека imagehash не найдена. Установите: pip install ImageHash")
+
 import argparse
 import sys
 import asyncio
@@ -196,6 +201,7 @@ class DatabaseCache:
     def _init_tables(self):
         c = self.conn.cursor()
         c.execute('''CREATE TABLE IF NOT EXISTS files (hash TEXT, path TEXT, size_mb REAL, width INTEGER, height INTEGER, PRIMARY KEY (hash, path))''')
+        c.execute('''CREATE TABLE IF NOT EXISTS phash_cache (hash TEXT PRIMARY KEY, phash TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS emb_cache (model TEXT, hash TEXT, features BLOB, PRIMARY KEY (model, hash))''')
         c.execute('''CREATE TABLE IF NOT EXISTS rerank_cache_v2 (model TEXT, query TEXT, hash TEXT, score REAL, PRIMARY KEY (model, query, hash))''')
         c.execute('''CREATE TABLE IF NOT EXISTS aes_cache (model TEXT, hash TEXT, avg_score REAL, max_score REAL, PRIMARY KEY (model, hash))''')
@@ -631,22 +637,35 @@ class SearchEngine:
             self.current_emb_model_state = current_state
         return self.embedding_model
 
-    def _gather_files(self, dir_path, allowed_exts):
-        files_list = self.files_cache.list_files(dir_path)
-        if files_list is None:
-            self.log(f"Индексация файловой системы: {dir_path}...")
-            all_supported = SUPPORTED_IMAGES + SUPPORTED_VIDEOS + SUPPORTED_TEXTS
-            files_list =[]
-            for root, dirs, files in os.walk(dir_path):
-                if self.cancel_flag: break
-                for file in files:
-                    if file.lower().endswith(all_supported):
-                        files_list.append(os.path.join(root, file))
-            if not self.cancel_flag:
-                self.files_cache._data[dir_path] = files_list
-                self.files_cache.save_cache()
-                self.log(f"Найдено поддерживаемых файлов: {len(files_list)}")
-        return[f for f in files_list if f.lower().endswith(allowed_exts)]
+    def _gather_files(self, dir_paths, allowed_exts):
+        if isinstance(dir_paths, str):
+            dirs =[d.strip() for d in dir_paths.replace('\r', '\n').split('\n') if d.strip()]
+        else:
+            dirs = dir_paths
+            
+        all_gathered =[]
+        all_supported = SUPPORTED_IMAGES + SUPPORTED_VIDEOS + SUPPORTED_TEXTS
+        
+        for d_path in dirs:
+            if not os.path.exists(d_path): continue
+            files_list = self.files_cache.list_files(d_path)
+            if files_list is None:
+                self.log(f"Индексация: {d_path}...")
+                files_list =[]
+                for root, _, files in os.walk(d_path):
+                    if self.cancel_flag: break
+                    for file in files:
+                        if file.lower().endswith(all_supported):
+                            files_list.append(os.path.join(root, file))
+                if not self.cancel_flag:
+                    self.files_cache._data[d_path] = files_list
+                    self.files_cache.save_cache()
+            if files_list:
+                all_gathered.extend(files_list)
+                
+        # Убираем дубли путей (на случай, если папки пересекаются)
+        all_gathered = list(set(all_gathered))
+        return[f for f in all_gathered if f.lower().endswith(allowed_exts)]
 
     def _load_and_prep_file(self, file_path, phase='embedding'):
         ext = os.path.splitext(file_path)[1].lower()
@@ -1795,6 +1814,97 @@ class TagEngine:
                 
                 batch_images, batch_frame_counts, batch_paths = [], [], []
 
+class DuplicatesEngine:
+    def __init__(self, search_engine):
+        self.se = search_engine
+        self.db_cache = search_engine.db_cache
+        
+    def find_exact(self, dir_paths, allowed_exts):
+        files = self.se._gather_files(dir_paths, allowed_exts)
+        path_to_hash = self.db_cache.get_or_create_hashes(files)
+        
+        hash_groups = defaultdict(list)
+        for p, h in path_to_hash.items():
+            hash_groups[h].append(p)
+            
+        results =[paths for h, paths in hash_groups.items() if len(paths) > 1]
+        results.sort(key=lambda g: len(g), reverse=True)
+        for g in results: g.sort()
+        return results
+
+    def find_similar(self, dir_paths, allowed_exts, threshold):
+        files = self.se._gather_files(dir_paths, allowed_exts)
+        files =[f for f in files if f.lower().endswith(SUPPORTED_IMAGES)] # pHash только для картинок
+        path_to_hash = self.db_cache.get_or_create_hashes(files)
+        
+        c = self.db_cache.conn.cursor()
+        hashes = list(set(path_to_hash.values()))
+        
+        phash_dict = {}
+        chunk_size = 900
+        for i in range(0, len(hashes), chunk_size):
+            chunk = hashes[i:i+chunk_size]
+            ph = ','.join(['?']*len(chunk))
+            c.execute(f"SELECT hash, phash FROM phash_cache WHERE hash IN ({ph})", chunk)
+            for row in c.fetchall(): phash_dict[row[0]] = row[1]
+                
+        missing_paths =[p for p in files if path_to_hash.get(p) not in phash_dict]
+        if missing_paths:
+            state.add_log(f"Вычисление pHash для {len(missing_paths)} новых изображений...")
+            to_insert =[]
+            for i, p in enumerate(missing_paths):
+                if state.is_processing == False or self.se.cancel_flag: break
+                try:
+                    with Image.open(p) as img:
+                        ph = str(imagehash.phash(img))
+                        h = path_to_hash[p]
+                        phash_dict[h] = ph
+                        to_insert.append((h, ph))
+                except Exception: pass
+                if i % 100 == 0: state.progress = i / max(1, len(missing_paths))
+            
+            if to_insert:
+                c.executemany("INSERT OR REPLACE INTO phash_cache (hash, phash) VALUES (?, ?)", to_insert)
+                self.db_cache.conn.commit()
+        
+        state.add_log("Кластеризация дубликатов...")
+        hash_objs = {}
+        for h, ph_hex in phash_dict.items():
+            try: hash_objs[h] = imagehash.hex_to_hash(ph_hex)
+            except Exception: pass
+            
+        parent = {h: h for h in hash_objs.keys()}
+        def find(i):
+            if parent[i] == i: return i
+            parent[i] = find(parent[i])
+            return parent[i]
+        def union(i, j):
+            root_i = find(i)
+            root_j = find(j)
+            if root_i != root_j: parent[root_i] = root_j
+        
+        hash_list = list(hash_objs.keys())
+        total = len(hash_list)
+        for i in range(total):
+            if self.se.cancel_flag: break
+            h1 = hash_list[i]
+            for j in range(i+1, total):
+                h2 = hash_list[j]
+                if hash_objs[h1] - hash_objs[h2] <= threshold:
+                    union(h1, h2)
+                    
+        groups = defaultdict(list)
+        for p in files:
+            h = path_to_hash.get(p)
+            if h in hash_objs:
+                root = find(h)
+                groups[root].append(p)
+                
+        results =[paths for paths in groups.values() if len(paths) > 1]
+        results.sort(key=lambda g: len(g), reverse=True)
+        for g in results: g.sort()
+        return results
+    
 # ==========================================
 # 4. СОСТОЯНИЕ И UI УТИЛИТЫ
 # ==========================================
@@ -1805,12 +1915,14 @@ class AppState:
         self.nsfw_results =[]
         self.face_results =[]
         self.tags_results =[]
+        self.dupes_results =[]
         
         self.sel_search = {}
         self.sel_aes = {}
         self.sel_nsfw = {}
         self.sel_face = {}
         self.sel_tags = {}
+        self.sel_dupes = {}
         
         self.search_page = 1
         self.aes_page = 1
@@ -1868,6 +1980,7 @@ aesthetic_engine = AestheticEngine(search_engine)
 nsfw_engine = NsfwEngine(search_engine)
 face_engine = FaceEngine(search_engine)
 tag_engine = TagEngine(search_engine)
+dupes_engine = DuplicatesEngine(search_engine)
 
 def open_file_native(filepath):
     try: os.startfile(filepath) if os.name == 'nt' else subprocess.call(('xdg-open', filepath))
@@ -1903,6 +2016,24 @@ def pick_folder_native():
 async def select_folder(input_element):
     folder = await run.io_bound(pick_folder_native)
     if folder: input_element.value = folder
+
+async def select_folder_multi(textarea_element):
+    folder = await run.io_bound(pick_folder_native)
+    if folder:
+        current = textarea_element.value.strip()
+        textarea_element.value = current + "\n" + folder if current else folder
+
+def clear_folder_cache_multi(paths_str):
+    if not paths_str: return
+    dirs =[d.strip() for d in paths_str.replace('\r', '\n').split('\n') if d.strip()]
+    cleared = 0
+    for d in dirs:
+        if d in search_engine.files_cache._data:
+            del search_engine.files_cache._data[d]
+            cleared += 1
+    if cleared:
+        search_engine.files_cache.save_cache()
+        ui.notify(f'Кэш очищен для {cleared} папок!', type='positive')
 
 def pick_file_native():
     import tkinter as tk
@@ -2042,6 +2173,7 @@ def index_page():
             tab_nsfw = ui.tab('NSFW', label='NSFW Детектор', icon='visibility_off')
             tab_face = ui.tab('Face', label='Поиск по лицу', icon='face')
             tab_tags = ui.tab('Tags', label='Danbooru Теги', icon='label')
+            tab_dupes = ui.tab('Dupes', label='Дубликаты', icon='content_copy')
             tab_cache = ui.tab('Cache', label='Индексатор', icon='storage')
             
         ui.button(icon='settings', on_click=lambda: global_settings_dialog.open()).props('flat round dense text-color=white').classes('shrink-0').tooltip('Глобальные настройки')
@@ -2431,6 +2563,7 @@ def index_page():
         elif tab_name == 'nsfw': nsfw_gallery_ui.refresh()
         elif tab_name == 'face': face_gallery_ui.refresh()
         elif tab_name == 'tags': tags_gallery_ui.refresh()
+        elif tab_name == 'dupes': dupes_gallery_ui.refresh()
 
     def get_physical_info(p):
         try:
@@ -2494,7 +2627,6 @@ def index_page():
     def delete_items(paths, tab_name):
         if not paths: return
         deleted = 0
-        # ИСПРАВЛЕНИЕ: Точный маппинг имени списка для AES
         attr_name = "aesthetic_results" if tab_name == "aes" else f"{tab_name}_results"
         
         for p in paths:
@@ -2503,7 +2635,16 @@ def index_page():
                 deleted += 1
                 search_engine.db_cache.remove_paths([p])
                 res_list = getattr(state, attr_name)
-                setattr(state, attr_name, [item for item in res_list if item[1] != p])
+                
+                # В дубликатах результаты хранятся как список списков
+                if tab_name == 'dupes':
+                    new_dupes = []
+                    for g in res_list:
+                        new_g =[item for item in g if item != p]
+                        if len(new_g) > 1: new_dupes.append(new_g)
+                    setattr(state, attr_name, new_dupes)
+                else:
+                    setattr(state, attr_name, [item for item in res_list if item[1] != p])
             except Exception as e:
                 state.add_log(f"Ошибка удаления {p}: {e}")
                 
@@ -2594,6 +2735,11 @@ def index_page():
                     sel_dict[all_p[i]] = target_val
 
     def set_all(tab, value):
+        if tab == 'dupes':
+            for g in state.dupes_results:
+                for p in g: state.sel_dupes[p] = value
+            return dupes_gallery_ui.refresh()
+            
         filter_val = getattr(state, f"{tab}_res_filter")
         sel_dict = getattr(state, f"sel_{tab}")
         for item in getattr(state, f"{tab}_results"):
@@ -3078,6 +3224,79 @@ def index_page():
 
             ui.button(icon='keyboard_arrow_up', on_click=lambda: ui.run_javascript(f'document.getElementById("{scroll_id}").scrollTo({{top: 0, behavior: "smooth"}})')).props('round color=pink-800').classes('absolute bottom-6 right-6 z-50 shadow-lg').tooltip('Наверх')
 
+    def auto_select_worst_dupes():
+        c = search_engine.db_cache.conn.cursor()
+        c.execute("SELECT path, size_mb, width, height FROM files")
+        info = {r[0]: (r[1], r[2], r[3]) for r in c.fetchall()}
+        
+        for group in state.dupes_results:
+            scored =[]
+            for p in group:
+                size, w, h = info.get(p, (0, 0, 0))
+                res = (w or 0) * (h or 0)
+                scored.append((res, size or 0, p))
+            
+            scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            # Оставляем галочку снятой у самого лучшего файла, а всем копиям ставим галочку на удаление
+            state.sel_dupes[scored[0][2]] = False
+            for item in scored[1:]:
+                state.sel_dupes[item[2]] = True
+                
+        dupes_gallery_ui.refresh()
+
+    @ui.refreshable
+    def dupes_gallery_ui():
+        if not state.dupes_results:
+            return ui.label("Найденные дубликаты появятся здесь...").classes("text-gray-400 m-4")
+            
+        total_pages = max(1, (len(state.dupes_results) + 15 - 1) // 15)
+        if getattr(state, 'dupes_page', 1) > total_pages: state.dupes_page = 1
+        
+        def change_page(d):
+            state.dupes_page = max(1, min(total_pages, getattr(state, 'dupes_page', 1) + d))
+            dupes_gallery_ui.refresh()
+
+        with ui.column().classes('w-full h-full flex flex-col p-0 m-0 gap-0 relative'):
+            with ui.column().classes('w-full shrink-0 bg-gray-900 p-4 pb-2 border-b border-gray-800 z-20 gap-0 shadow-md'):
+                with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
+                    with ui.row().classes('gap-2 items-center'):
+                        ui.button('АВТО-ВЫБОР ХУДШИХ', icon='auto_awesome', on_click=auto_select_worst_dupes).props('color=orange text-black font-bold dense')
+                        ui.button('Снять всё', on_click=lambda: set_all('dupes', False)).props('outline color=white dense')
+                    with ui.row().classes('gap-2 items-center'):
+                        ui.button('УДАЛИТЬ ВЫДЕЛЕННЫЕ ✔', icon='delete_forever', on_click=lambda: delete_items([p for p, c in state.sel_dupes.items() if c], 'dupes')).props('color=red-10 text-white dense')
+                
+                with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
+                    ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
+                    ui.label(f'Страница {getattr(state, "dupes_page", 1)} из {total_pages}').classes('text-gray-300 font-bold')
+                    ui.button(icon='chevron_right', on_click=lambda: change_page(1)).props('flat outline color=white')
+            
+            scroll_id = 'dupes_scroll_area'
+            with ui.column().classes('w-full flex-1 overflow-y-auto p-4 relative').props(f'id="{scroll_id}"'):
+                start_idx = (getattr(state, 'dupes_page', 1) - 1) * 15
+                page_groups = state.dupes_results[start_idx : start_idx + 15]
+                
+                for group_idx, group in enumerate(page_groups):
+                    with ui.card().classes('w-full bg-gray-800 border border-gray-700 p-2 mb-4'):
+                        ui.label(f"Группа {start_idx + group_idx + 1} (Файлов: {len(group)})").classes('font-bold text-orange-400 mb-2 px-2')
+                        with ui.row().classes('w-full gap-4 overflow-x-auto pb-2 flex-nowrap'):
+                            for path in group:
+                                safe_path = urllib.parse.quote(path)
+                                with ui.column().classes('w-[200px] shrink-0 relative bg-gray-900 rounded overflow-hidden border border-gray-700'):
+                                    with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
+                                        ui.checkbox().bind_value(state.sel_dupes, path)
+                                    ui.image(f"/thumb/{safe_path}").classes('w-full h-[150px] object-contain cursor-pointer bg-black').props('fit=contain').on('click', lambda p=path: reveal_file_native(p))
+                                    
+                                    c = search_engine.db_cache.conn.cursor()
+                                    c.execute("SELECT size_mb, width, height FROM files WHERE path=?", (path,))
+                                    info = c.fetchone()
+                                    size_str = f"{info[0]:.2f} MB" if info and info[0] else "N/A"
+                                    res_str = f"{info[1]}x{info[2]}" if info and info[1] else "N/A"
+                                    
+                                    with ui.column().classes('p-2 gap-0 w-full'):
+                                        ui.label(res_str).classes('text-green-400 font-bold text-xs')
+                                        ui.label(size_str).classes('text-yellow-400 font-bold text-xs')
+                                        ui.label(os.path.basename(path)).classes('text-gray-400 text-[10px] truncate w-full').tooltip(path)
+
     # --- ОСНОВНАЯ РАБОЧАЯ ОБЛАСТЬ ---
     with ui.tab_panels(tabs).bind_value(state, 'current_tab').classes('w-full bg-[#121212] p-0'):
         
@@ -3088,10 +3307,11 @@ def index_page():
                     ui.label('Параметры поиска').classes('text-lg font-bold')
                 
                 with ui.column().classes('w-full flex-1 overflow-y-auto p-4 gap-2 min-h-0'):
-                    with ui.row().classes('w-full items-center gap-1 flex-nowrap'):
-                        inp_dir = ui.input('Папка', value=cfg.get('inp_dir', '')).classes('flex-grow')
-                        ui.button(icon='folder', on_click=lambda: select_folder(inp_dir)).props('flat round dense')
-                        ui.button(icon='delete_sweep', on_click=lambda: clear_folder_cache(inp_dir.value)).props('flat round dense text-color=red').tooltip('Очистить индекс файлов папки')
+                    with ui.row().classes('w-full items-start gap-1 flex-nowrap'):
+                        inp_dir = ui.textarea('Папки (каждая с новой строки)', value=cfg.get('inp_dir', '')).classes('flex-grow').props('rows=2')
+                        with ui.column().classes('gap-0 pt-2'):
+                            ui.button(icon='create_new_folder', on_click=lambda: select_folder_multi(inp_dir)).props('flat round dense').tooltip('Добавить папку')
+                            ui.button(icon='delete_sweep', on_click=lambda: clear_folder_cache_multi(inp_dir.value)).props('flat round dense text-color=red').tooltip('Очистить кэш этих папок')
                     
                     inp_query = ui.input('Запрос или путь', value=cfg.get('inp_query', '')).classes('w-full')
                     
@@ -3210,12 +3430,12 @@ def index_page():
                 with ui.row().classes('w-full p-4 pb-2 shrink-0 border-b border-gray-800 bg-gray-900 z-10'):
                     ui.label('Оценка Эстетики').classes('text-lg font-bold')
                 
-                with ui.column().classes('w-full flex-1 overflow-y-auto p-4 gap-2 min-h-0'):
-                    with ui.row().classes('w-full items-center gap-1 flex-nowrap'):
-                        rate_dir = ui.input('Папка', value=cfg.get('rate_dir', '')).classes('flex-grow')
-                        ui.button(icon='folder', on_click=lambda: select_folder(rate_dir)).props('flat round dense')
-                        ui.button(icon='delete_sweep', on_click=lambda: clear_folder_cache(rate_dir.value)).props('flat round dense text-color=red').tooltip('Очистить индекс файлов папки')
-                        
+                    with ui.row().classes('w-full items-start gap-1 flex-nowrap'):
+                        rate_dir = ui.textarea('Папки (каждая с новой строки)', value=cfg.get('rate_dir', '')).classes('flex-grow').props('rows=2')
+                        with ui.column().classes('gap-0 pt-2'):
+                            ui.button(icon='create_new_folder', on_click=lambda: select_folder_multi(rate_dir)).props('flat round dense').tooltip('Добавить папку')
+                            ui.button(icon='delete_sweep', on_click=lambda: clear_folder_cache_multi(rate_dir.value)).props('flat round dense text-color=red').tooltip('Очистить кэш этих папок')
+
                     with ui.row().classes('w-full gap-2'):
                         chk_img_aes = ui.checkbox('Картинки', value=cfg.get('chk_img_aes', True))
                         chk_vid_aes = ui.checkbox('Видео', value=cfg.get('chk_vid_aes', False))
@@ -3318,11 +3538,12 @@ def index_page():
                     ui.label('NSFW Детектор').classes('text-lg font-bold')
                 
                 with ui.column().classes('w-full flex-1 overflow-y-auto p-4 gap-2 min-h-0'):
-                    with ui.row().classes('w-full items-center gap-1 flex-nowrap'):
-                        nsfw_dir = ui.input('Папка', value=cfg.get('nsfw_dir', '')).classes('flex-grow')
-                        ui.button(icon='folder', on_click=lambda: select_folder(nsfw_dir)).props('flat round dense')
-                        ui.button(icon='delete_sweep', on_click=lambda: clear_folder_cache(nsfw_dir.value)).props('flat round dense text-color=red').tooltip('Очистить индекс файлов папки')
-                        
+                    with ui.row().classes('w-full items-start gap-1 flex-nowrap'):
+                        nsfw_dir = ui.textarea('Папки (каждая с новой строки)', value=cfg.get('nsfw_dir', '')).classes('flex-grow').props('rows=2')
+                        with ui.column().classes('gap-0 pt-2'):
+                            ui.button(icon='create_new_folder', on_click=lambda: select_folder_multi(nsfw_dir)).props('flat round dense').tooltip('Добавить папку')
+                            ui.button(icon='delete_sweep', on_click=lambda: clear_folder_cache_multi(nsfw_dir.value)).props('flat round dense text-color=red').tooltip('Очистить кэш этих папок')
+
                     with ui.row().classes('w-full gap-2'):
                         chk_img_nsfw = ui.checkbox('Картинки', value=cfg.get('chk_img_nsfw', True))
                         chk_vid_nsfw = ui.checkbox('Видео', value=cfg.get('chk_vid_nsfw', False))
@@ -3403,13 +3624,14 @@ def index_page():
             with ui.column().classes('w-[350px] shrink-0 bg-gray-900 rounded-xl border border-gray-800 shadow-lg flex flex-col overflow-hidden p-0 gap-0'):
                 with ui.row().classes('w-full p-4 pb-2 shrink-0 border-b border-gray-800 bg-gray-900 z-10'):
                     ui.label('Поиск по лицу').classes('text-lg font-bold')
-                
+
                 with ui.column().classes('w-full flex-1 overflow-y-auto p-4 gap-2 min-h-0'):
-                    with ui.row().classes('w-full items-center gap-1 flex-nowrap'):
-                        face_dir = ui.input('Папка для поиска', value=cfg.get('face_dir', '')).classes('flex-grow')
-                        ui.button(icon='folder', on_click=lambda: select_folder(face_dir)).props('flat round dense')
-                        ui.button(icon='delete_sweep', on_click=lambda: clear_folder_cache(face_dir.value)).props('flat round dense text-color=red').tooltip('Очистить индекс файлов папки')
-                        
+                    with ui.row().classes('w-full items-start gap-1 flex-nowrap'):
+                        face_dir = ui.textarea('Папки (каждая с новой строки)', value=cfg.get('face_dir', '')).classes('flex-grow').props('rows=2')
+                        with ui.column().classes('gap-0 pt-2'):
+                            ui.button(icon='create_new_folder', on_click=lambda: select_folder_multi(face_dir)).props('flat round dense').tooltip('Добавить папку')
+                            ui.button(icon='delete_sweep', on_click=lambda: clear_folder_cache_multi(face_dir.value)).props('flat round dense text-color=red').tooltip('Очистить кэш этих папок')
+
                     with ui.row().classes('w-full items-center gap-1 flex-nowrap mt-2'):
                         ref_img = ui.input('Фото с лицом (Референс)', value=cfg.get('ref_img', '')).classes('flex-grow')
                         ui.button(icon='image', on_click=lambda: select_file(ref_img)).props('flat round dense')
@@ -3485,11 +3707,12 @@ def index_page():
                     ui.label('Поиск по тегам').classes('text-lg font-bold')
                 
                 with ui.column().classes('w-full flex-1 overflow-y-auto p-4 gap-2 min-h-0'):
-                    with ui.row().classes('w-full items-center gap-1 flex-nowrap'):
-                        tags_dir = ui.input('Папка', value=cfg.get('tags_dir', '')).classes('flex-grow')
-                        ui.button(icon='folder', on_click=lambda: select_folder(tags_dir)).props('flat round dense')
-                        ui.button(icon='delete_sweep', on_click=lambda: clear_folder_cache(tags_dir.value)).props('flat round dense text-color=red').tooltip('Очистить индекс файлов папки')
-                    
+                    with ui.row().classes('w-full items-start gap-1 flex-nowrap'):
+                        tags_dir = ui.textarea('Папки (каждая с новой строки)', value=cfg.get('tags_dir', '')).classes('flex-grow').props('rows=2')
+                        with ui.column().classes('gap-0 pt-2'):
+                            ui.button(icon='create_new_folder', on_click=lambda: select_folder_multi(tags_dir)).props('flat round dense').tooltip('Добавить папку')
+                            ui.button(icon='delete_sweep', on_click=lambda: clear_folder_cache_multi(tags_dir.value)).props('flat round dense text-color=red').tooltip('Очистить кэш этих папок')
+
                     with ui.row().classes('w-full gap-2'):
                         chk_img_tags = ui.checkbox('Картинки', value=cfg.get('chk_img_tags', True))
                         chk_vid_tags = ui.checkbox('Видео', value=cfg.get('chk_vid_tags', False))
@@ -3948,6 +4171,80 @@ def index_page():
                     btn_cache.enable()
 
                 btn_cache = ui.button('🚀 Запустить полное кэширование', on_click=run_cache_action).classes('w-full bg-blue-600 hover:bg-blue-500 font-bold text-lg mt-4')
+        
+        # ВКЛАДКА: ДУБЛИКАТЫ
+        with ui.tab_panel(tab_dupes).classes('w-full h-[calc(100vh-115px)] p-4 flex flex-row flex-nowrap items-stretch gap-4'):
+            with ui.column().classes('w-[350px] shrink-0 bg-gray-900 rounded-xl border border-gray-800 shadow-lg flex flex-col overflow-hidden p-0 gap-0'):
+                with ui.row().classes('w-full p-4 pb-2 shrink-0 border-b border-gray-800 bg-gray-900 z-10'):
+                    ui.label('Поиск дубликатов').classes('text-lg font-bold')
+                
+                with ui.column().classes('w-full flex-1 overflow-y-auto p-4 gap-2 min-h-0'):
+                    with ui.row().classes('w-full items-start gap-1 flex-nowrap'):
+                        dupes_dir = ui.textarea('Папки (каждая с новой строки)', value=cfg.get('dupes_dir', '')).classes('flex-grow').props('rows=3')
+                        with ui.column().classes('gap-0 pt-2'):
+                            ui.button(icon='create_new_folder', on_click=lambda: select_folder_multi(dupes_dir)).props('flat round dense').tooltip('Добавить папку')
+                            ui.button(icon='delete_sweep', on_click=lambda: clear_folder_cache_multi(dupes_dir.value)).props('flat round dense text-color=red').tooltip('Очистить кэш')
+                    
+                    dupes_mode = ui.select(['Точные (Быстрый Хеш)', 'Похожие картинки (pHash)'], value=cfg.get('dupes_mode', 'Точные (Быстрый Хеш)'), label='Режим поиска').classes('w-full mt-2')
+                    phash_threshold = ui.number('Порог pHash (Допуск разницы, 1-10)', value=cfg.get('phash_threshold', 4), format='%.0f').classes('w-full').bind_visibility_from(dupes_mode, 'value', value=lambda v: v == 'Похожие картинки (pHash)')
+                    
+                    with ui.row().classes('w-full gap-2 mt-2'):
+                        chk_img_dupes = ui.checkbox('Картинки', value=cfg.get('chk_img_dupes', True))
+                        chk_vid_dupes = ui.checkbox('Видео', value=cfg.get('chk_vid_dupes', True)).bind_visibility_from(dupes_mode, 'value', value=lambda v: v == 'Точные (Быстрый Хеш)')
+
+                async def run_dupes_action():
+                    save_config({
+                        'dupes_dir': dupes_dir.value, 'dupes_mode': dupes_mode.value,
+                        'phash_threshold': phash_threshold.value,
+                        'chk_img_dupes': chk_img_dupes.value, 'chk_vid_dupes': chk_vid_dupes.value
+                    })
+                    if not dupes_dir.value: return ui.notify("Укажите папки!", type='warning')
+                    
+                    state.is_processing = True
+                    search_engine.cancel_flag = False
+                    state.dupes_results.clear()
+                    state.sel_dupes.clear()
+                    setattr(state, 'dupes_page', 1)
+                    dupes_gallery_ui.refresh()
+                    btn_dupes.disable()
+                    
+                    exts =[]
+                    if chk_img_dupes.value: exts.extend(SUPPORTED_IMAGES)
+                    # pHash работает только с картинками, поэтому видео разрешаем только для "Точного" режима
+                    if dupes_mode.value == 'Точные (Быстрый Хеш)' and chk_vid_dupes.value: 
+                        exts.extend(SUPPORTED_VIDEOS)
+
+                    def bg_task():
+                        try:
+                            state.add_log(f"Запуск поиска дубликатов. Режим: {dupes_mode.value}")
+                            if dupes_mode.value == 'Точные (Быстрый Хеш)':
+                                res = dupes_engine.find_exact(dupes_dir.value, tuple(exts))
+                            else:
+                                res = dupes_engine.find_similar(dupes_dir.value, tuple(exts), int(phash_threshold.value))
+                                
+                            state.dupes_results = res
+                            # Заполняем словарь выделения False для всех найденных файлов
+                            for group in res:
+                                for p in group:
+                                    state.sel_dupes[p] = False
+                                    
+                            state.add_log(f"✅ Поиск дубликатов завершен! Найдено групп: {len(res)}")
+                        except Exception as e: 
+                            state.add_log(f"❌ Ошибка поиска дубликатов: {e}")
+                        finally:
+                            state.status_text = "Готово!"
+                            state.progress = 1.0
+                            state.is_processing = False
+
+                    await run.io_bound(bg_task)
+                    dupes_gallery_ui.refresh()
+                    btn_dupes.enable()
+                    
+                with ui.row().classes('w-full p-4 pt-2 shrink-0 border-t border-gray-800 bg-gray-900 z-10'):
+                    btn_dupes = ui.button('👯 Найти Дубликаты', on_click=run_dupes_action).classes('w-full bg-orange-700 hover:bg-orange-600 font-bold text-lg')
+
+            with ui.column().classes('flex-1 w-0 bg-gray-900 rounded-xl border border-gray-800 overflow-hidden h-full relative p-0'):
+                dupes_gallery_ui()
 
     with ui.footer().classes('bg-gray-900 border-t border-gray-800 px-4 py-0 flex flex-row flex-nowrap items-center justify-between z-40 h-8 shadow-lg'):
         ui.label().bind_text_from(state, 'status_text').classes('text-blue-400 font-mono text-xs truncate max-w-[30%] shrink-0')
