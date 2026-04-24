@@ -152,171 +152,263 @@ def read_thumb(file_path: str):
 # ==========================================
 # 1. БАЗЫ ДАННЫХ И КЭШ
 # ==========================================
+def get_fast_hash(file_path):
+    """Сверхбыстрое хеширование: Размер + MD5(первый 1 МБ) + MD5(последний 1 МБ)"""
+    try:
+        size = os.path.getsize(file_path)
+        if size == 0:
+            return "empty_" + hashlib.md5(file_path.encode('utf-8')).hexdigest()
+        
+        with open(file_path, 'rb') as f:
+            first_mb = f.read(1024 * 1024)
+            if size > 1024 * 1024:
+                f.seek(max(0, size - 1024 * 1024))
+                last_mb = f.read(1024 * 1024)
+            else:
+                last_mb = b""
+        
+        h1 = hashlib.md5(first_mb).hexdigest()
+        h2 = hashlib.md5(last_mb).hexdigest()
+        return f"{size}_{h1}_{h2}"
+    except Exception:
+        # Fallback если файл заблокирован
+        return hashlib.md5(file_path.encode('utf-8')).hexdigest()
+
 class DatabaseCache:
     def __init__(self, db_path='image_cache.db'):
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
-
-        # Включаем WAL (Write-Ahead Logging) для быстрой работы без блокировок
         self.conn.execute("PRAGMA journal_mode=WAL") 
         self.conn.execute("PRAGMA synchronous=NORMAL")
-        # Выделяем 256 МБ ОЗУ под кэш SQLite (по умолчанию там смешные крохи)
         self.conn.execute("PRAGMA cache_size=-262144") 
-        # Разрешаем проецировать базу в оперативную память (до 2 ГБ)
         self.conn.execute("PRAGMA mmap_size=2147483648") 
         self.conn.execute("PRAGMA temp_store=MEMORY")
 
+        self._migrate_if_needed()
         self._init_tables()
 
     def _init_tables(self):
         c = self.conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS emb_cache (model TEXT, path TEXT, features BLOB, PRIMARY KEY (model, path))''')
-        c.execute('''CREATE TABLE IF NOT EXISTS rerank_cache_v2 (model TEXT, query TEXT, path TEXT, score REAL, PRIMARY KEY (model, query, path))''')
-        c.execute('''CREATE TABLE IF NOT EXISTS aes_cache (model TEXT, path TEXT, avg_score REAL, max_score REAL, PRIMARY KEY (model, path))''')
-        c.execute('''CREATE TABLE IF NOT EXISTS sim_cache (model TEXT, query TEXT, path TEXT, score REAL, PRIMARY KEY (model, query, path))''')
-        c.execute('''CREATE TABLE IF NOT EXISTS nsfw_cache (model TEXT, path TEXT, top_label TEXT, danger_score REAL, details TEXT, PRIMARY KEY (model, path))''')
-        c.execute('''CREATE TABLE IF NOT EXISTS face_cache (path TEXT, face_idx INTEGER, embedding BLOB, PRIMARY KEY (path, face_idx))''')
+        c.execute('''CREATE TABLE IF NOT EXISTS files (hash TEXT, path TEXT, size_mb REAL, width INTEGER, height INTEGER, PRIMARY KEY (hash, path))''')
+        c.execute('''CREATE TABLE IF NOT EXISTS emb_cache (model TEXT, hash TEXT, features BLOB, PRIMARY KEY (model, hash))''')
+        c.execute('''CREATE TABLE IF NOT EXISTS rerank_cache_v2 (model TEXT, query TEXT, hash TEXT, score REAL, PRIMARY KEY (model, query, hash))''')
+        c.execute('''CREATE TABLE IF NOT EXISTS aes_cache (model TEXT, hash TEXT, avg_score REAL, max_score REAL, PRIMARY KEY (model, hash))''')
+        c.execute('''CREATE TABLE IF NOT EXISTS sim_cache (model TEXT, query TEXT, hash TEXT, score REAL, PRIMARY KEY (model, query, hash))''')
+        c.execute('''CREATE TABLE IF NOT EXISTS nsfw_cache (model TEXT, hash TEXT, top_label TEXT, danger_score REAL, details TEXT, PRIMARY KEY (model, hash))''')
+        c.execute('''CREATE TABLE IF NOT EXISTS face_cache (hash TEXT, face_idx INTEGER, embedding BLOB, PRIMARY KEY (hash, face_idx))''')
+        c.execute('''CREATE TABLE IF NOT EXISTS tags_cache (model TEXT, hash TEXT, tags TEXT, PRIMARY KEY (model, hash))''')
         
-        c.execute('''CREATE TABLE IF NOT EXISTS tags_cache (model TEXT, path TEXT, tags TEXT, PRIMARY KEY (model, path))''')
-        
-        c.execute('CREATE INDEX IF NOT EXISTS idx_nsfw_path ON nsfw_cache(path)')
-        c.execute('CREATE INDEX IF NOT EXISTS idx_emb_path ON emb_cache(path)')
-        c.execute('CREATE INDEX IF NOT EXISTS idx_face_path ON face_cache(path)')
-        c.execute('CREATE INDEX IF NOT EXISTS idx_tags_path ON tags_cache(path)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_files_path ON files(path)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_nsfw_hash ON nsfw_cache(hash)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_emb_hash ON emb_cache(hash)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_face_hash ON face_cache(hash)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_tags_hash ON tags_cache(hash)')
         self.conn.commit()
 
-    # --- Danbooru Tags ---
-    def get_tags(self, model_name, path):
+    def _migrate_if_needed(self):
         c = self.conn.cursor()
-        c.execute("SELECT tags FROM tags_cache WHERE model=? AND path=?", (model_name, path))
+        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='emb_cache'")
+        if c.fetchone():
+            c.execute("PRAGMA table_info(emb_cache)")
+            cols = [row[1] for row in c.fetchall()]
+            if 'path' in cols:
+                print("🚀 ВНИМАНИЕ: Найдена старая структура БД! Запускаем авто-миграцию на хеши (ЭТАП 1). Это займет некоторое время...")
+                tables_to_migrate =['emb_cache', 'rerank_cache_v2', 'aes_cache', 'sim_cache', 'nsfw_cache', 'face_cache', 'tags_cache']
+                for t in tables_to_migrate:
+                    try:
+                        c.execute(f"ALTER TABLE {t} RENAME TO old_{t}")
+                    except Exception: pass
+                self.conn.commit()
+                self._init_tables()
+                self._run_migration()
+
+    def _run_migration(self):
+        c = self.conn.cursor()
+        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'old_%'")
+        old_tables = [r[0] for r in c.fetchall()]
+        
+        unique_paths = set()
+        for t in old_tables:
+            try:
+                c.execute(f"SELECT DISTINCT path FROM {t}")
+                for row in c.fetchall(): unique_paths.add(row[0])
+            except Exception: pass
+        
+        print(f"📦 Найдено {len(unique_paths)} уникальных файлов в старом кэше. Хешируем...")
+        path_to_hash = {}
+        insert_files =[]
+        
+        for i, p in enumerate(unique_paths):
+            if i > 0 and i % 500 == 0: print(f"⏳ Хеширование для миграции: {i}/{len(unique_paths)}")
+            if os.path.exists(p):
+                h = get_fast_hash(p)
+                path_to_hash[p] = h
+                try: size_mb = os.path.getsize(p) / (1024*1024)
+                except: size_mb = 0.0
+                insert_files.append((h, p, size_mb, None, None))
+        
+        if insert_files:
+            c.executemany("INSERT OR IGNORE INTO files (hash, path, size_mb, width, height) VALUES (?, ?, ?, ?, ?)", insert_files)
+        
+        print("🔄 Перенос данных ИИ в новые таблицы...")
+        try:
+            c.execute("SELECT model, path, features FROM old_emb_cache")
+            c.executemany("INSERT OR IGNORE INTO emb_cache (model, hash, features) VALUES (?, ?, ?)", [(r[0], path_to_hash[r[1]], r[2]) for r in c.fetchall() if r[1] in path_to_hash])
+            
+            c.execute("SELECT model, path, avg_score, max_score FROM old_aes_cache")
+            c.executemany("INSERT OR IGNORE INTO aes_cache (model, hash, avg_score, max_score) VALUES (?, ?, ?, ?)", [(r[0], path_to_hash[r[1]], r[2], r[3]) for r in c.fetchall() if r[1] in path_to_hash])
+            
+            c.execute("SELECT model, path, top_label, danger_score, details FROM old_nsfw_cache")
+            c.executemany("INSERT OR IGNORE INTO nsfw_cache (model, hash, top_label, danger_score, details) VALUES (?, ?, ?, ?, ?)", [(r[0], path_to_hash[r[1]], r[2], r[3], r[4]) for r in c.fetchall() if r[1] in path_to_hash])
+            
+            c.execute("SELECT path, face_idx, embedding FROM old_face_cache")
+            c.executemany("INSERT OR IGNORE INTO face_cache (hash, face_idx, embedding) VALUES (?, ?, ?)", [(path_to_hash[r[0]], r[1], r[2]) for r in c.fetchall() if r[0] in path_to_hash])
+            
+            c.execute("SELECT model, path, tags FROM old_tags_cache")
+            c.executemany("INSERT OR IGNORE INTO tags_cache (model, hash, tags) VALUES (?, ?, ?)",[(r[0], path_to_hash[r[1]], r[2]) for r in c.fetchall() if r[1] in path_to_hash])
+        except Exception as e: print(f"⚠️ Ошибка миграции некоторых таблиц: {e}")
+
+        for t in old_tables: c.execute(f"DROP TABLE {t}")
+            
+        self.conn.commit()
+        self.conn.execute("VACUUM")
+        print("✅ База данных успешно обновлена до версии с HASH ключами!")
+
+    def get_or_create_hashes(self, paths):
+        """Возвращает словарь {path: hash}. Автоматически хеширует новые файлы."""
+        c = self.conn.cursor()
+        result = {}
+        chunk_size = 900
+        for i in range(0, len(paths), chunk_size):
+            chunk = paths[i:i+chunk_size]
+            ph = ','.join(['?'] * len(chunk))
+            c.execute(f"SELECT path, hash FROM files WHERE path IN ({ph})", chunk)
+            for row in c.fetchall():
+                result[row[0]] = row[1]
+                
+        insert_data =[]
+        for p in paths:
+            if p not in result and os.path.exists(p):
+                h = get_fast_hash(p)
+                result[p] = h
+                try: size_mb = os.path.getsize(p) / (1024 * 1024)
+                except: size_mb = 0.0
+                insert_data.append((h, p, size_mb, None, None))
+                
+        if insert_data:
+            c.executemany("INSERT OR IGNORE INTO files (hash, path, size_mb, width, height) VALUES (?, ?, ?, ?, ?)", insert_data)
+            self.conn.commit()
+        return result
+
+    def get_hash_by_path(self, path):
+        c = self.conn.cursor()
+        c.execute("SELECT hash FROM files WHERE path=?", (path,))
+        res = c.fetchone()
+        return res[0] if res else None
+
+    # --- Danbooru Tags ---
+    def get_tags(self, model_name, file_hash):
+        c = self.conn.cursor()
+        c.execute("SELECT tags FROM tags_cache WHERE model=? AND hash=?", (model_name, file_hash))
         row = c.fetchone()
         return json.loads(row[0]) if row and row[0] else None
 
-    def save_tags(self, model_name, path, tags_dict):
+    def save_tags(self, model_name, file_hash, tags_dict):
         c = self.conn.cursor()
-        c.execute("INSERT OR REPLACE INTO tags_cache (model, path, tags) VALUES (?, ?, ?)", 
-                  (model_name, path, json.dumps(tags_dict)))
+        c.execute("INSERT OR REPLACE INTO tags_cache (model, hash, tags) VALUES (?, ?, ?)", (model_name, file_hash, json.dumps(tags_dict)))
         self.conn.commit()
 
     def save_tags_batch(self, batch_data):
         if not batch_data: return
         c = self.conn.cursor()
-        data =[(m, p, json.dumps(t)) for m, p, t in batch_data]
-        c.executemany("INSERT OR REPLACE INTO tags_cache (model, path, tags) VALUES (?, ?, ?)", data)
+        c.executemany("INSERT OR REPLACE INTO tags_cache (model, hash, tags) VALUES (?, ?, ?)",[(m, h, json.dumps(t)) for m, h, t in batch_data])
         self.conn.commit()
 
     # --- Face ---
-    def get_face_embeddings(self, path):
+    def get_face_embeddings(self, file_hash):
         c = self.conn.cursor()
-        c.execute("SELECT embedding FROM face_cache WHERE path=?", (path,))
+        c.execute("SELECT embedding FROM face_cache WHERE hash=?", (file_hash,))
         rows = c.fetchall()
         if not rows: return None
-        embs =[]
-        for r in rows:
-            if len(r[0]) > 0:
-                embs.append(np.frombuffer(r[0], dtype=np.float32))
-        return embs
-
-    def save_face_embeddings(self, path, embeddings):
-        c = self.conn.cursor()
-        c.execute("DELETE FROM face_cache WHERE path=?", (path,))
-        if not embeddings:
-            c.execute("INSERT INTO face_cache (path, face_idx, embedding) VALUES (?, ?, ?)", (path, -1, b''))
-        else:
-            data =[(path, i, emb.tobytes()) for i, emb in enumerate(embeddings)]
-            c.executemany("INSERT INTO face_cache (path, face_idx, embedding) VALUES (?, ?, ?)", data)
-        self.conn.commit()
+        return [np.frombuffer(r[0], dtype=np.float32) for r in rows if len(r[0]) > 0]
 
     def save_face_embeddings_batch(self, batch_data):
-        """Пакетное сохранение для логического батчинга InsightFace (ускорение SQLite)"""
         if not batch_data: return
         c = self.conn.cursor()
-        
-        # 1. Удаляем старые записи для всего батча разом
-        paths = [(item[0],) for item in batch_data]
-        c.executemany("DELETE FROM face_cache WHERE path=?", paths)
-        
-        # 2. Подготавливаем новые векторы
+        hashes = [(item[0],) for item in batch_data]
+        c.executemany("DELETE FROM face_cache WHERE hash=?", hashes)
         insert_data =[]
-        for path, embs in batch_data:
-            if not embs:
-                insert_data.append((path, -1, b''))
+        for h, embs in batch_data:
+            if not embs: insert_data.append((h, -1, b''))
             else:
-                for i, emb in enumerate(embs):
-                    insert_data.append((path, i, emb.tobytes()))
-                    
-        # 3. Сохраняем всё одним запросом
-        c.executemany("INSERT INTO face_cache (path, face_idx, embedding) VALUES (?, ?, ?)", insert_data)
+                for i, emb in enumerate(embs): insert_data.append((h, i, emb.tobytes()))
+        c.executemany("INSERT INTO face_cache (hash, face_idx, embedding) VALUES (?, ?, ?)", insert_data)
         self.conn.commit()
 
     # --- NSFW ---
-    def get_nsfw_score(self, model_name, path):
+    def get_nsfw_score(self, model_name, file_hash):
         c = self.conn.cursor()
-        c.execute("SELECT top_label, danger_score, details FROM nsfw_cache WHERE model=? AND path=?", (model_name, path))
+        c.execute("SELECT top_label, danger_score, details FROM nsfw_cache WHERE model=? AND hash=?", (model_name, file_hash))
         return c.fetchone()
 
-    def save_nsfw_score(self, model_name, path, top_label, danger_score, details):
+    def save_nsfw_score(self, model_name, file_hash, top_label, danger_score, details):
         c = self.conn.cursor()
-        c.execute("INSERT OR REPLACE INTO nsfw_cache (model, path, top_label, danger_score, details) VALUES (?, ?, ?, ?, ?)", 
-                  (model_name, path, top_label, danger_score, json.dumps(details)))
+        c.execute("INSERT OR REPLACE INTO nsfw_cache (model, hash, top_label, danger_score, details) VALUES (?, ?, ?, ?, ?)", (model_name, file_hash, top_label, danger_score, json.dumps(details)))
         self.conn.commit()
 
     # --- Общие ---
     def get_query_sims(self, model_name, query):
         c = self.conn.cursor()
-        c.execute("SELECT path, score FROM sim_cache WHERE model=? AND query=?", (model_name, query))
+        c.execute("SELECT hash, score FROM sim_cache WHERE model=? AND query=?", (model_name, query))
         return {row[0]: row[1] for row in c.fetchall()}
 
-    def save_query_sims(self, model_name, query, paths, scores):
+    def save_query_sims(self, model_name, query, hashes, scores):
         c = self.conn.cursor()
-        data =[(model_name, query, p, s) for p, s in zip(paths, scores)]
-        c.executemany("INSERT OR REPLACE INTO sim_cache (model, query, path, score) VALUES (?, ?, ?, ?)", data)
+        data =[(model_name, query, h, s) for h, s in zip(hashes, scores)]
+        c.executemany("INSERT OR REPLACE INTO sim_cache (model, query, hash, score) VALUES (?, ?, ?, ?)", data)
         self.conn.commit()
 
-    def get_aesthetic_score(self, model_name, path):
+    def get_aesthetic_score(self, model_name, file_hash):
         c = self.conn.cursor()
-        c.execute("SELECT avg_score, max_score FROM aes_cache WHERE model=? AND path=?", (model_name, path))
+        c.execute("SELECT avg_score, max_score FROM aes_cache WHERE model=? AND hash=?", (model_name, file_hash))
         return c.fetchone()
 
-    def save_aesthetic_score(self, model_name, path, avg_score, max_score):
+    def save_aesthetic_score(self, model_name, file_hash, avg_score, max_score):
         c = self.conn.cursor()
-        c.execute("INSERT OR REPLACE INTO aes_cache (model, path, avg_score, max_score) VALUES (?, ?, ?, ?)", 
-                  (model_name, path, avg_score, max_score))
+        c.execute("INSERT OR REPLACE INTO aes_cache (model, hash, avg_score, max_score) VALUES (?, ?, ?, ?)", (model_name, file_hash, avg_score, max_score))
         self.conn.commit()
 
-    def get_image_features(self, model_name, path):
+    def get_image_features(self, model_name, file_hash):
         c = self.conn.cursor()
-        c.execute("SELECT features FROM emb_cache WHERE model=? AND path=?", (model_name, path))
+        c.execute("SELECT features FROM emb_cache WHERE model=? AND hash=?", (model_name, file_hash))
         result = c.fetchone()
-        if result is not None:
-            return torch.load(io.BytesIO(result[0]), weights_only=False)
+        if result is not None: return torch.load(io.BytesIO(result[0]), weights_only=False)
         return None
 
-    def save_image_features(self, model_name, path, features):
+    def save_image_features(self, model_name, file_hash, features):
         c = self.conn.cursor()
         features_bytes = io.BytesIO()
         torch.save(features, features_bytes)
-        c.execute("INSERT OR REPLACE INTO emb_cache (model, path, features) VALUES (?, ?, ?)", 
-                  (model_name, path, features_bytes.getvalue()))
+        c.execute("INSERT OR REPLACE INTO emb_cache (model, hash, features) VALUES (?, ?, ?)", (model_name, file_hash, features_bytes.getvalue()))
         self.conn.commit()
 
-    def get_rerank_score(self, model_name, query, path):
+    def get_rerank_score(self, model_name, query, file_hash):
         c = self.conn.cursor()
-        c.execute("SELECT score FROM rerank_cache_v2 WHERE model=? AND query=? AND path=?", (model_name, query, path))
+        c.execute("SELECT score FROM rerank_cache_v2 WHERE model=? AND query=? AND hash=?", (model_name, query, file_hash))
         result = c.fetchone()
         return result[0] if result is not None else None
 
-    def save_rerank_score(self, model_name, query, path, score):
+    def save_rerank_score(self, model_name, query, file_hash, score):
         c = self.conn.cursor()
-        c.execute("INSERT OR REPLACE INTO rerank_cache_v2 (model, query, path, score) VALUES (?, ?, ?, ?)", 
-                  (model_name, query, path, score))
+        c.execute("INSERT OR REPLACE INTO rerank_cache_v2 (model, query, hash, score) VALUES (?, ?, ?, ?)", (model_name, query, file_hash, score))
         self.conn.commit()
 
     def get_max_danger_score(self, path):
+        h = self.get_hash_by_path(path)
+        if not h: return -1.0
         c = self.conn.cursor()
-        # Ищем файл в кэше любых NSFW-моделей и берем максимальную оценку опасности
-        c.execute("SELECT MAX(danger_score) FROM nsfw_cache WHERE path=?", (path,))
+        c.execute("SELECT MAX(danger_score) FROM nsfw_cache WHERE hash=?", (h,))
         res = c.fetchone()
-        return res[0] if res and res[0] is not None else -1.0  # -1.0 означает, что файла нет в базе
+        return res[0] if res and res[0] is not None else -1.0
 
     def get_all_models(self):
         c = self.conn.cursor()
@@ -326,52 +418,40 @@ class DatabaseCache:
                 c.execute(f"SELECT DISTINCT model FROM {table}")
                 models.update([r[0] for r in c.fetchall() if r[0]])
             except: pass
-            
-        # Искусственно добавляем пункт для лиц, если в кэше лиц есть хотя бы одна запись
         try:
             c.execute("SELECT 1 FROM face_cache LIMIT 1")
-            if c.fetchone() is not None:
-                models.add("InsightFace (Лица)")
+            if c.fetchone() is not None: models.add("InsightFace (Лица)")
         except: pass
-        
         return list(models)
 
     def clear_model_cache(self, model_name=None):
         c = self.conn.cursor()
         tables =['emb_cache', 'rerank_cache_v2', 'aes_cache', 'sim_cache', 'nsfw_cache', 'face_cache', 'tags_cache']
         if model_name:
-            if model_name == "InsightFace (Лица)":
-                c.execute("DELETE FROM face_cache")
+            if model_name == "InsightFace (Лица)": c.execute("DELETE FROM face_cache")
             else:
                 for table in tables:
                     if table == 'face_cache': continue 
                     c.execute(f"DELETE FROM {table} WHERE model=?", (model_name,))
         else:
-            for table in tables:
-                c.execute(f"DELETE FROM {table}")
+            for table in tables: c.execute(f"DELETE FROM {table}")
+            c.execute("DELETE FROM files")
         self.conn.commit()
         self.conn.execute("VACUUM")
 
     def get_all_paths(self):
         c = self.conn.cursor()
-        paths = set()
-        for table in['emb_cache', 'aes_cache', 'nsfw_cache', 'face_cache', 'tags_cache']:
-            try:
-                c.execute(f"SELECT DISTINCT path FROM {table}")
-                paths.update([r[0] for r in c.fetchall() if r[0]])
-            except: pass
-        return list(paths)
+        c.execute("SELECT DISTINCT path FROM files")
+        return [r[0] for r in c.fetchall() if r[0]]
 
     def remove_paths(self, paths_to_remove):
         if not paths_to_remove: return
         c = self.conn.cursor()
-        tables =['emb_cache', 'rerank_cache_v2', 'aes_cache', 'sim_cache', 'nsfw_cache', 'face_cache', 'tags_cache']
         chunk_size = 900
         for i in range(0, len(paths_to_remove), chunk_size):
             chunk = paths_to_remove[i:i+chunk_size]
             placeholders = ','.join(['?'] * len(chunk))
-            for table in tables:
-                c.execute(f"DELETE FROM {table} WHERE path IN ({placeholders})", chunk)
+            c.execute(f"DELETE FROM files WHERE path IN ({placeholders})", chunk)
         self.conn.commit()
 
     def close(self): self.conn.close()
@@ -581,24 +661,23 @@ class SearchEngine:
         return raw_query, raw_query
 
     def build_cache(self, dir_path, emb_model_name, batch_size, allowed_exts, override_files=None):
-        """ Метод для предкэширования всех медиа-файлов в папке (без выполнения поиска) """
         self.cancel_flag = False
-        files_list = self._gather_files(dir_path, allowed_exts) if override_files is None else[f for f in override_files if f.lower().endswith(allowed_exts)]
+        files_list = self._gather_files(dir_path, allowed_exts) if override_files is None else [f for f in override_files if f.lower().endswith(allowed_exts)]
         cache_key = emb_model_name if self.emb_size == 512 else f"{emb_model_name}_{self.emb_size}"
         
+        path_to_hash = self.db_cache.get_or_create_hashes(files_list)
         paths_to_compute =[]
-        for i, fp in enumerate(files_list):
+        for fp in files_list:
             if self.cancel_flag: break
-            if self.db_cache.get_image_features(cache_key, fp) is None:
+            h = path_to_hash.get(fp)
+            if h and self.db_cache.get_image_features(cache_key, h) is None:
                 paths_to_compute.append(fp)
                 
         if not paths_to_compute or self.cancel_flag:
             self.log("Кэш эмбеддингов полностью актуален.")
             return
 
-        # LAZY LOADING: Загружаем модель только если есть новые файлы для обработки
         model = self._get_embedding_model(emb_model_name)
-
         self.log(f"Кэширование поиска: обработка {len(paths_to_compute)} новых файлов...")
         processed_count, total = 0, len(paths_to_compute)
         preload_chunk = max(64, batch_size * 4) 
@@ -608,7 +687,6 @@ class SearchEngine:
                 if self.cancel_flag: break
                 chunk_paths = paths_to_compute[i:i + preload_chunk]
                 futures = {executor.submit(self._load_and_prep_file, p, 'embedding'): p for p in chunk_paths}
-                
                 buckets = defaultdict(list)
                 for fut in concurrent.futures.as_completed(futures):
                     path = futures[fut]
@@ -617,21 +695,20 @@ class SearchEngine:
                 
                 for size_key, items in buckets.items():
                     if self.cancel_flag: break
-                    c_paths, c_docs = [],[]
-                    c_weight = 0
+                    c_paths, c_docs, c_weight = [],[], 0
                     
                     for path, doc, weight in items:
                         if c_weight + weight > batch_size and len(c_docs) > 0:
                             try:
                                 feats_batch = model.encode(c_docs, batch_size=len(c_docs), convert_to_tensor=True).cpu()
                                 for p, feats in zip(c_paths, feats_batch):
-                                    self.db_cache.save_image_features(cache_key, p, feats)
+                                    h = path_to_hash.get(p)
+                                    if h: self.db_cache.save_image_features(cache_key, h, feats)
                             except Exception as e: self.log(f"Ошибка батча эмбеддингов: {e}")
                             
                             processed_count += len(c_paths)
                             self.progress(processed_count / total, f"Кэш эмбеддингов ({processed_count}/{total})...")
-                            c_paths, c_docs = [],[]
-                            c_weight = 0
+                            c_paths, c_docs, c_weight = [],[], 0
                             
                         c_paths.append(path)
                         c_docs.append(doc)
@@ -641,7 +718,8 @@ class SearchEngine:
                         try:
                             feats_batch = model.encode(c_docs, batch_size=len(c_docs), convert_to_tensor=True).cpu()
                             for p, feats in zip(c_paths, feats_batch):
-                                self.db_cache.save_image_features(cache_key, p, feats)
+                                h = path_to_hash.get(p)
+                                if h: self.db_cache.save_image_features(cache_key, h, feats)
                         except Exception as e: self.log(f"Ошибка батча эмбеддингов: {e}")
                             
                         processed_count += len(c_paths)
@@ -653,16 +731,19 @@ class SearchEngine:
         
         results_phase1 =[]
         cache_key = emb_model_name if self.emb_size == 512 else f"{emb_model_name}_{self.emb_size}"
-        cached_sims = self.db_cache.get_query_sims(cache_key, raw_query)
+        cached_sims_hashes = self.db_cache.get_query_sims(cache_key, raw_query)
+        path_to_hash = self.db_cache.get_or_create_hashes(files_list)
         
         self.log(f"Фильтрация {len(files_list)} файлов через кэш...")
-        paths_needing_sims =[]
-        paths_needing_features =[]
+        paths_needing_sims, paths_needing_features = [],[]
         
         for i, file_path in enumerate(files_list):
             if self.cancel_flag: break
-            if file_path in cached_sims:
-                results_phase1.append((cached_sims[file_path], file_path))
+            h = path_to_hash.get(file_path)
+            if not h: continue
+            
+            if h in cached_sims_hashes:
+                results_phase1.append((cached_sims_hashes[h], file_path))
             else:
                 paths_needing_sims.append(file_path)
                 
@@ -670,45 +751,38 @@ class SearchEngine:
                 prog = 0.1 * (i / max(1, len(files_list)))
                 self.progress(prog, f"Чтение кэша ({i}/{len(files_list)})...")
                 
-        # ⚡ Если все результаты уже в кэше — возвращаем мгновенно, не трогая VRAM!
         if not paths_needing_sims or self.cancel_flag:
             self.log("⚡ Запрос полностью закэширован! Обход загрузки модели.")
             results_phase1.sort(key=lambda x: x[0], reverse=True)
             self.progress(0.8, "Поиск завершен.") 
             return results_phase1[:top_k]
 
-        # Иначе загружаем модель для создания вектора (эмбеддинга) запроса
         model = self._get_embedding_model(emb_model_name)
         self.log("Конвертация запроса в эмбеддинг...")
         query_emb = model.encode(query_input, convert_to_tensor=True).cpu()
 
-        # Проверяем, есть ли уже фичи картинок для тех файлов, где нет симиларов
-        sims_to_save_paths = []
-        sims_to_save_scores =[]
+        sims_to_save_hashes, sims_to_save_scores = [],[]
         
         for file_path in paths_needing_sims:
             if self.cancel_flag: break
-            features = self.db_cache.get_image_features(cache_key, file_path)
+            h = path_to_hash.get(file_path)
+            features = self.db_cache.get_image_features(cache_key, h)
             if features is not None:
                 sim = float(util.cos_sim(query_emb, features).item())
                 results_phase1.append((sim, file_path))
-                
-                # Собираем данные в списки вместо сохранения по одному
-                sims_to_save_paths.append(file_path)
+                sims_to_save_hashes.append(h)
                 sims_to_save_scores.append(sim)
             else: 
                 paths_needing_features.append(file_path)
 
-        # Сохраняем все вычисленные симилары ОДНИМ запросом к диску (ускорение в 100+ раз)
-        if sims_to_save_paths and not self.cancel_flag:
-            self.db_cache.save_query_sims(cache_key, raw_query, sims_to_save_paths, sims_to_save_scores)
+        if sims_to_save_hashes and not self.cancel_flag:
+            self.db_cache.save_query_sims(cache_key, raw_query, sims_to_save_hashes, sims_to_save_scores)
 
         if not paths_needing_features or self.cancel_flag:
             results_phase1.sort(key=lambda x: x[0], reverse=True)
             self.progress(0.8, "Поиск завершен.") 
             return results_phase1[:top_k]
 
-        # Если дошли сюда, значит есть файлы, для которых нужно инференсить фичи
         self.log(f"ИИ обработка новых файлов: {len(paths_needing_features)} шт...")
         processed_count, total = 0, len(paths_needing_features)
         preload_chunk = max(64, batch_size * 4) 
@@ -718,38 +792,40 @@ class SearchEngine:
                 if self.cancel_flag: break
                 chunk_paths = paths_needing_features[i:i + preload_chunk]
                 futures = {executor.submit(self._load_and_prep_file, p, 'embedding'): p for p in chunk_paths}
-                
                 buckets = defaultdict(list)
+                
                 for fut in concurrent.futures.as_completed(futures):
                     path = futures[fut]
                     doc, size_key, weight = fut.result()
                     if doc is not None: 
                         buckets[size_key].append((path, doc, weight))
                     else:
-                        self.db_cache.save_query_sims(cache_key, raw_query, [path], [0.0])
+                        h = path_to_hash.get(path)
+                        if h: self.db_cache.save_query_sims(cache_key, raw_query, [h], [0.0])
                 
                 for size_key, items in buckets.items():
                     if self.cancel_flag: break
-                    c_paths, c_docs = [],[]
-                    c_weight = 0
+                    c_paths, c_docs, c_weight = [],[], 0
                     
                     for path, doc, weight in items:
                         if c_weight + weight > batch_size and len(c_docs) > 0:
                             try:
                                 feats_batch = model.encode(c_docs, batch_size=len(c_docs), convert_to_tensor=True).cpu()
-                                sims_to_save =[]
+                                sims_to_save, c_hashes = [],[]
                                 for p, feats in zip(c_paths, feats_batch):
-                                    self.db_cache.save_image_features(cache_key, p, feats)
-                                    sim = float(util.cos_sim(query_emb, feats).item())
-                                    sims_to_save.append(sim)
-                                    results_phase1.append((sim, p))
-                                self.db_cache.save_query_sims(cache_key, raw_query, c_paths, sims_to_save)
+                                    h = path_to_hash.get(p)
+                                    if h:
+                                        self.db_cache.save_image_features(cache_key, h, feats)
+                                        sim = float(util.cos_sim(query_emb, feats).item())
+                                        sims_to_save.append(sim)
+                                        c_hashes.append(h)
+                                        results_phase1.append((sim, p))
+                                self.db_cache.save_query_sims(cache_key, raw_query, c_hashes, sims_to_save)
                             except Exception as e: self.log(f"Ошибка батча: {e}")
                             
                             processed_count += len(c_paths)
                             self.progress(0.1 + 0.7 * (processed_count / total), f"Инференс ({processed_count}/{total})...")
-                            c_paths, c_docs = [],[]
-                            c_weight = 0
+                            c_paths, c_docs, c_weight = [],[], 0
                             
                         c_paths.append(path)
                         c_docs.append(doc)
@@ -758,13 +834,16 @@ class SearchEngine:
                     if len(c_docs) > 0 and not self.cancel_flag:
                         try:
                             feats_batch = model.encode(c_docs, batch_size=len(c_docs), convert_to_tensor=True).cpu()
-                            sims_to_save =[]
+                            sims_to_save, c_hashes = [],[]
                             for p, feats in zip(c_paths, feats_batch):
-                                self.db_cache.save_image_features(cache_key, p, feats)
-                                sim = float(util.cos_sim(query_emb, feats).item())
-                                sims_to_save.append(sim)
-                                results_phase1.append((sim, p))
-                            self.db_cache.save_query_sims(cache_key, raw_query, c_paths, sims_to_save)
+                                h = path_to_hash.get(p)
+                                if h:
+                                    self.db_cache.save_image_features(cache_key, h, feats)
+                                    sim = float(util.cos_sim(query_emb, feats).item())
+                                    sims_to_save.append(sim)
+                                    c_hashes.append(h)
+                                    results_phase1.append((sim, p))
+                            self.db_cache.save_query_sims(cache_key, raw_query, c_hashes, sims_to_save)
                         except Exception as e: self.log(f"Ошибка батча (остаток): {e}")
                             
                         processed_count += len(c_paths)
@@ -777,11 +856,15 @@ class SearchEngine:
         if not top_candidates or self.cancel_flag: return top_candidates
         cache_key = rerank_model_name if self.rerank_size == 800 else f"{rerank_model_name}_{self.rerank_size}"
         
+        path_to_hash = self.db_cache.get_or_create_hashes([fp for _, fp in top_candidates])
         final_results =[]
-        docs_to_compute, paths_to_compute =[],[]
+        docs_to_compute, paths_to_compute = [],[]
+        
         for i, (score, fp) in enumerate(top_candidates):
             if self.cancel_flag: break
-            cached_score = self.db_cache.get_rerank_score(cache_key, raw_query, fp)
+            h = path_to_hash.get(fp)
+            cached_score = self.db_cache.get_rerank_score(cache_key, raw_query, h) if h else None
+            
             if cached_score is not None:
                 if cached_score >= min_score: final_results.append((cached_score, fp))
             else:
@@ -791,16 +874,15 @@ class SearchEngine:
                     paths_to_compute.append(fp)
                     
         if docs_to_compute and not self.cancel_flag:
-            self._unload_embedding_model() # LAZY UNLOAD: освобождаем память только если нужен Reranker
+            self._unload_embedding_model()
             self.log(f"Reranker: глубокая обработка {len(docs_to_compute)} кандидатов...")
             kwargs = dict(self.model_kwargs)
             kwargs = self._apply_quantization(kwargs)
-            
             local_path = self._download_model(rerank_model_name)
             reranker = CrossEncoder(local_path, device=self.device, model_kwargs=kwargs, trust_remote_code=True)
+            
             chunk_size = 4
             processed, len_total = 0, len(docs_to_compute)
-            
             for i in range(0, len_total, chunk_size):
                 if self.cancel_flag: break
                 c_docs, c_paths = docs_to_compute[i:i+chunk_size], paths_to_compute[i:i+chunk_size]
@@ -808,7 +890,8 @@ class SearchEngine:
                 for rank in rankings:
                     s = float(rank['score'])
                     fp = c_paths[rank['corpus_id']]
-                    self.db_cache.save_rerank_score(cache_key, raw_query, fp, s)
+                    h = path_to_hash.get(fp)
+                    if h: self.db_cache.save_rerank_score(cache_key, raw_query, h, s)
                     if s >= min_score: final_results.append((s, fp))
                     
                 processed += len(c_docs)
@@ -898,6 +981,8 @@ class AestheticEngine:
 
     def evaluate_media(self, directory_path, allowed_exts, override_files=None):
         all_files = self.se._gather_files(directory_path, allowed_exts) if override_files is None else[f for f in override_files if f.lower().endswith(allowed_exts)]
+        path_to_hash = self.db_cache.get_or_create_hashes(all_files)
+        
         image_paths =[p for p in all_files if p.lower().endswith(SUPPORTED_IMAGES)]
         video_paths =[p for p in all_files if p.lower().endswith(SUPPORTED_VIDEOS)]
         
@@ -906,67 +991,63 @@ class AestheticEngine:
         cache_key_img = "v2_5_siglip"
         cache_key_vid = "v2_5_siglip_vid_" + str(self.video_frames)
 
-        # Подготовка: фильтрация через кэш (LAZY LOADING)
-        images_to_process =[]
+        images_to_process, videos_to_process = [],[]
         for p in image_paths:
-            cached = self.db_cache.get_aesthetic_score(cache_key_img, p)
-            if cached is not None:
-                results.append((cached[0], p, cached[1]))
-            else:
-                images_to_process.append(p)
+            h = path_to_hash.get(p)
+            if not h: continue
+            cached = self.db_cache.get_aesthetic_score(cache_key_img, h)
+            if cached is not None: results.append((cached[0], p, cached[1]))
+            else: images_to_process.append(p)
                 
-        videos_to_process =[]
         for p in video_paths:
-            cached = self.db_cache.get_aesthetic_score(cache_key_vid, p)
-            if cached is not None:
-                results.append((cached[0], p, cached[1]))
-            else:
-                videos_to_process.append(p)
+            h = path_to_hash.get(p)
+            if not h: continue
+            cached = self.db_cache.get_aesthetic_score(cache_key_vid, h)
+            if cached is not None: results.append((cached[0], p, cached[1]))
+            else: videos_to_process.append(p)
                 
-        # Если все есть в базе, модель даже не грузим в VRAM
-        if images_to_process or videos_to_process:
-            self.load_model()
+        if images_to_process or videos_to_process: self.load_model()
         else:
             results.sort(key=lambda x: x[0], reverse=True)
             return results
 
         # --- ОБРАБОТКА ИЗОБРАЖЕНИЙ ---
-        batch_images, batch_paths =[],[]
+        batch_images, batch_paths = [],[]
         for i, img_path in enumerate(images_to_process):
             if not state.is_processing: break
             state.status_text = f"Подготовка фото: {Path(img_path).name} ({i+1}/{len(images_to_process)})"
+            h = path_to_hash.get(img_path)
             try:
                 image = media_cache.get_image(img_path, self.max_dim)
                 if image:
                     batch_images.append(image)
                     batch_paths.append(img_path)
                 else:
-                    self.db_cache.save_aesthetic_score(cache_key_img, img_path, 0.0, 0.0)
+                    if h: self.db_cache.save_aesthetic_score(cache_key_img, h, 0.0, 0.0)
                     results.append((0.0, img_path, 0.0))
             except Exception as e: 
-                state.add_log(f"Ошибка {img_path}: {e}")
-                self.db_cache.save_aesthetic_score(cache_key_img, img_path, 0.0, 0.0)
+                if h: self.db_cache.save_aesthetic_score(cache_key_img, h, 0.0, 0.0)
                 results.append((0.0, img_path, 0.0))
                 
             if len(batch_images) >= self.batch_size or (i == len(images_to_process) - 1 and batch_images):
                 state.progress = (i + 1) / max(1, len(images_to_process))
-                state.status_text = f"Инференс фото ({i+1}/{len(images_to_process)})..."
                 try:
                     pixel_values = self.preprocessor(images=batch_images, return_tensors="pt").pixel_values.to(self.dtype).to(self.device)
                     with torch.inference_mode():
                         logits = self.model(pixel_values).logits.flatten().float().cpu().tolist()
                     for score, p in zip(logits, batch_paths):
-                        self.db_cache.save_aesthetic_score(cache_key_img, p, score, score)
+                        h_val = path_to_hash.get(p)
+                        if h_val: self.db_cache.save_aesthetic_score(cache_key_img, h_val, score, score)
                         results.append((score, p, score))
                 except Exception as e: state.add_log(f"Ошибка инференса: {e}")
-                batch_images, batch_paths = [],[]
+                batch_images, batch_paths =[],[]
 
         # --- ОБРАБОТКА ВИДЕО ---
-        batch_images, batch_frame_counts, batch_paths =[], [],[]
+        batch_images, batch_frame_counts, batch_paths = [], [],[]
         for i, vid_path in enumerate(videos_to_process):
-            time.sleep(0.002)
             if not state.is_processing: break
             state.status_text = f"Подготовка видео: {Path(vid_path).name} ({i+1}/{len(videos_to_process)})"
+            h = path_to_hash.get(vid_path)
             try:
                 frames = media_cache.get_video_frames(vid_path, self.max_dim, self.video_frames)
                 if frames:
@@ -974,16 +1055,14 @@ class AestheticEngine:
                     batch_paths.append(vid_path)
                     batch_frame_counts.append(len(frames))
                 else:
-                    self.db_cache.save_aesthetic_score(cache_key_vid, vid_path, 0.0, 0.0)
+                    if h: self.db_cache.save_aesthetic_score(cache_key_vid, h, 0.0, 0.0)
                     results.append((0.0, vid_path, 0.0))
             except Exception as e: 
-                state.add_log(f"Ошибка чтения {vid_path}: {e}")
-                self.db_cache.save_aesthetic_score(cache_key_vid, vid_path, 0.0, 0.0)
+                if h: self.db_cache.save_aesthetic_score(cache_key_vid, h, 0.0, 0.0)
                 results.append((0.0, vid_path, 0.0))
                 
             if len(batch_images) >= self.batch_size or (i == len(videos_to_process) - 1 and batch_images):
                 state.progress = (i + 1) / max(1, len(videos_to_process))
-                state.status_text = f"Инференс видео ({i+1}/{len(videos_to_process)})..."
                 try:
                     all_scores =[]
                     for k in range(0, len(batch_images), self.batch_size):
@@ -1000,10 +1079,11 @@ class AestheticEngine:
                         if vid_scores:
                             avg_s = sum(vid_scores) / len(vid_scores)
                             max_s = max(vid_scores)
-                            self.db_cache.save_aesthetic_score(cache_key_vid, path, avg_s, max_s)
+                            h_val = path_to_hash.get(path)
+                            if h_val: self.db_cache.save_aesthetic_score(cache_key_vid, h_val, avg_s, max_s)
                             results.append((avg_s, path, max_s))
                 except Exception as e: state.add_log(f"Ошибка инференса: {e}")
-                batch_images, batch_frame_counts, batch_paths = [],[],[]
+                batch_images, batch_frame_counts, batch_paths = [], [],[]
 
         results.sort(key=lambda x: x[0], reverse=True)
         return results
@@ -1093,35 +1173,35 @@ class NsfwEngine:
 
     def evaluate_media(self, directory_path, model_name, allowed_exts, override_files=None):
         all_files = self.se._gather_files(directory_path, allowed_exts) if override_files is None else[f for f in override_files if f.lower().endswith(allowed_exts)]
-        image_paths =[p for p in all_files if p.lower().endswith(SUPPORTED_IMAGES)]
+        path_to_hash = self.db_cache.get_or_create_hashes(all_files)
+        
+        image_paths = [p for p in all_files if p.lower().endswith(SUPPORTED_IMAGES)]
         video_paths =[p for p in all_files if p.lower().endswith(SUPPORTED_VIDEOS)]
         
         state.add_log(f"Найдено для NSFW детектора: {len(image_paths)} изображений, {len(video_paths)} видео.")
         results =[]
         cache_key = f"{model_name}_{self.video_frames}"
 
-        # Подготовка: фильтрация через кэш (LAZY LOADING)
-        images_to_process =[]
+        images_to_process, videos_to_process = [],[]
         for p in image_paths:
-            cached = self.db_cache.get_nsfw_score(cache_key, p)
+            h = path_to_hash.get(p)
+            if not h: continue
+            cached = self.db_cache.get_nsfw_score(cache_key, h)
             if cached is not None:
                 details_dict = json.loads(cached[2]) if cached[2] else {}
                 results.append((cached[1], p, cached[0], details_dict))
-            else:
-                images_to_process.append(p)
+            else: images_to_process.append(p)
 
-        videos_to_process =[]
         for p in video_paths:
-            cached = self.db_cache.get_nsfw_score(cache_key, p)
+            h = path_to_hash.get(p)
+            if not h: continue
+            cached = self.db_cache.get_nsfw_score(cache_key, h)
             if cached is not None:
                 details_dict = json.loads(cached[2]) if cached[2] else {}
                 results.append((cached[1], p, cached[0], details_dict))
-            else:
-                videos_to_process.append(p)
+            else: videos_to_process.append(p)
                 
-        # Если все есть в базе, модель не грузим в VRAM
-        if images_to_process or videos_to_process:
-            self.load_model(model_name)
+        if images_to_process or videos_to_process: self.load_model(model_name)
         else:
             results.sort(key=lambda x: x[0], reverse=True)
             return results
@@ -1131,22 +1211,21 @@ class NsfwEngine:
         for i, img_path in enumerate(images_to_process):
             if not state.is_processing: break
             state.status_text = f"NSFW Фото: {Path(img_path).name} ({i+1}/{len(images_to_process)})"
+            h = path_to_hash.get(img_path)
             try:
                 image = media_cache.get_image(img_path, self.max_dim)
                 if image:
                     batch_images.append(image)
                     batch_paths.append(img_path)
                 else:
-                    self.db_cache.save_nsfw_score(cache_key, img_path, "error", 0.0, {"error": 1.0})
+                    if h: self.db_cache.save_nsfw_score(cache_key, h, "error", 0.0, {"error": 1.0})
                     results.append((0.0, img_path, "error", {"error": 1.0}))
             except Exception as e: 
-                state.add_log(f"Ошибка {img_path}: {e}")
-                self.db_cache.save_nsfw_score(cache_key, img_path, "error", 0.0, {"error": 1.0})
+                if h: self.db_cache.save_nsfw_score(cache_key, h, "error", 0.0, {"error": 1.0})
                 results.append((0.0, img_path, "error", {"error": 1.0}))
                 
             if len(batch_images) >= self.batch_size or (i == len(images_to_process) - 1 and batch_images):
                 state.progress = (i + 1) / max(1, len(images_to_process))
-                state.status_text = f"Инференс NSFW фото ({i+1}/{len(images_to_process)})..."
                 try:
                     inputs = self.processor(images=batch_images, return_tensors="pt")
                     inputs = {k: v.to(self.dtype).to(self.device) if v.is_floating_point() else v.to(self.device) for k, v in inputs.items()}
@@ -1156,22 +1235,21 @@ class NsfwEngine:
                     
                     for j, p in enumerate(batch_paths):
                         prob_dist = probs[j]
-                        top_idx = prob_dist.argmax(-1).item()
-                        top_label = self.model.config.id2label[top_idx]
+                        top_label = self.model.config.id2label[prob_dist.argmax(-1).item()]
                         details = {self.model.config.id2label[idx]: float(val) for idx, val in enumerate(prob_dist)}
                         danger = self.compute_danger(details)
-                        
-                        self.db_cache.save_nsfw_score(cache_key, p, top_label, danger, details)
+                        h_val = path_to_hash.get(p)
+                        if h_val: self.db_cache.save_nsfw_score(cache_key, h_val, top_label, danger, details)
                         results.append((danger, p, top_label, details))
                 except Exception as e: state.add_log(f"Ошибка инференса: {e}")
                 batch_images, batch_paths = [],[]
 
         # --- ВИДЕО ---
-        batch_images, batch_frame_counts, batch_paths =[], [],[]
+        batch_images, batch_frame_counts, batch_paths = [], [],[]
         for i, vid_path in enumerate(videos_to_process):
-            time.sleep(0.002)
             if not state.is_processing: break
             state.status_text = f"NSFW Видео: {Path(vid_path).name} ({i+1}/{len(videos_to_process)})"
+            h = path_to_hash.get(vid_path)
             try:
                 frames = media_cache.get_video_frames(vid_path, self.max_dim, self.video_frames)
                 if frames:
@@ -1179,16 +1257,14 @@ class NsfwEngine:
                     batch_paths.append(vid_path)
                     batch_frame_counts.append(len(frames))
                 else:
-                    self.db_cache.save_nsfw_score(cache_key, vid_path, "error", 0.0, {"error": 1.0})
+                    if h: self.db_cache.save_nsfw_score(cache_key, h, "error", 0.0, {"error": 1.0})
                     results.append((0.0, vid_path, "error", {"error": 1.0}))
             except Exception as e: 
-                state.add_log(f"Ошибка чтения {vid_path}: {e}")
-                self.db_cache.save_nsfw_score(cache_key, vid_path, "error", 0.0, {"error": 1.0})
+                if h: self.db_cache.save_nsfw_score(cache_key, h, "error", 0.0, {"error": 1.0})
                 results.append((0.0, vid_path, "error", {"error": 1.0}))
 
             if len(batch_images) >= self.batch_size or (i == len(videos_to_process) - 1 and batch_images):
                 state.progress = (i + 1) / max(1, len(videos_to_process))
-                state.status_text = f"Инференс NSFW видео ({i+1}/{len(videos_to_process)})..."
                 try:
                     all_probs =[]
                     for k in range(0, len(batch_images), self.batch_size):
@@ -1204,15 +1280,15 @@ class NsfwEngine:
                         vid_probs = torch.stack(all_probs[idx : idx + count])
                         idx += count
                         avg_probs = vid_probs.mean(dim=0)
-                        top_idx = avg_probs.argmax(-1).item()
-                        top_label = self.model.config.id2label[top_idx]
+                        top_label = self.model.config.id2label[avg_probs.argmax(-1).item()]
                         details = {self.model.config.id2label[k]: float(val) for k, val in enumerate(avg_probs)}
                         danger = self.compute_danger(details)
                         
-                        self.db_cache.save_nsfw_score(cache_key, p, top_label, danger, details)
+                        h_val = path_to_hash.get(p)
+                        if h_val: self.db_cache.save_nsfw_score(cache_key, h_val, top_label, danger, details)
                         results.append((danger, p, top_label, details))
                 except Exception as e: state.add_log(f"Ошибка инференса: {e}")
-                batch_images, batch_frame_counts, batch_paths = [], [],[]
+                batch_images, batch_frame_counts, batch_paths = [], [], []
 
         results.sort(key=lambda x: x[0], reverse=True)
         return results
@@ -1263,124 +1339,89 @@ class FaceEngine:
 
     def search_faces(self, ref_img_path, directory_path, allowed_exts, threshold, override_files=None):
         self.load_model()
-        
         ref_embs = self.extract_faces(ref_img_path)
-        if not ref_embs:
-            raise Exception("На референсном фото (шаблоне) не найдено лиц!")
+        if not ref_embs: raise Exception("На референсном фото (шаблоне) не найдено лиц!")
         
-        ref_emb = ref_embs[0] # Берем первое найденное лицо из референса
-        ref_n = ref_emb / np.linalg.norm(ref_emb)
-
+        ref_n = ref_embs[0] / np.linalg.norm(ref_embs[0])
         all_files = self.se._gather_files(directory_path, allowed_exts) if override_files is None else[f for f in override_files if f.lower().endswith(allowed_exts)]
+        path_to_hash = self.db_cache.get_or_create_hashes(all_files)
         
-        results = []
-        images_to_process =[]
+        results, images_to_process = [],[]
         
-        # 1. Быстрый проход через кэш
         for p in all_files:
-            cached = self.db_cache.get_face_embeddings(p)
+            h = path_to_hash.get(p)
+            if not h: continue
+            cached = self.db_cache.get_face_embeddings(h)
             if cached is not None:
                 if len(cached) > 0:
-                    max_sim = -1.0
-                    for emb in cached:
-                        emb_n = emb / np.linalg.norm(emb)
-                        sim = np.dot(emb_n, ref_n)
-                        if sim > max_sim: max_sim = sim
-                    if max_sim >= threshold:
-                        results.append((float(max_sim), p))
-            else:
-                images_to_process.append(p)
+                    max_sim = max([np.dot(emb / np.linalg.norm(emb), ref_n) for emb in cached], default=-1.0)
+                    if max_sim >= threshold: results.append((float(max_sim), p))
+            else: images_to_process.append(p)
                 
-        # 2. Обработка новых файлов
         if images_to_process:
             state.add_log(f"Извлечение лиц для {len(images_to_process)} новых файлов...")
             batch_paths =[]
             for i, p in enumerate(images_to_process):
                 if not state.is_processing: break
-                
                 batch_paths.append(p)
                 
                 if len(batch_paths) >= self.batch_size or i == len(images_to_process) - 1:
                     state.progress = (i + 1) / max(1, len(images_to_process))
-                    state.status_text = f"Анализ лиц ({i+1}/{len(images_to_process)})..."
-                    
                     batch_db_data =[]
                     for path in batch_paths:
                         ext = os.path.splitext(path)[1].lower()
-                        if ext in SUPPORTED_IMAGES:
-                            embs = self.extract_faces(path)
+                        if ext in SUPPORTED_IMAGES: embs = self.extract_faces(path)
                         elif ext in SUPPORTED_VIDEOS:
-                            # Для видео берем лишь первый кадр
                             frames = media_cache.get_video_frames(path, 640, 1)
                             if frames and len(frames) > 0:
-                                img_arr = np.array(frames[0])
-                                img_bgr = cv2.cvtColor(img_arr, cv2.COLOR_RGB2BGR)
-                                faces = self.app.get(img_bgr)
-                                embs =[f.embedding for f in faces]
-                            else:
-                                embs =[]
-                        else:
-                            embs =[]
+                                faces = self.app.get(cv2.cvtColor(np.array(frames[0]), cv2.COLOR_RGB2BGR))
+                                embs = [f.embedding for f in faces]
+                            else: embs =[]
+                        else: embs =[]
                             
-                        batch_db_data.append((path, embs))
+                        h_val = path_to_hash.get(path)
+                        if h_val: batch_db_data.append((h_val, embs))
                         
                         if embs:
-                            max_sim = -1.0
-                            for emb in embs:
-                                emb_n = emb / np.linalg.norm(emb)
-                                sim = np.dot(emb_n, ref_n)
-                                if sim > max_sim: max_sim = sim
-                            if max_sim >= threshold:
-                                results.append((float(max_sim), path))
+                            max_sim = max([np.dot(emb / np.linalg.norm(emb), ref_n) for emb in embs], default=-1.0)
+                            if max_sim >= threshold: results.append((float(max_sim), path))
                                 
                     self.db_cache.save_face_embeddings_batch(batch_db_data)
-                    batch_paths = []
+                    batch_paths =[]
                         
         results.sort(key=lambda x: x[0], reverse=True)
         return results
 
     def build_cache(self, directory_path, allowed_exts, override_files=None):
-        """ Метод для предкэширования лиц """
         self.load_model()
         all_files = self.se._gather_files(directory_path, allowed_exts) if override_files is None else[f for f in override_files if f.lower().endswith(allowed_exts)]
+        path_to_hash = self.db_cache.get_or_create_hashes(all_files)
         
-        images_to_process =[]
-        for p in all_files:
-            if self.db_cache.get_face_embeddings(p) is None:
-                images_to_process.append(p)
-                
-        if not images_to_process:
-            return
+        images_to_process =[p for p in all_files if path_to_hash.get(p) and self.db_cache.get_face_embeddings(path_to_hash[p]) is None]
+        if not images_to_process: return
             
         state.add_log(f"Кэширование лиц для {len(images_to_process)} файлов...")
         batch_paths =[]
         for i, p in enumerate(images_to_process):
             if not state.is_processing: break
-            
             batch_paths.append(p)
             
             if len(batch_paths) >= self.batch_size or i == len(images_to_process) - 1:
                 state.progress = (i + 1) / max(1, len(images_to_process))
-                state.status_text = f"Кэш лиц ({i+1}/{len(images_to_process)})..."
-                
                 batch_db_data =[]
                 for path in batch_paths:
                     ext = os.path.splitext(path)[1].lower()
-                    if ext in SUPPORTED_IMAGES:
-                        embs = self.extract_faces(path)
+                    if ext in SUPPORTED_IMAGES: embs = self.extract_faces(path)
                     elif ext in SUPPORTED_VIDEOS:
                         frames = media_cache.get_video_frames(path, 640, 1)
                         if frames and len(frames) > 0:
-                            img_arr = np.array(frames[0])
-                            img_bgr = cv2.cvtColor(img_arr, cv2.COLOR_RGB2BGR)
-                            faces = self.app.get(img_bgr)
+                            faces = self.app.get(cv2.cvtColor(np.array(frames[0]), cv2.COLOR_RGB2BGR))
                             embs = [f.embedding for f in faces]
-                        else:
-                            embs =[]
-                    else:
-                        embs =[]
+                        else: embs =[]
+                    else: embs =[]
                         
-                    batch_db_data.append((path, embs))
+                    h_val = path_to_hash.get(path)
+                    if h_val: batch_db_data.append((h_val, embs))
                     
                 self.db_cache.save_face_embeddings_batch(batch_db_data)
                 batch_paths =[]
@@ -1613,17 +1654,16 @@ class TagEngine:
         state.add_log(f"Найдено для тегирования: {len(image_paths)} фото, {len(video_paths)} видео.")
         cache_key = f"{model_name}_{self.video_frames}"
         
-        images_to_process, videos_to_process = [],[]
+        path_to_hash = self.db_cache.get_or_create_hashes(all_files)
         
+        images_to_process, videos_to_process = [],[]
         for p in image_paths:
-            if self.db_cache.get_tags(cache_key, p) is None: images_to_process.append(p)
+            if path_to_hash.get(p) and self.db_cache.get_tags(cache_key, path_to_hash[p]) is None: images_to_process.append(p)
         for p in video_paths:
-            if self.db_cache.get_tags(cache_key, p) is None: videos_to_process.append(p)
+            if path_to_hash.get(p) and self.db_cache.get_tags(cache_key, path_to_hash[p]) is None: videos_to_process.append(p)
 
-        if images_to_process or videos_to_process:
-            self.load_model(model_name)
-        else:
-            return
+        if images_to_process or videos_to_process: self.load_model(model_name)
+        else: return
 
         input_name = self.session.get_inputs()[0].name
         input_shape = self.session.get_inputs()[0].shape
@@ -1637,15 +1677,12 @@ class TagEngine:
                     padded = Image.new('RGB', (max_dim, max_dim), (255, 255, 255))
                     padded.paste(img, ((max_dim - img.width) // 2, (max_dim - img.height) // 2))
                     padded = padded.resize((self.target_size, self.target_size), Image.Resampling.BICUBIC)
-                    arr = np.array(padded, dtype=np.float32)[:, :, ::-1] # BGR
+                    arr = np.array(padded, dtype=np.float32)[:, :, ::-1]
                     if is_nchw: arr = arr.transpose(2, 0, 1)
                     img_arrs.append(arr)
-                batch_inputs = np.stack(img_arrs)
                     
-                probs_batch = self.session.run(None, {input_name: batch_inputs})[0]
+                probs_batch = self.session.run(None, {input_name: np.stack(img_arrs)})[0]
                 probs_batch = np.array(probs_batch, dtype=np.float32)
-                
-                # Применяем Sigmoid если на выходе логиты
                 if probs_batch.max() > 1.0 or probs_batch.min() < 0.0:
                     probs_batch = 1 / (1 + np.exp(-np.clip(probs_batch, -100, 100)))
                 
@@ -1653,40 +1690,33 @@ class TagEngine:
                 for j, p in enumerate(paths):
                     probs = probs_batch[j]
                     tags_dict = {str(tag): float(prob) for tag, prob in zip(self.tag_names, probs) if float(prob) >= self.min_save_threshold}
-                    
-                    if len(tags_dict) == 0:
-                        state.add_log(f"⚠️ Дебаг: Для файла {Path(p).name} не найдено тегов >= {self.min_save_threshold}. Макс вероятность модели: {float(probs.max()):.3f}")
-                        
-                    db_data.append((cache_key, p, tags_dict))
+                    h_val = path_to_hash.get(p)
+                    if h_val: db_data.append((cache_key, h_val, tags_dict))
                     
                 self.db_cache.save_tags_batch(db_data)
-                
             except Exception as e:
-                state.add_log(f"⚠️ Ошибка инференса тегов (process_batch): {e}")
-                self.db_cache.save_tags_batch([(cache_key, p, {}) for p in paths])
+                state.add_log(f"⚠️ Ошибка инференса тегов: {e}")
+                self.db_cache.save_tags_batch([(cache_key, path_to_hash.get(p), {}) for p in paths if path_to_hash.get(p)])
 
-        # --- ОБРАБОТКА ИЗОБРАЖЕНИЙ ---
+        # Обработка фото (Только меняем save_tags на использование хеша)
         batch_images, batch_paths = [],[]
         for i, img_path in enumerate(images_to_process):
             if not state.is_processing: break
             state.status_text = f"Теги фото: {Path(img_path).name} ({i+1}/{len(images_to_process)})"
-            
             try:
                 image = media_cache.get_image(img_path, self.target_size)
                 if image:
                     batch_images.append(image)
                     batch_paths.append(img_path)
                 else:
-                    state.add_log(f"⚠️ Ошибка: не удалось прочитать изображение {Path(img_path).name}")
-                    self.db_cache.save_tags(cache_key, img_path, {})
+                    if path_to_hash.get(img_path): self.db_cache.save_tags(cache_key, path_to_hash[img_path], {})
             except Exception as e:
-                state.add_log(f"⚠️ Ошибка загрузки {Path(img_path).name}: {e}")
-                self.db_cache.save_tags(cache_key, img_path, {})
+                if path_to_hash.get(img_path): self.db_cache.save_tags(cache_key, path_to_hash[img_path], {})
 
             if len(batch_images) >= self.batch_size or (i == len(images_to_process) - 1 and batch_images):
                 state.progress = (i + 1) / max(1, len(images_to_process))
                 process_batch(batch_images, batch_paths)
-                batch_images, batch_paths = [],[]
+                batch_images, batch_paths =[],[]
 
         # --- ОБРАБОТКА ВИДЕО ---
         batch_images, batch_frame_counts, batch_paths = [], [],[]
@@ -1739,11 +1769,8 @@ class TagEngine:
                         idx += count
                         max_probs = vid_probs.max(axis=0)
                         tags_dict = {str(tag): float(prob) for tag, prob in zip(self.tag_names, max_probs) if float(prob) >= self.min_save_threshold}
-                        
-                        if len(tags_dict) == 0:
-                            state.add_log(f"⚠️ Дебаг: Для видео {Path(p).name} не найдено тегов >= {self.min_save_threshold}. Макс вероятность: {float(max_probs.max()):.3f}")
-                            
-                        db_data.append((cache_key, p, tags_dict))
+                        h_val = path_to_hash.get(p)
+                        if h_val: db_data.append((cache_key, h_val, tags_dict))
                         
                     self.db_cache.save_tags_batch(db_data)
                 except Exception as e: state.add_log(f"⚠️ Ошибка инференса тегов (видео): {e}")
@@ -3265,20 +3292,19 @@ def index_page():
                         
                         def process_tags(directory, extensions, key):
                             all_files = search_engine._gather_files(directory, tuple(extensions))
+                            path_to_hash = search_engine.db_cache.get_or_create_hashes(all_files)
+                            valid_hashes = set(path_to_hash.values())
                             unique_tags = {}
                             
-                            # Ускорение: запрашиваем все теги для модели ОДНИМ запросом (Bulk fetch)
                             c = search_engine.db_cache.conn.cursor()
-                            c.execute("SELECT path, tags FROM tags_cache WHERE model=?", (key,))
+                            c.execute("SELECT hash, tags FROM tags_cache WHERE model=?", (key,))
                             db_data = c.fetchall()
                             
-                            valid_paths = set(all_files)
                             for row in db_data:
-                                path, tags_json = row[0], row[1]
-                                if path in valid_paths and tags_json:
+                                h, tags_json = row[0], row[1]
+                                if h in valid_hashes and tags_json:
                                     tags = json.loads(tags_json)
-                                    for t in tags.keys(): 
-                                        unique_tags[t] = unique_tags.get(t, 0) + 1
+                                    for t in tags.keys(): unique_tags[t] = unique_tags.get(t, 0) + 1
                             return unique_tags
 
                         # Выполняем в фоне, чтобы не заблокировать веб-сервер и не потерять соединение
@@ -3422,25 +3448,22 @@ def index_page():
                     if chk_img_tags.value: exts.extend(SUPPORTED_IMAGES)
                     if chk_vid_tags.value: exts.extend(SUPPORTED_VIDEOS)
 
-                    def process_search(directory, extensions, key, thres, pos, neg, lazy_str): # <--- Добавили аргумент lazy_str
+                    def process_search(directory, extensions, key, thres, pos, neg, lazy_str):
                         all_files = search_engine._gather_files(directory, tuple(extensions))
+                        path_to_hash = search_engine.db_cache.get_or_create_hashes(all_files)
+                        hash_to_path = {h: p for p, h in path_to_hash.items()}
                         
                         c = search_engine.db_cache.conn.cursor()
-                        c.execute("SELECT path, tags FROM tags_cache WHERE model=?", (key,))
+                        c.execute("SELECT hash, tags FROM tags_cache WHERE model=?", (key,))
                         db_data = c.fetchall()
                         
-                        valid_paths = set(all_files)
-                        res =[]
-                        
-                        valid_paths = set(all_files)
-                        res =[]
-                        
-                        # Разбиваем строку lazy-поиска на отдельные слова (запятые игнорируем)
+                        res = []
                         lazy_words =[w for w in lazy_str.replace(',', ' ').split() if w] if lazy_str else[]
                         
                         for row in db_data:
-                            path, tags_json = row[0], row[1]
-                            if path not in valid_paths or not tags_json: continue
+                            h, tags_json = row[0], row[1]
+                            if h not in hash_to_path or not tags_json: continue
+                            path = hash_to_path[h]
                             
                             tags = json.loads(tags_json)
                             valid = True
