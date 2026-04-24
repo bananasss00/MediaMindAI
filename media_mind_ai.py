@@ -1985,7 +1985,8 @@ def index_page():
     with ui.header().classes('bg-gray-900 border-b border-gray-800 flex justify-between items-center px-4 py-0 shrink-0 h-[60px]'):
         ui.label('🤖 AI Media Organizer Pro').classes('text-xl font-bold tracking-wider text-blue-400 shrink-0')
         
-        with ui.tabs().bind_value(state, 'current_tab').classes('h-full') as tabs:
+        # Добавляем серый цвет по умолчанию и пропсы для активного состояния
+        with ui.tabs().bind_value(state, 'current_tab').classes('h-full text-gray-400 font-semibold').props('active-color=white indicator-color=primary') as tabs:
             tab_search = ui.tab('Search', label='Умный Поиск', icon='search')
             tab_aesthetic = ui.tab('Aesthetic', label='Оценка Эстетики', icon='star')
             tab_nsfw = ui.tab('NSFW', label='NSFW Детектор', icon='visibility_off')
