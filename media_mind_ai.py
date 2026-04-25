@@ -467,9 +467,27 @@ class DatabaseCache:
                     c.execute(f"DELETE FROM {table} WHERE model=?", (model_name,))
         else:
             for table in tables: c.execute(f"DELETE FROM {table}")
+            c.execute("DELETE FROM phash_cache") # Теперь полное удаление сносит и pHash тоже
             c.execute("DELETE FROM files")
         self.conn.commit()
         self.conn.execute("VACUUM")
+
+    def clear_specific_cache(self, cache_type):
+        """Точечная очистка конкретных таблиц"""
+        c = self.conn.cursor()
+        if cache_type == 'phash':
+            c.execute("DELETE FROM phash_cache")
+        elif cache_type == 'tags':
+            c.execute("DELETE FROM tags_cache")
+        elif cache_type == 'nsfw_aes':
+            c.execute("DELETE FROM nsfw_cache")
+            c.execute("DELETE FROM aes_cache")
+        elif cache_type == 'search_history':
+            c.execute("DELETE FROM sim_cache")
+            c.execute("DELETE FROM rerank_cache_v2")
+        elif cache_type == 'faces':
+            c.execute("DELETE FROM face_cache")
+        self.conn.commit()
 
     def get_all_paths(self):
         c = self.conn.cursor()
@@ -2451,6 +2469,20 @@ async def index_page():
                 model_to_clear.update()
 
             global_settings_dialog.on('show', refresh_models_list)
+
+            # --- БЛОК ТОЧЕЧНОЙ ОЧИСТКИ ---
+            ui.label('Точечная очистка (по категориям)').classes('text-md font-bold mt-6 mb-2 text-orange-400')
+            with ui.grid(columns=2).classes('w-full gap-2'):
+                def _clear_cache(ctype, name):
+                    search_engine.db_cache.clear_specific_cache(ctype)
+                    ui.notify(f"Кэш '{name}' успешно очищен!", type='positive')
+                
+                ui.button('Дубликаты (pHash)', on_click=lambda: _clear_cache('phash', 'Дубликатов')).props('outline color=orange').classes('w-full')
+                ui.button('Теги (Danbooru)', on_click=lambda: _clear_cache('tags', 'Тегов')).props('outline color=pink').classes('w-full')
+                ui.button('NSFW и Эстетика', on_click=lambda: _clear_cache('nsfw_aes', 'NSFW/Эстетики')).props('outline color=red').classes('w-full')
+                ui.button('История поиска', on_click=lambda: _clear_cache('search_history', 'Истории поиска')).props('outline color=blue').classes('w-full').tooltip('Удаляет текстовые запросы (сами ИИ-векторы файлов останутся)')
+                ui.button('Лица (InsightFace)', on_click=lambda: _clear_cache('faces', 'Лиц')).props('outline color=teal').classes('w-full')
+                ui.label('Освобождает место в БД. После очистки нажмите "Сжать базу", чтобы файл .db уменьшился на диске.').classes('text-[10px] text-gray-500 col-span-2 leading-tight')
 
             async def cleanup_dead_links():
                 ui.notify("Ищем удаленные файлы... Это может занять время", type="info")
