@@ -366,14 +366,14 @@ class DatabaseCache:
     def save_face_embeddings_batch(self, batch_data):
         if not batch_data: return
         c = self.conn.cursor()
-        hashes = [(item[0],) for item in batch_data]
-        c.executemany("DELETE FROM face_cache WHERE hash=?", hashes)
         insert_data =[]
         for h, embs in batch_data:
-            if not embs: insert_data.append((h, -1, b''))
+            if not embs: 
+                insert_data.append((h, -1, b''))
             else:
-                for i, emb in enumerate(embs): insert_data.append((h, i, emb.tobytes()))
-        c.executemany("INSERT INTO face_cache (hash, face_idx, embedding) VALUES (?, ?, ?)", insert_data)
+                for i, emb in enumerate(embs): 
+                    insert_data.append((h, i, emb.tobytes()))
+        c.executemany("INSERT OR REPLACE INTO face_cache (hash, face_idx, embedding) VALUES (?, ?, ?)", insert_data)
         self.conn.commit()
 
     # --- NSFW ---
@@ -2079,6 +2079,7 @@ class AppState:
         self.nsfw_threshold = 0.45
         self.flatten_structure = False
         self.grid_columns = 4
+        self.groups_per_page = 5
 
         self.filter_min_res = 0
         self.filter_max_res = 10000
@@ -2273,6 +2274,7 @@ async def index_page():
     state.nsfw_threshold = float(cfg.get('nsfw_threshold', 0.45))
     state.flatten_structure = bool(cfg.get('flatten_structure', False))
     state.grid_columns = int(cfg.get('grid_columns', 4))
+    state.groups_per_page = int(cfg.get('groups_per_page', 5))
 
     def cancel_all_tasks():
         if state.is_processing:
@@ -2307,6 +2309,7 @@ async def index_page():
             
             ui.number('Порог опасности NSFW (0.0 - 1.0)', value=state.nsfw_threshold, min=0.0, max=1.0, step=0.01, format='%.2f').bind_value(state, 'nsfw_threshold').classes('w-full')
             ui.number('Колонок в сетке (чем больше - тем меньше плитки)', value=state.grid_columns, min=1, max=12, format='%d').bind_value(state, 'grid_columns').classes('w-full mt-2')
+            ui.number('Групп на странице (Дубликаты/Сортировка)', value=state.groups_per_page, min=1, max=20, format='%d').bind_value(state, 'groups_per_page').classes('w-full mt-2')
             ui.checkbox('Копировать/Перемещать без структуры папок (в одну директорию)', value=state.flatten_structure).bind_value(state, 'flatten_structure').classes('w-full mt-2')
             
             # --- УПРАВЛЕНИЕ КЭШЕМ ---
@@ -2405,10 +2408,12 @@ async def index_page():
 
             def save_global_settings():
                 state.grid_columns = int(state.grid_columns)
+                state.groups_per_page = int(state.groups_per_page)
                 save_config({
                     'nsfw_threshold': state.nsfw_threshold,
                     'flatten_structure': state.flatten_structure,
-                    'grid_columns': state.grid_columns
+                    'grid_columns': state.grid_columns,
+                    'groups_per_page': state.groups_per_page,
                 })
                 ui.notify('Глобальные настройки сохранены', type='positive')
                 search_gallery_ui.refresh()
@@ -2416,6 +2421,8 @@ async def index_page():
                 nsfw_gallery_ui.refresh()
                 face_gallery_ui.refresh()
                 tags_gallery_ui.refresh()
+                dupes_gallery_ui.refresh()
+                cluster_gallery_ui.refresh()
                 global_settings_dialog.close()
                 
             ui.button('Сохранить и закрыть', on_click=save_global_settings).classes('w-full mt-6 bg-blue-600 hover:bg-blue-500 font-bold')
@@ -3516,7 +3523,7 @@ async def index_page():
         await asyncio.sleep(0.001)
             
         # ЖЕСТКИЕ ЛИМИТЫ ДЛЯ АБСОЛЮТНОЙ СТАБИЛЬНОСТИ
-        GROUPS_PER_PAGE = 3  
+        GROUPS_PER_PAGE = int(state.groups_per_page)
         MAX_ITEMS_PER_GROUP = 40  
         
         total_pages = max(1, (len(state.dupes_results) + GROUPS_PER_PAGE - 1) // GROUPS_PER_PAGE)
@@ -4701,7 +4708,7 @@ async def index_page():
                 
                 await asyncio.sleep(0.001)
 
-                GROUPS_PER_PAGE = 3  
+                GROUPS_PER_PAGE = int(state.groups_per_page)
                 MAX_ITEMS_PER_GROUP = 30  # В свернутом виде
                 ITEMS_PER_PAGE_CLUSTER = 60 # Во внутреннем развернутом виде (безопасно для DOM)
                 
