@@ -2001,7 +2001,7 @@ class ClusteringEngine:
         self.se = search_engine
         self.db_cache = search_engine.db_cache
 
-    def build_clusters(self, dir_paths, allowed_exts, algo, n_clusters, eps, emb_model_name, emb_size, batch_size, video_frames, quant_mode):
+    def build_clusters(self, dir_paths, allowed_exts, algo, n_clusters, eps, emb_model_name, emb_size, batch_size, video_frames, quant_mode, align_domains=True):
         if not SKLEARN_AVAILABLE:
             raise Exception("Установите библиотеку scikit-learn: pip install scikit-learn")
 
@@ -2025,10 +2025,9 @@ class ClusteringEngine:
                 try:
                     feat_tensor = torch.load(io.BytesIO(row[1]), weights_only=False)
                     emb_dict[row[0]] = feat_tensor.float().cpu().numpy().flatten()
-                except Exception as e: 
-                    state.add_log(f"⚠️ Ошибка загрузки вектора: {e}")
+                except Exception as e: pass
 
-        valid_paths = []
+        valid_paths =[]
         valid_embs = []
         missing_paths =[]
         
@@ -2040,43 +2039,28 @@ class ClusteringEngine:
             else:
                 missing_paths.append(p)
 
-        # Если есть файлы без эмбеддингов — вычисляем их "на лету"
+        # Вычисление "на лету"
         if missing_paths:
             state.add_log(f"Вычисление ИИ-векторов для {len(missing_paths)} новых файлов (On-the-fly)...")
+            old_vf, old_es, old_qm = self.se.video_frames, self.se.emb_size, self.se.quant_mode
+            self.se.video_frames, self.se.emb_size, self.se.quant_mode = video_frames, emb_size, quant_mode
             
-            # Сохраняем старые настройки движка
-            old_vf = self.se.video_frames
-            old_es = self.se.emb_size
-            old_qm = self.se.quant_mode
-            
-            self.se.video_frames = video_frames
-            self.se.emb_size = emb_size
-            self.se.quant_mode = quant_mode
-            
-            # Запускаем кэширование только для пропущенных файлов
             self.se.build_cache(dir_paths, emb_model_name, batch_size, allowed_exts, override_files=missing_paths)
+            self.se.video_frames, self.se.emb_size, self.se.quant_mode = old_vf, old_es, old_qm
             
-            # Восстанавливаем настройки
-            self.se.video_frames = old_vf
-            self.se.emb_size = old_es
-            self.se.quant_mode = old_qm
-            
-            if self.se.cancel_flag:
-                raise Exception("Инференс отменен пользователем.")
+            if self.se.cancel_flag: raise Exception("Инференс отменен пользователем.")
                 
-            # Докачиваем новые вектора из БД
             for i in range(0, len(missing_paths), chunk_size):
                 chunk_paths = missing_paths[i:i+chunk_size]
                 chunk_hashes =[path_to_hash[p] for p in chunk_paths]
                 ph = ','.join(['?']*len(chunk_hashes))
-                c.execute(f"SELECT hash, features FROM emb_cache WHERE model=? AND hash IN ({ph})", [cache_key] + chunk_hashes)
+                c.execute(f"SELECT hash, features FROM emb_cache WHERE model=? AND hash IN ({ph})",[cache_key] + chunk_hashes)
                 for row in c.fetchall():
                     try:
                         feat_tensor = torch.load(io.BytesIO(row[1]), weights_only=False)
                         emb_dict[row[0]] = feat_tensor.float().cpu().numpy().flatten()
                     except Exception: pass
                         
-            # Добавляем новоиспеченные файлы в финальный пул
             for p in missing_paths:
                 h = path_to_hash.get(p)
                 if h in emb_dict:
@@ -2086,13 +2070,28 @@ class ClusteringEngine:
         if not valid_paths:
             raise Exception("Не удалось получить эмбеддинги для кластеризации. Возможно, файлы повреждены.")
 
-        # Выгружаем модель из памяти, чтобы она не мешала тяжелому Scikit-learn
         self.se._unload_embedding_model()
 
-        state.add_log(f"Найдено {len(valid_paths)} файлов. Запуск алгоритма {algo}...")
+        state.add_log(f"Найдено {len(valid_paths)} файлов. Обработка математического пространства...")
         
         X = np.array(valid_embs)
-        X = normalize(X)
+        X = normalize(X) # L2 Нормализация
+
+        # МАГИЯ ЗДЕСЬ: Устранение "разрыва доменов" (Mean Centering)
+        if align_domains:
+            img_indices =[i for i, p in enumerate(valid_paths) if p.lower().endswith(SUPPORTED_IMAGES)]
+            vid_indices =[i for i, p in enumerate(valid_paths) if p.lower().endswith(SUPPORTED_VIDEOS)]
+            
+            if len(img_indices) > 0 and len(vid_indices) > 0:
+                state.add_log("Применение алгоритма слияния доменов (Коррекция разрыва Картинка ↔ Видео)...")
+                mean_img = np.mean(X[img_indices], axis=0)
+                mean_vid = np.mean(X[vid_indices], axis=0)
+                # Сдвигаем векторы видео в центр векторов картинок
+                X[vid_indices] += (mean_img - mean_vid)
+                # Повторная нормализация после сдвига
+                X = normalize(X)
+
+        state.add_log(f"Запуск алгоритма {algo}...")
 
         if algo == 'K-Means':
             n_c = min(n_clusters, len(X))
@@ -3188,6 +3187,9 @@ async def index_page():
                             with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
                                 ui.checkbox().bind_value(state.sel_search, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'search'), ['shiftKey'])
                             
+                            if path.lower().endswith(SUPPORTED_VIDEOS):
+                                ui.label('▶ ВИДЕО').classes('absolute top-2 right-2 bg-blue-600/90 text-white text-[10px] font-bold px-1.5 py-0.5 rounded z-10 pointer-events-none shadow')
+
                             with ui.context_menu():
                                 ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
                                 ui.menu_item('Копировать картинку', on_click=lambda p=path: copy_image_to_clipboard(p))
@@ -3288,6 +3290,9 @@ async def index_page():
                             with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
                                 ui.checkbox().bind_value(state.sel_aes, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'aes'),['shiftKey'])
 
+                            if path.lower().endswith(SUPPORTED_VIDEOS):
+                                ui.label('▶ ВИДЕО').classes('absolute top-2 right-2 bg-blue-600/90 text-white text-[10px] font-bold px-1.5 py-0.5 rounded z-10 pointer-events-none shadow')
+
                             with ui.context_menu():
                                 ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
                                 ui.menu_item('Копировать картинку', on_click=lambda p=path: copy_image_to_clipboard(p))
@@ -3384,6 +3389,9 @@ async def index_page():
                         with ui.card().classes('bg-gray-800 border border-gray-700 hover:border-red-500 transition-colors p-0 overflow-hidden relative'):
                             with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
                                 ui.checkbox().bind_value(state.sel_nsfw, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'nsfw'), ['shiftKey'])
+
+                            if path.lower().endswith(SUPPORTED_VIDEOS):
+                                ui.label('▶ ВИДЕО').classes('absolute top-2 right-2 bg-blue-600/90 text-white text-[10px] font-bold px-1.5 py-0.5 rounded z-10 pointer-events-none shadow')
 
                             with ui.context_menu():
                                 ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
@@ -3483,6 +3491,9 @@ async def index_page():
                         with ui.card().classes('bg-gray-800 border border-gray-700 hover:border-teal-500 transition-colors p-0 overflow-hidden relative'):
                             with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
                                 ui.checkbox().bind_value(state.sel_face, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'face'),['shiftKey'])
+
+                            if path.lower().endswith(SUPPORTED_VIDEOS):
+                                ui.label('▶ ВИДЕО').classes('absolute top-2 right-2 bg-blue-600/90 text-white text-[10px] font-bold px-1.5 py-0.5 rounded z-10 pointer-events-none shadow')
 
                             with ui.context_menu():
                                 ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
@@ -3586,6 +3597,9 @@ async def index_page():
                             with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
                                 ui.checkbox().bind_value(state.sel_tags, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'tags'), ['shiftKey'])
 
+                            if path.lower().endswith(SUPPORTED_VIDEOS):
+                                ui.label('▶ ВИДЕО').classes('absolute top-2 right-2 bg-blue-600/90 text-white text-[10px] font-bold px-1.5 py-0.5 rounded z-10 pointer-events-none shadow')
+
                             with ui.context_menu():
                                 ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
                                 ui.menu_item('Копировать картинку', on_click=lambda p=path: copy_image_to_clipboard(p))
@@ -3599,7 +3613,7 @@ async def index_page():
                                 ui.label(top_tags_str).classes('text-pink-400 font-bold text-xs truncate max-w-[80%]').tooltip(", ".join([f"{k} ({v:.2f})" for k, v in top_tags]))
                                 ui.button(icon='sell', on_click=lambda p=path, d=tags_dict: show_tags_debug(p, d)).props('flat round dense color=white').tooltip('Все теги')
                             ui.label(os.path.basename(path)).classes('text-xs text-gray-400 px-2 pb-2 truncate w-full').tooltip(path)
-
+                        
             ui.button(icon='keyboard_arrow_up', on_click=lambda: ui.run_javascript(f'document.getElementById("{scroll_id}").scrollTo({{top: 0, behavior: "smooth"}})')).props('round color=pink-800').classes('absolute bottom-6 right-6 z-50 shadow-lg').tooltip('Наверх')
 
     async def auto_select_worst_dupes():
@@ -3723,6 +3737,9 @@ async def index_page():
                                             with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
                                                 ui.checkbox().bind_value(state.sel_dupes, path).on('click', lambda e, i=local_index, p=path, paths=group: handle_shift_click(e, i, p, 'dupes', paths),['shiftKey'])
                                             
+                                            if path.lower().endswith(SUPPORTED_VIDEOS):
+                                                ui.label('▶ ВИДЕО').classes('absolute top-2 right-2 bg-blue-600/90 text-white text-[10px] font-bold px-1.5 py-0.5 rounded z-10 pointer-events-none shadow')
+
                                             with ui.context_menu():
                                                 ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
                                                 ui.menu_item('Копировать картинку', on_click=lambda p=path: copy_image_to_clipboard(p))
@@ -4768,6 +4785,8 @@ async def index_page():
                         chk_img_cluster = ui.checkbox('Картинки', value=cfg.get('chk_img_cluster', True))
                         chk_vid_cluster = ui.checkbox('Видео', value=cfg.get('chk_vid_cluster', False))
                         
+                    chk_align_domains = ui.checkbox('Слияние Картинка ↔ Видео (Сдвиг ИИ-векторов)', value=cfg.get('chk_align_domains', True)).classes('text-sm text-purple-300 font-bold mb-2').tooltip('Устраняет системную разницу в понимании нейросетью фото и видео, заставляя их попадать в одни папки')
+                        
                     cluster_emb_model = ui.select(['Qwen/Qwen3-VL-Embedding-2B', 'Qwen/Qwen3-VL-Embedding-8B'], value=cfg.get('cluster_emb_model', 'Qwen/Qwen3-VL-Embedding-2B'), label='Модель (из которой брать вектора)').classes('w-full text-xs')
                     cluster_emb_size = ui.number('Разрешение при кэше', value=cfg.get('emb_size', 512), format='%.0f').classes('w-full')
 
@@ -4840,7 +4859,7 @@ async def index_page():
                         'cluster_dir': cluster_dir.value, 'cluster_algo': cluster_algo.value,
                         'cluster_k': cluster_k.value, 'cluster_eps': cluster_eps.value,
                         'chk_img_cluster': chk_img_cluster.value, 'chk_vid_cluster': chk_vid_cluster.value,
-                        'cluster_emb_model': cluster_emb_model.value
+                        'cluster_emb_model': cluster_emb_model.value, 'chk_align_domains': chk_align_domains.value
                     })
                     if not cluster_dir.value: return ui.notify("Укажите папки!", type='warning')
                     
@@ -4863,7 +4882,8 @@ async def index_page():
                                 cluster_dir.value, tuple(exts), cluster_algo.value,
                                 int(cluster_k.value), float(cluster_eps.value),
                                 cluster_emb_model.value, int(cluster_emb_size.value),
-                                int(cluster_batch_size.value), int(cluster_video_frames.value), cluster_quant_mode.value
+                                int(cluster_batch_size.value), int(cluster_video_frames.value), 
+                                cluster_quant_mode.value, chk_align_domains.value
                             )
                             state.cluster_results = res
                             for cluster in res:
@@ -4984,6 +5004,9 @@ async def index_page():
                                                     with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
                                                         ui.checkbox().bind_value(state.sel_cluster, path).on('click', lambda e, i=local_index, p=path, pts=paths: handle_shift_click(e, i, p, 'cluster', pts),['shiftKey'])
                                                     
+                                                    if path.lower().endswith(SUPPORTED_VIDEOS):
+                                                        ui.label('▶ ВИДЕО').classes('absolute top-2 right-2 bg-blue-600/90 text-white text-[10px] font-bold px-1.5 py-0.5 rounded z-10 pointer-events-none shadow')
+
                                                     with ui.context_menu():
                                                         ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
                                                         ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
