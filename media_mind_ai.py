@@ -2698,6 +2698,7 @@ async def index_page():
         elif state.current_tab == 'Face' and path in state.sel_face: is_selected = state.sel_face[path]
         elif state.current_tab == 'Tags' and path in state.sel_tags: is_selected = state.sel_tags[path]
         elif state.current_tab == 'Cluster' and path in state.sel_cluster: is_selected = state.sel_cluster[path]
+        elif state.current_tab == 'Dupes' and path in state.sel_dupes: is_selected = state.sel_dupes[path]
             
         btn_viewer_select._props['icon'] = 'check_box' if is_selected else 'check_box_outline_blank'
         btn_viewer_select._props['color'] = 'green' if is_selected else 'white'
@@ -2718,6 +2719,8 @@ async def index_page():
             state.sel_tags[path] = not state.sel_tags[path]
         elif state.current_tab == 'Cluster' and path in state.sel_cluster:
             state.sel_cluster[path] = not state.sel_cluster[path]
+        elif state.current_tab == 'Dupes' and path in state.sel_dupes:
+            state.sel_dupes[path] = not state.sel_dupes[path]
         update_viewer_selection_ui()
 
     def download_current_item():
@@ -2914,6 +2917,58 @@ async def index_page():
             return size_mb, w, h_dim
         except Exception:
             return 0.0, 0, 0
+
+    async def get_physically_valid_paths_async(paths):
+        if not paths: return set()
+        min_r = state.filter_min_res
+        max_r = state.filter_max_res
+        max_s = state.filter_max_size
+        orient = state.filter_orientation
+
+        if min_r <= 0 and max_r >= 10000 and max_s >= 10000 and orient == 'Любая':
+            return set(paths)
+
+        def _filter_task():
+            c = search_engine.db_cache.conn.cursor()
+            file_infos = {}
+            chunk_size = 900
+            for i in range(0, len(paths), chunk_size):
+                chunk = paths[i:i+chunk_size]
+                ph = ','.join(['?']*len(chunk))
+                c.execute(f"SELECT path, size_mb, width, height FROM files WHERE path IN ({ph})", chunk)
+                for row in c.fetchall():
+                    file_infos[row[0]] = (row[1], row[2], row[3])
+            
+            valid = set()
+            db_needs_commit = False
+            
+            for p in paths:
+                info = file_infos.get(p)
+                if not info or info[1] is None or info[2] is None:
+                    size_mb, w, h = get_physical_info(p)
+                    hash_val = search_engine.db_cache.get_hash_by_path(p) or get_fast_hash(p)
+                    c.execute("INSERT OR REPLACE INTO files (hash, path, size_mb, width, height) VALUES (?, ?, ?, ?, ?)", (hash_val, p, size_mb, w, h))
+                    db_needs_commit = True
+                else:
+                    size_mb, w, h = info
+                    
+                if size_mb is not None and size_mb > max_s: continue
+                
+                max_dim = max(w, h) if w and h else 0
+                if max_dim > 0:
+                    if max_dim < min_r or max_dim > max_r: continue
+                    if orient != 'Любая':
+                        if orient == 'Горизонтальная' and w <= h * 1.05: continue
+                        if orient == 'Вертикальная' and h <= w * 1.05: continue
+                        if orient == 'Квадрат' and (w > h * 1.05 or h > w * 1.05): continue
+                
+                valid.add(p)
+                
+            if db_needs_commit:
+                search_engine.db_cache.conn.commit()
+            return valid
+
+        return await run.io_bound(_filter_task)
 
     async def apply_physical_filters_async(results_list):
         if not results_list: return[]
@@ -3683,12 +3738,22 @@ async def index_page():
             return
         
         await asyncio.sleep(0.001)
+
+        # --- ПРИМЕНЕНИЕ ФИЗ. ФИЛЬТРОВ ---
+        all_paths_in_dupes = [p for g in state.dupes_results for p in g]
+        valid_paths = await get_physically_valid_paths_async(all_paths_in_dupes)
+        
+        filtered_dupes =[]
+        for g in state.dupes_results:
+            new_g = [p for p in g if p in valid_paths]
+            if len(new_g) > 0:
+                filtered_dupes.append(new_g)
             
         # ЖЕСТКИЕ ЛИМИТЫ ДЛЯ АБСОЛЮТНОЙ СТАБИЛЬНОСТИ
         GROUPS_PER_PAGE = int(state.groups_per_page)
         MAX_ITEMS_PER_GROUP = 40  
         
-        total_pages = max(1, (len(state.dupes_results) + GROUPS_PER_PAGE - 1) // GROUPS_PER_PAGE)
+        total_pages = max(1, (len(filtered_dupes) + GROUPS_PER_PAGE - 1) // GROUPS_PER_PAGE)
         if getattr(state, 'dupes_page', 1) > total_pages: state.dupes_page = 1
         
         def change_page(d):
@@ -3701,11 +3766,27 @@ async def index_page():
                     with ui.row().classes('gap-2 items-center'):
                         ui.button('АВТО-ВЫБОР ХУДШИХ', icon='auto_awesome', on_click=auto_select_worst_dupes).props('color=orange text-black font-bold dense')
                         ui.button('Снять всё', on_click=lambda: ui.timer(0, lambda: set_all('dupes', False), once=True)).props('outline color=white dense')
+                        ui.button(icon='filter_alt', on_click=lambda: (setattr(state, 'show_phys_filters_dupes', not getattr(state, 'show_phys_filters_dupes', False)), dupes_gallery_ui.refresh())).props('flat color=gray dense').tooltip('Доп. фильтры')
                     with ui.row().classes('gap-2 items-center'):
                         ui.button('Копировать по группам ✔', icon='content_copy', on_click=lambda: execute_dupes_action('copy')).props('color=orange-800 text-white font-bold dense')
                         ui.button('Переместить по группам ✔', icon='drive_file_move', on_click=lambda: execute_dupes_action('move')).props('color=orange-600 text-white font-bold dense')
                         ui.button('УДАЛИТЬ ВЫДЕЛЕННЫЕ ✔', icon='delete_forever', on_click=lambda: delete_items([p for p, c in state.sel_dupes.items() if c], 'dupes')).props('color=red-10 text-white dense')
                 
+                if getattr(state, 'show_phys_filters_dupes', False):
+                    with ui.row().classes('w-full bg-gray-800/50 p-2 rounded-lg mb-2 items-end gap-4 border border-gray-700'):
+                        with ui.column().classes('gap-1 flex-1'):
+                            ui.label('Разрешение (Max сторона, px):').classes('text-xs text-gray-400')
+                            with ui.row().classes('w-full gap-2 flex-nowrap'):
+                                ui.number('Мин', value=0, format='%.0f').bind_value(state, 'filter_min_res').classes('flex-1')
+                                ui.number('Макс', value=10000, format='%.0f').bind_value(state, 'filter_max_res').classes('flex-1')
+                        with ui.column().classes('gap-1 flex-1'):
+                            ui.label('Макс. вес:').classes('text-xs text-gray-400')
+                            ui.number('МБ', value=10000, format='%.0f').bind_value(state, 'filter_max_size').classes('w-full')
+                        with ui.column().classes('gap-1 flex-1'):
+                            ui.label('Ориентация:').classes('text-xs text-gray-400')
+                            ui.select(['Любая', 'Горизонтальная', 'Вертикальная', 'Квадрат'], value='Любая').bind_value(state, 'filter_orientation').classes('w-full')
+                        ui.button('Применить', on_click=dupes_gallery_ui.refresh).props('outline color=orange-800').classes('h-[40px]')
+
                 with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
                     ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
                     ui.label(f'Страница {getattr(state, "dupes_page", 1)} из {total_pages}').classes('text-gray-300 font-bold')
@@ -3714,7 +3795,10 @@ async def index_page():
             scroll_id = 'dupes_scroll_area'
             with ui.column().classes('w-full flex-1 overflow-y-auto p-4 relative').props(f'id="{scroll_id}"'):
                 start_idx = (getattr(state, 'dupes_page', 1) - 1) * GROUPS_PER_PAGE
-                page_groups = state.dupes_results[start_idx : start_idx + GROUPS_PER_PAGE]
+                page_groups = filtered_dupes[start_idx : start_idx + GROUPS_PER_PAGE]
+                
+                if not page_groups:
+                    ui.label("Нет файлов, подходящих под выбранный фильтр.").classes("text-gray-400 m-4")
                 
                 ITEMS_PER_INNER_PAGE = 60 # Лимит при развороте
                 
@@ -4995,6 +5079,16 @@ async def index_page():
                 
                 await asyncio.sleep(0.001)
 
+                # --- ПРИМЕНЕНИЕ ФИЗ. ФИЛЬТРОВ ---
+                all_paths_in_clusters = [p for c in state.cluster_results for p in c["paths"]]
+                valid_paths = await get_physically_valid_paths_async(all_paths_in_clusters)
+                
+                filtered_clusters =[]
+                for c in state.cluster_results:
+                    new_paths = [p for p in c["paths"] if p in valid_paths]
+                    if new_paths:
+                        filtered_clusters.append({"name": c["name"], "paths": new_paths})
+
                 GROUPS_PER_PAGE = int(state.groups_per_page)
                 MAX_ITEMS_PER_GROUP = 30  # В свернутом виде
                 ITEMS_PER_PAGE_CLUSTER = 60 # Во внутреннем развернутом виде (безопасно для DOM)
@@ -5005,7 +5099,7 @@ async def index_page():
                 if not hasattr(state, 'expanded_pages'):
                     state.expanded_pages = {}
                 
-                total_pages = max(1, (len(state.cluster_results) + GROUPS_PER_PAGE - 1) // GROUPS_PER_PAGE)
+                total_pages = max(1, (len(filtered_clusters) + GROUPS_PER_PAGE - 1) // GROUPS_PER_PAGE)
                 if getattr(state, 'cluster_page', 1) > total_pages: state.cluster_page = 1
                 
                 def change_page(d):
@@ -5018,11 +5112,27 @@ async def index_page():
                             with ui.row().classes('gap-2 items-center'):
                                 ui.button('Выбрать всё', on_click=lambda: ui.timer(0, lambda: set_all('cluster', True), once=True)).props('outline color=white dense')
                                 ui.button('Снять всё', on_click=lambda: ui.timer(0, lambda: set_all('cluster', False), once=True)).props('outline color=white dense')
+                                ui.button(icon='filter_alt', on_click=lambda: (setattr(state, 'show_phys_filters_cluster', not getattr(state, 'show_phys_filters_cluster', False)), cluster_gallery_ui.refresh())).props('flat color=gray dense').tooltip('Доп. фильтры')
                             with ui.row().classes('gap-2 items-center'):
                                 ui.button('Копировать по папкам ✔', icon='content_copy', on_click=lambda: execute_cluster_action('copy')).props('color=purple-800 text-white font-bold dense')
                                 ui.button('Переместить по папкам ✔', icon='drive_file_move', on_click=lambda: execute_cluster_action('move')).props('color=purple-600 text-white font-bold dense')
                                 ui.button('УДАЛИТЬ ✔', icon='delete_forever', on_click=lambda: delete_items([p for p, c in state.sel_cluster.items() if c], 'cluster')).props('color=red-10 text-white dense')
                         
+                        if getattr(state, 'show_phys_filters_cluster', False):
+                            with ui.row().classes('w-full bg-gray-800/50 p-2 rounded-lg mb-2 items-end gap-4 border border-gray-700'):
+                                with ui.column().classes('gap-1 flex-1'):
+                                    ui.label('Разрешение (Max сторона, px):').classes('text-xs text-gray-400')
+                                    with ui.row().classes('w-full gap-2 flex-nowrap'):
+                                        ui.number('Мин', value=0, format='%.0f').bind_value(state, 'filter_min_res').classes('flex-1')
+                                        ui.number('Макс', value=10000, format='%.0f').bind_value(state, 'filter_max_res').classes('flex-1')
+                                with ui.column().classes('gap-1 flex-1'):
+                                    ui.label('Макс. вес:').classes('text-xs text-gray-400')
+                                    ui.number('МБ', value=10000, format='%.0f').bind_value(state, 'filter_max_size').classes('w-full')
+                                with ui.column().classes('gap-1 flex-1'):
+                                    ui.label('Ориентация:').classes('text-xs text-gray-400')
+                                    ui.select(['Любая', 'Горизонтальная', 'Вертикальная', 'Квадрат'], value='Любая').bind_value(state, 'filter_orientation').classes('w-full')
+                                ui.button('Применить', on_click=cluster_gallery_ui.refresh).props('outline color=purple-800').classes('h-[40px]')
+
                         with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
                             ui.button(icon='chevron_left', on_click=lambda: change_page(-1)).props('flat outline color=white')
                             ui.label(f'Страница {getattr(state, "cluster_page", 1)} из {total_pages}').classes('text-gray-300 font-bold')
@@ -5031,7 +5141,10 @@ async def index_page():
                     scroll_id = 'cluster_scroll_area'
                     with ui.column().classes('w-full flex-1 overflow-y-auto p-4 relative').props(f'id="{scroll_id}"'):
                         start_idx = (getattr(state, 'cluster_page', 1) - 1) * GROUPS_PER_PAGE
-                        page_groups = state.cluster_results[start_idx : start_idx + GROUPS_PER_PAGE]
+                        page_groups = filtered_clusters[start_idx : start_idx + GROUPS_PER_PAGE]
+                        
+                        if not page_groups:
+                            ui.label("Нет файлов, подходящих под выбранный фильтр.").classes("text-gray-400 m-4")
                         
                         def render_cluster_group(group):
                             cluster_name = group["name"]
