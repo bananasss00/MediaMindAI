@@ -474,7 +474,7 @@ class DatabaseCache:
     def get_all_paths(self):
         c = self.conn.cursor()
         c.execute("SELECT DISTINCT path FROM files")
-        return [r[0] for r in c.fetchall() if r[0]]
+        return[r[0] for r in c.fetchall() if r[0]]
 
     def remove_paths(self, paths_to_remove):
         if not paths_to_remove: return
@@ -707,7 +707,7 @@ class SearchEngine:
 
     def build_cache(self, dir_path, emb_model_name, batch_size, allowed_exts, override_files=None):
         self.cancel_flag = False
-        files_list = self._gather_files(dir_path, allowed_exts) if override_files is None else [f for f in override_files if f.lower().endswith(allowed_exts)]
+        files_list = self._gather_files(dir_path, allowed_exts) if override_files is None else[f for f in override_files if f.lower().endswith(allowed_exts)]
         cache_key = emb_model_name if self.emb_size == 512 else f"{emb_model_name}_{self.emb_size}"
         
         path_to_hash = self.db_cache.get_or_create_hashes(files_list)
@@ -1391,7 +1391,7 @@ class FaceEngine:
         all_files = self.se._gather_files(directory_path, allowed_exts) if override_files is None else[f for f in override_files if f.lower().endswith(allowed_exts)]
         path_to_hash = self.db_cache.get_or_create_hashes(all_files)
         
-        results, images_to_process = [],[]
+        results, images_to_process =[],[]
         
         for p in all_files:
             h = path_to_hash.get(p)
@@ -1461,7 +1461,7 @@ class FaceEngine:
                         frames = media_cache.get_video_frames(path, 640, 1)
                         if frames and len(frames) > 0:
                             faces = self.app.get(cv2.cvtColor(np.array(frames[0]), cv2.COLOR_RGB2BGR))
-                            embs = [f.embedding for f in faces]
+                            embs =[f.embedding for f in faces]
                         else: embs =[]
                     else: embs =[]
                         
@@ -1568,7 +1568,7 @@ class TagEngine:
             extracted_names =[]
             
             def extract_from_list(lst):
-                names = []
+                names =[]
                 if len(lst) > 0 and isinstance(lst[0], dict):
                     if any(key in lst[0] for key in['id', 'tag_id', 'tag_index']):
                         max_id = max((int(item.get('id', item.get('tag_id', item.get('tag_index', -1)))) for item in lst if isinstance(item, dict) and str(item.get('id', item.get('tag_id', item.get('tag_index', '')))).lstrip('-').isdigit()), default=-1)
@@ -1650,7 +1650,7 @@ class TagEngine:
             if extracted_names:
                 self.tag_names = extracted_names
             else:
-                self.tag_names = ['unknown_tag'] * 100000
+                self.tag_names =['unknown_tag'] * 100000
                 state.add_log(f"⚠️ ОШИБКА ЧТЕНИЯ ТЕГОВ! Структура неизвестна. Первые 200 символов: {str(data)[:200]}")
         elif os.path.exists(txt_path):
             with open(txt_path, 'r', encoding='utf-8') as f:
@@ -1820,7 +1820,7 @@ class TagEngine:
                     self.db_cache.save_tags_batch(db_data)
                 except Exception as e: state.add_log(f"⚠️ Ошибка инференса тегов (видео): {e}")
                 
-                batch_images, batch_frame_counts, batch_paths = [], [], []
+                batch_images, batch_frame_counts, batch_paths = [], [],[]
 
 class DuplicatesEngine:
     def __init__(self, search_engine):
@@ -1955,7 +1955,6 @@ class ClusteringEngine:
             for row in c.fetchall():
                 try:
                     feat_tensor = torch.load(io.BytesIO(row[1]), weights_only=False)
-                    # ИСПРАВЛЕНИЕ: Конвертируем bfloat16/float16 в float32, т.к. numpy не поддерживает bfloat16
                     emb_dict[row[0]] = feat_tensor.float().cpu().numpy().flatten()
                 except Exception as e: 
                     state.add_log(f"⚠️ Ошибка загрузки вектора: {e}")
@@ -2344,11 +2343,14 @@ async def index_page():
                         search_engine.db_cache.remove_paths(dead)
                         search_engine.db_cache.conn.execute("VACUUM")
                     return len(dead)
-                dead_count = await run.io_bound(task)
-                if dead_count > 0:
-                    ui.notify(f"Удалено {dead_count} мертвых записей из базы!", type="positive")
-                else:
-                    ui.notify("Мертвых записей не найдено, база в порядке.", type="positive")
+                try:
+                    dead_count = await run.io_bound(task)
+                    if dead_count > 0:
+                        ui.notify(f"Удалено {dead_count} мертвых записей из базы!", type="positive")
+                    else:
+                        ui.notify("Мертвых записей не найдено, база в порядке.", type="positive")
+                except Exception as e:
+                    ui.notify(f"Ошибка: {e}", type="negative")
 
             def cleanup_thumbnails():
                 count = 0
@@ -2388,8 +2390,11 @@ async def index_page():
                     
                     return start_total, end_total
                     
-                start_sz, end_sz = await run.io_bound(task)
-                ui.notify(f"База успешно сжата! Было (с WAL): {start_sz:.1f} МБ -> Стало: {end_sz:.1f} МБ", type="positive", timeout=8000)
+                try:
+                    start_sz, end_sz = await run.io_bound(task)
+                    ui.notify(f"База успешно сжата! Было (с WAL): {start_sz:.1f} МБ -> Стало: {end_sz:.1f} МБ", type="positive", timeout=8000)
+                except Exception as e:
+                    ui.notify(f"Ошибка: {e}", type="negative")
                 
             with ui.column().classes('w-full gap-2 mt-4'):
                 ui.button('Удалить "Мертвые души" (Файлы, которых больше нет на диске)', on_click=cleanup_dead_links).props('outline color=orange').classes('w-full')
@@ -2628,7 +2633,7 @@ async def index_page():
         elif e.key.space: toggle_selection()
         elif e.key.name and e.key.name.lower() == 'd': download_current_item()
         elif e.key.name and e.key.name.lower() == 'c': copy_image_to_clipboard(state.viewer_items[state.viewer_index])
-        elif e.key.name == 'Delete': # <--- НОВОЕ
+        elif e.key.name == 'Delete': 
             path = state.viewer_items[state.viewer_index]
             tab = state.current_tab.lower()
             if tab == 'search': tab_name = 'search'
@@ -2655,69 +2660,80 @@ async def index_page():
         if not folder: return
         
         html_path = os.path.join(folder, f"gallery_{tab}.html")
-        html_content =[
-            "<html><body style='background-color:#1e1e1e; color:white; font-family:sans-serif;'>",
-            f"<h2>Экспорт результатов</h2>",
-            "<div style='display:flex; flex-wrap:wrap; gap:15px;'>"
-        ]
+        ui.notify("Создание HTML галереи...", type='info')
         
         items = getattr(state, f"{tab}_results",[])
-        for item in items:
-            path = item[1]
-            filter_val = getattr(state, f"{tab}_res_filter", 'Все')
-            
-            if filter_val == 'Картинки' and not path.lower().endswith(SUPPORTED_IMAGES): continue
-            if filter_val == 'Видео' and not path.lower().endswith(SUPPORTED_VIDEOS): continue
-            
-            if tab == 'search': label_text = f"Score: {item[0]:.3f}"
-            elif tab == 'aes': label_text = f"★ {item[0]:.2f} (Пик: {item[2]:.2f})"
-            elif tab == 'nsfw': label_text = f"🚨 Danger: {item[0]*100:.1f}% | {item[2].upper()}"
-            elif tab == 'face': label_text = f"Match: {item[0]*100:.1f}%"
-            elif tab == 'tags': label_text = f"Tags Score: {item[0]:.2f}"
-                
-            uri = Path(path).absolute().as_uri()
-            ext = os.path.splitext(path)[1].lower()
-            
-            if ext in SUPPORTED_VIDEOS:
-                path_hash = hashlib.md5(path.encode('utf-8')).hexdigest()
-                thumb_path = os.path.join(THUMB_CACHE_DIR, f"{path_hash}.jpg")
-                if not os.path.exists(thumb_path):
-                    try:
-                        with av.open(path) as container:
-                            for frame in container.decode(video=0):
-                                img = frame.to_image()
-                                img.thumbnail((300, 300))
-                                img.convert('RGB').save(thumb_path, format="JPEG", quality=80)
-                                break
-                    except: pass
-                
-                thumb_uri = Path(thumb_path).absolute().as_uri() if os.path.exists(thumb_path) else uri
-                
-                html_content.append(
-                    f"<div style='background:#2d2d2d; padding:10px; border-radius:8px; text-align:center; max-width:320px;'>"
-                    f"<a href='{uri}' target='_blank' title='Кликните, чтобы открыть видео'>"
-                    f"<div style='position:relative; width:300px; height:200px; background:#111; border-radius:4px; display:flex; align-items:center; justify-content:center; overflow:hidden;'>"
-                    f"<img src='{thumb_uri}' style='max-width:100%; max-height:100%; object-fit:contain;'>"
-                    f"<div style='position:absolute; top:5px; right:5px; background:rgba(0,0,0,0.7); padding:3px 6px; border-radius:4px; font-size:12px;'>▶ Video</div>"
-                    f"</div></a>"
-                    f"<h4 style='margin:10px 0 5px 0; color:#4caf50;'>{label_text}</h4>"
-                    f"<div style='font-size:11px; color:#aaa; word-wrap:break-word;'>{os.path.basename(path)}</div></div>"
-                )
-            else:
-                html_content.append(
-                    f"<div style='background:#2d2d2d; padding:10px; border-radius:8px; text-align:center; max-width:320px;'>"
-                    f"<a href='{uri}' target='_blank'>"
-                    f"<div style='width:300px; height:200px; background:#111; border-radius:4px; display:flex; align-items:center; justify-content:center; overflow:hidden;'>"
-                    f"<img src='{uri}' style='max-width:100%; max-height:100%; object-fit:contain;'></div></a>"
-                    f"<h4 style='margin:10px 0 5px 0; color:#4caf50;'>{label_text}</h4>"
-                    f"<div style='font-size:11px; color:#aaa; word-wrap:break-word;'>{os.path.basename(path)}</div></div>"
-                )
-        html_content.append("</div></body></html>")
+        filter_val = getattr(state, f"{tab}_res_filter", 'Все')
         
-        try:
-            with open(html_path, "w", encoding="utf-8") as f: f.write("\n".join(html_content))
+        def _export():
+            html_content =[
+                "<html><body style='background-color:#1e1e1e; color:white; font-family:sans-serif;'>",
+                f"<h2>Экспорт результатов</h2>",
+                "<div style='display:flex; flex-wrap:wrap; gap:15px;'>"
+            ]
+            
+            for item in items:
+                path = item[1]
+                
+                if filter_val == 'Картинки' and not path.lower().endswith(SUPPORTED_IMAGES): continue
+                if filter_val == 'Видео' and not path.lower().endswith(SUPPORTED_VIDEOS): continue
+                
+                if tab == 'search': label_text = f"Score: {item[0]:.3f}"
+                elif tab == 'aes': label_text = f"★ {item[0]:.2f} (Пик: {item[2]:.2f})"
+                elif tab == 'nsfw': label_text = f"🚨 Danger: {item[0]*100:.1f}% | {item[2].upper()}"
+                elif tab == 'face': label_text = f"Match: {item[0]*100:.1f}%"
+                elif tab == 'tags': label_text = f"Tags Score: {item[0]:.2f}"
+                    
+                uri = Path(path).absolute().as_uri()
+                ext = os.path.splitext(path)[1].lower()
+                
+                if ext in SUPPORTED_VIDEOS:
+                    path_hash = hashlib.md5(path.encode('utf-8')).hexdigest()
+                    thumb_path = os.path.join(THUMB_CACHE_DIR, f"{path_hash}.jpg")
+                    if not os.path.exists(thumb_path):
+                        try:
+                            with av.open(path) as container:
+                                for frame in container.decode(video=0):
+                                    img = frame.to_image()
+                                    img.thumbnail((300, 300))
+                                    img.convert('RGB').save(thumb_path, format="JPEG", quality=80)
+                                    break
+                        except: pass
+                    
+                    thumb_uri = Path(thumb_path).absolute().as_uri() if os.path.exists(thumb_path) else uri
+                    
+                    html_content.append(
+                        f"<div style='background:#2d2d2d; padding:10px; border-radius:8px; text-align:center; max-width:320px;'>"
+                        f"<a href='{uri}' target='_blank' title='Кликните, чтобы открыть видео'>"
+                        f"<div style='position:relative; width:300px; height:200px; background:#111; border-radius:4px; display:flex; align-items:center; justify-content:center; overflow:hidden;'>"
+                        f"<img src='{thumb_uri}' style='max-width:100%; max-height:100%; object-fit:contain;'>"
+                        f"<div style='position:absolute; top:5px; right:5px; background:rgba(0,0,0,0.7); padding:3px 6px; border-radius:4px; font-size:12px;'>▶ Video</div>"
+                        f"</div></a>"
+                        f"<h4 style='margin:10px 0 5px 0; color:#4caf50;'>{label_text}</h4>"
+                        f"<div style='font-size:11px; color:#aaa; word-wrap:break-word;'>{os.path.basename(path)}</div></div>"
+                    )
+                else:
+                    html_content.append(
+                        f"<div style='background:#2d2d2d; padding:10px; border-radius:8px; text-align:center; max-width:320px;'>"
+                        f"<a href='{uri}' target='_blank'>"
+                        f"<div style='width:300px; height:200px; background:#111; border-radius:4px; display:flex; align-items:center; justify-content:center; overflow:hidden;'>"
+                        f"<img src='{uri}' style='max-width:100%; max-height:100%; object-fit:contain;'></div></a>"
+                        f"<h4 style='margin:10px 0 5px 0; color:#4caf50;'>{label_text}</h4>"
+                        f"<div style='font-size:11px; color:#aaa; word-wrap:break-word;'>{os.path.basename(path)}</div></div>"
+                    )
+            html_content.append("</div></body></html>")
+            
+            try:
+                with open(html_path, "w", encoding="utf-8") as f: f.write("\n".join(html_content))
+                return True
+            except Exception as e:
+                return e
+
+        res = await run.io_bound(_export)
+        if res is True:
             ui.notify(f"Галерея сохранена: {html_path}", type='positive')
-        except Exception as e: ui.notify(f"Ошибка экспорта: {e}", type='negative')
+        else:
+            ui.notify(f"Ошибка экспорта: {res}", type='negative')
 
     # --- БЕЗОПАСНОЕ ОБНОВЛЕНИЕ UI ---
     def refresh_tab_ui(tab_name):
@@ -2748,16 +2764,28 @@ async def index_page():
     async def apply_physical_filters_async(results_list):
         if not results_list: return[]
         
-        # Забираем переменные из state ДО отправки в поток
         min_r = state.filter_min_res
         max_r = state.filter_max_res
         max_s = state.filter_max_size
         orient = state.filter_orientation
 
+        # Если фильтры по умолчанию, мы можем сразу вернуть исходный список без обращений к БД или диску!
+        if min_r <= 0 and max_r >= 10000 and max_s >= 10000 and orient == 'Любая':
+            return results_list
+
         def _filter_task():
             c = search_engine.db_cache.conn.cursor()
-            c.execute("SELECT path, size_mb, width, height FROM files")
-            file_infos = {row[0]: (row[1], row[2], row[3]) for row in c.fetchall()}
+            paths = [item[1] for item in results_list]
+            file_infos = {}
+            
+            # Запрашиваем из базы только те пути, которые реально попали в поиск
+            chunk_size = 900
+            for i in range(0, len(paths), chunk_size):
+                chunk = paths[i:i+chunk_size]
+                ph = ','.join(['?']*len(chunk))
+                c.execute(f"SELECT path, size_mb, width, height FROM files WHERE path IN ({ph})", chunk)
+                for row in c.fetchall():
+                    file_infos[row[0]] = (row[1], row[2], row[3])
             
             filtered =[]
             db_needs_commit = False
@@ -2766,6 +2794,7 @@ async def index_page():
                 p = item[1]
                 info = file_infos.get(p)
                 
+                # Если в базе нет размеров (старый кэш или файл не индексировался), то открываем файл
                 if not info or info[1] is None or info[2] is None:
                     size_mb, w, h = get_physical_info(p)
                     hash_val = search_engine.db_cache.get_hash_by_path(p) or get_fast_hash(p)
@@ -2773,10 +2802,6 @@ async def index_page():
                     db_needs_commit = True
                 else:
                     size_mb, w, h = info
-                    
-                if min_r == 0 and max_r >= 10000 and max_s >= 10000 and orient == 'Любая':
-                    filtered.append(item)
-                    continue
                     
                 if size_mb is not None and size_mb > max_s: continue
                 
@@ -2887,7 +2912,7 @@ async def index_page():
                         item_data = next((i for i in state.tags_results if i[1] == path), None)
                         if item_data and len(item_data) > 2:
                             tags_dict = item_data[2]
-                            valid_tags = [t for t, s in tags_dict.items() if s >= txt_threshold]
+                            valid_tags =[t for t, s in tags_dict.items() if s >= txt_threshold]
                             if valid_tags:
                                 with open(txt_dest, 'w', encoding='utf-8') as f:
                                     f.write(", ".join(valid_tags))
@@ -2911,7 +2936,7 @@ async def index_page():
         sel_dict = getattr(state, f"sel_{tab}")
         
         # Если передали кастомный список (для вкладок со сложной структурой вроде dupes)
-        all_p = custom_paths if custom_paths is not None else [p for i in getattr(state, f"{tab}_results") for p in[i[1]]]
+        all_p = custom_paths if custom_paths is not None else[p for i in getattr(state, f"{tab}_results") for p in[i[1]]]
 
         last_idx = getattr(state, f'last_clicked_{tab}', None)
 
@@ -2967,12 +2992,13 @@ async def index_page():
 
         await asyncio.sleep(0.001)
 
-        filtered_results = []
+        filtered_results =[]
         for item in state.search_results:
             p = item[1].lower()
             if state.search_res_filter == 'Картинки' and not p.endswith(SUPPORTED_IMAGES): continue
             if state.search_res_filter == 'Видео' and not p.endswith(SUPPORTED_VIDEOS): continue
             filtered_results.append(item)
+            
         filtered_results = await apply_physical_filters_async(filtered_results)
 
         total_pages = max(1, (len(filtered_results) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
@@ -3072,6 +3098,7 @@ async def index_page():
             if state.aes_res_filter == 'Картинки' and not p.endswith(SUPPORTED_IMAGES): continue
             if state.aes_res_filter == 'Видео' and not p.endswith(SUPPORTED_VIDEOS): continue
             filtered_results.append(item)
+            
         filtered_results = await apply_physical_filters_async(filtered_results)
 
         total_pages = max(1, (len(filtered_results) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
@@ -3168,6 +3195,7 @@ async def index_page():
             if state.nsfw_res_filter == 'Картинки' and not p.endswith(SUPPORTED_IMAGES): continue
             if state.nsfw_res_filter == 'Видео' and not p.endswith(SUPPORTED_VIDEOS): continue
             filtered_results.append(item)
+            
         filtered_results = await apply_physical_filters_async(filtered_results)
 
         total_pages = max(1, (len(filtered_results) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
@@ -3260,12 +3288,13 @@ async def index_page():
         
         await asyncio.sleep(0.001)
 
-        filtered_results = []
+        filtered_results =[]
         for item in state.face_results:
             p = item[1].lower()
             if state.face_res_filter == 'Картинки' and not p.endswith(SUPPORTED_IMAGES): continue
             if state.face_res_filter == 'Видео' and not p.endswith(SUPPORTED_VIDEOS): continue
             filtered_results.append(item)
+            
         filtered_results = await apply_physical_filters_async(filtered_results)
 
         total_pages = max(1, (len(filtered_results) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
@@ -3330,7 +3359,7 @@ async def index_page():
                         
                         with ui.card().classes('bg-gray-800 border border-gray-700 hover:border-teal-500 transition-colors p-0 overflow-hidden relative'):
                             with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
-                                ui.checkbox().bind_value(state.sel_face, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'face'), ['shiftKey'])
+                                ui.checkbox().bind_value(state.sel_face, path).on('click', lambda e, i=global_index, p=path: handle_shift_click(e, i, p, 'face'),['shiftKey'])
 
                             with ui.context_menu():
                                 ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
@@ -3357,12 +3386,13 @@ async def index_page():
         
         await asyncio.sleep(0.001)
 
-        filtered_results = []
+        filtered_results =[]
         for item in state.tags_results:
             p = item[1].lower()
             if state.tags_res_filter == 'Картинки' and not p.endswith(SUPPORTED_IMAGES): continue
             if state.tags_res_filter == 'Видео' and not p.endswith(SUPPORTED_VIDEOS): continue
             filtered_results.append(item)
+            
         filtered_results = await apply_physical_filters_async(filtered_results)
 
         total_pages = max(1, (len(filtered_results) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
@@ -3682,13 +3712,14 @@ async def index_page():
                             state.add_log("✅ Поиск успешно завершен!")
                         except Exception as e: state.add_log(f"❌ Ошибка поиска: {e}")
                         finally:
-                            state.status_text = "Готово!"
+                            state.status_text = "Применение фильтров и рендеринг..."
                             state.progress = 1.0
                             state.is_processing = False
 
                     await run.io_bound(task)
                     search_gallery_ui.refresh()
                     btn_search.enable()
+                    state.status_text = "Готово!"
 
                 with ui.row().classes('w-full p-4 pt-2 shrink-0 border-t border-gray-800 bg-gray-900 z-10'):
                     btn_search = ui.button('🚀 Искать', on_click=run_search_action).classes('w-full bg-blue-600 hover:bg-blue-500 font-bold')
@@ -3789,13 +3820,14 @@ async def index_page():
                             state.add_log("✅ Оценка эстетики завершена!")
                         except Exception as e: state.add_log(f"❌ Ошибка: {e}")
                         finally:
-                            state.status_text = "Готово!"
+                            state.status_text = "Применение фильтров и рендеринг..."
                             state.progress = 1.0
                             state.is_processing = False
 
                     await run.io_bound(bg_task)
                     aesthetic_gallery_ui.refresh()
                     btn_rate.enable()
+                    state.status_text = "Готово!"
                     
                 with ui.row().classes('w-full p-4 pt-2 shrink-0 border-t border-gray-800 bg-gray-900 z-10'):
                     btn_rate = ui.button('✨ Оценить', on_click=run_aesthetic_action).classes('w-full bg-yellow-600 hover:bg-yellow-500 font-bold text-lg')
@@ -3877,13 +3909,14 @@ async def index_page():
                             state.add_log("✅ NSFW сканирование завершено!")
                         except Exception as e: state.add_log(f"❌ Ошибка: {e}")
                         finally:
-                            state.status_text = "Готово!"
+                            state.status_text = "Применение фильтров и рендеринг..."
                             state.progress = 1.0
                             state.is_processing = False
 
                     await run.io_bound(bg_task)
                     nsfw_gallery_ui.refresh()
                     btn_nsfw.enable()
+                    state.status_text = "Готово!"
                     
                 with ui.row().classes('w-full p-4 pt-2 shrink-0 border-t border-gray-800 bg-gray-900 z-10'):
                     btn_nsfw = ui.button('🚨 Анализ', on_click=run_nsfw_action).classes('w-full bg-red-800 hover:bg-red-700 font-bold text-lg')
@@ -3958,13 +3991,14 @@ async def index_page():
                             state.add_log("✅ Поиск лиц завершен!")
                         except Exception as e: state.add_log(f"❌ Ошибка поиска лиц: {e}")
                         finally:
-                            state.status_text = "Готово!"
+                            state.status_text = "Применение фильтров и рендеринг..."
                             state.progress = 1.0
                             state.is_processing = False
 
                     await run.io_bound(bg_task)
                     face_gallery_ui.refresh()
                     btn_face.enable()
+                    state.status_text = "Готово!"
                     
                 with ui.row().classes('w-full p-4 pt-2 shrink-0 border-t border-gray-800 bg-gray-900 z-10'):
                     btn_face = ui.button('🕵️ Искать Лицо', on_click=run_face_action).classes('w-full bg-teal-600 hover:bg-teal-500 font-bold text-lg')
@@ -4148,7 +4182,7 @@ async def index_page():
                     save_config({
                         'tags_dir': tags_dir.value, 'pos_tags': pos_tags_sel.value, 'neg_tags': neg_tags_sel.value,
                         'tags_threshold': tags_threshold.value, 'chk_txt_tags': chk_txt_tags.value,
-                        'lazy_tags': lazy_tags_input.value  # <--- Добавили сохранение
+                        'lazy_tags': lazy_tags_input.value
                     })
                     if not tags_dir.value: return ui.notify("Укажите папку!", type='warning')
                     
@@ -4164,7 +4198,7 @@ async def index_page():
                     thres_val = float(tags_threshold.value)
                     pos_val = set(pos_tags_sel.value)
                     neg_val = set(neg_tags_sel.value)
-                    lazy_val = lazy_tags_input.value.strip().lower() # <--- Подготовка lazy
+                    lazy_val = lazy_tags_input.value.strip().lower()
                     cache_key = f"{tags_model_sel.value}_{int(tags_video_frames.value)}"
                     
                     exts =[]
@@ -4241,9 +4275,11 @@ async def index_page():
                     
                     state.tags_results = res
                     state.sel_tags = {p: False for s, p, t in res}
+                    state.status_text = "Применение фильтров и рендеринг..."
+                    state.is_processing = False
                     tags_gallery_ui.refresh()
                     btn_search_tags.enable()
-                    state.is_processing = False
+                    state.status_text = "Готово!"
                     
                 with ui.row().classes('w-full p-4 pt-2 shrink-0 border-t border-gray-800 bg-gray-900 z-10 gap-2'):
                     btn_index_tags = ui.button('🔍 Индексировать', on_click=index_tags_action).classes('w-full bg-gray-700 hover:bg-gray-600 font-bold')
@@ -4512,13 +4548,14 @@ async def index_page():
                         except Exception as e: 
                             state.add_log(f"❌ Ошибка поиска дубликатов: {e}")
                         finally:
-                            state.status_text = "Готово!"
+                            state.status_text = "Применение фильтров и рендеринг..."
                             state.progress = 1.0
                             state.is_processing = False
 
                     await run.io_bound(bg_task)
                     dupes_gallery_ui.refresh()
                     btn_dupes.enable()
+                    state.status_text = "Готово!"
                     
                 with ui.row().classes('w-full p-4 pt-2 shrink-0 border-t border-gray-800 bg-gray-900 z-10'):
                     btn_dupes = ui.button('👯 Найти Дубликаты', on_click=run_dupes_action).classes('w-full bg-orange-700 hover:bg-orange-600 font-bold text-lg')
@@ -4567,31 +4604,37 @@ async def index_page():
                     base_dest = await run.io_bound(pick_folder_native)
                     if not base_dest: return
                     
-                    success = 0
-                    moved_paths = set()
-                    
-                    for cluster in state.cluster_results:
-                        cluster_name = cluster["name"]
-                        dest_folder = os.path.join(base_dest, cluster_name)
+                    ui.notify(f"Начато {action} для кластеров...", type='info')
+
+                    def _process_cluster_files():
+                        success = 0
+                        moved_paths = set()
                         
-                        for path in cluster["paths"]:
-                            if state.sel_cluster.get(path):
-                                os.makedirs(dest_folder, exist_ok=True)
-                                fname = os.path.basename(path)
-                                dest = os.path.join(dest_folder, fname)
-                                
-                                # Защита, если исходный файл и цель совпадают
-                                if os.path.abspath(path) == os.path.abspath(dest):
-                                    continue
-                                
-                                try:
-                                    if action == 'copy':
-                                        shutil.copy2(path, dest)
-                                    else:
-                                        shutil.move(path, dest)
-                                        moved_paths.add(path)
-                                    success += 1
-                                except Exception as e: state.add_log(f"Ошибка {path}: {e}")
+                        for cluster in state.cluster_results:
+                            cluster_name = cluster["name"]
+                            dest_folder = os.path.join(base_dest, cluster_name)
+                            
+                            for path in cluster["paths"]:
+                                if state.sel_cluster.get(path):
+                                    os.makedirs(dest_folder, exist_ok=True)
+                                    fname = os.path.basename(path)
+                                    dest = os.path.join(dest_folder, fname)
+                                    
+                                    # Защита, если исходный файл и цель совпадают
+                                    if os.path.abspath(path) == os.path.abspath(dest):
+                                        continue
+                                    
+                                    try:
+                                        if action == 'copy':
+                                            shutil.copy2(path, dest)
+                                        else:
+                                            shutil.move(path, dest)
+                                            moved_paths.add(path)
+                                        success += 1
+                                    except Exception as e: state.add_log(f"Ошибка {path}: {e}")
+                        return success, moved_paths
+                        
+                    success, moved_paths = await run.io_bound(_process_cluster_files)
                                     
                     ui.notify(f'Успешно {action}: {success} файлов', type='positive')
                     
@@ -4638,13 +4681,14 @@ async def index_page():
                             state.add_log(f"✅ Кластеризация завершена! Сформировано папок: {len(res)}")
                         except Exception as e: state.add_log(f"❌ Ошибка: {e}")
                         finally:
-                            state.status_text = "Готово!"
+                            state.status_text = "Применение фильтров и рендеринг..."
                             state.progress = 1.0
                             state.is_processing = False
 
                     await run.io_bound(bg_task)
                     cluster_gallery_ui.refresh()
                     btn_cluster.enable()
+                    state.status_text = "Готово!"
                     
                 with ui.row().classes('w-full p-4 pt-2 shrink-0 border-t border-gray-800 bg-gray-900 z-10'):
                     btn_cluster = ui.button('✨ Раскидать по папкам', on_click=run_cluster_action).classes('w-full bg-purple-700 hover:bg-purple-600 font-bold text-lg')
