@@ -3552,57 +3552,107 @@ async def index_page():
                 start_idx = (getattr(state, 'dupes_page', 1) - 1) * GROUPS_PER_PAGE
                 page_groups = state.dupes_results[start_idx : start_idx + GROUPS_PER_PAGE]
                 
-                # Список только видимых файлов на этой странице для листания в полноэкранном плеере
-                visible_dupes_paths =[]
-                for g in page_groups:
-                    visible_dupes_paths.extend(g[:MAX_ITEMS_PER_GROUP])
+                ITEMS_PER_INNER_PAGE = 60 # Лимит при развороте
                 
-                for group_idx, group in enumerate(page_groups):
+                def render_dupe_group(group_idx, group):
+                    is_expanded = {'val': False}
+                    inner_page = {'val': 1}
+                    
                     with ui.card().classes('w-full bg-gray-800 border border-gray-700 p-2 mb-4'):
-                        ui.label(f"Группа {start_idx + group_idx + 1} (Всего файлов в группе: {len(group)})").classes('font-bold text-orange-400 mb-2 px-2')
-                        
-                        visible_group = group[:MAX_ITEMS_PER_GROUP]
-                        hidden_count = len(group) - MAX_ITEMS_PER_GROUP
-                        
-                        with ui.row().classes('w-full gap-4 overflow-x-auto pb-2 flex-nowrap items-center'):
-                            for path in visible_group:
-                                safe_path = urllib.parse.quote(path)
-                                global_index = visible_dupes_paths.index(path)
+                        with ui.row().classes('w-full justify-between items-center px-2 mb-2'):
+                            ui.label(f"Группа {start_idx + group_idx + 1} (Всего файлов: {len(group)})").classes('font-bold text-orange-400')
+                            
+                            with ui.row().classes('gap-2 items-center'):
+                                def select_group(val):
+                                    for p in group: state.sel_dupes[p] = val
+                                    update_view()
+                                    
+                                ui.button('Выделить группу', on_click=lambda: select_group(True)).props('outline size=sm color=green')
+                                ui.button('Снять выделение', on_click=lambda: select_group(False)).props('outline size=sm color=red')
                                 
-                                with ui.column().classes('w-[200px] shrink-0 relative bg-gray-900 rounded overflow-hidden border border-gray-700 hover:border-orange-500 transition-colors'):
-                                    with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
-                                        ui.checkbox().bind_value(state.sel_dupes, path).on('click', lambda e, i=global_index, p=path, paths=visible_dupes_paths: handle_shift_click(e, i, p, 'dupes', paths),['shiftKey'])
-                                    
-                                    with ui.context_menu():
-                                        ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
-                                        ui.menu_item('Копировать картинку', on_click=lambda p=path: copy_image_to_clipboard(p))
-                                        ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
-                                        ui.separator()
-                                        ui.menu_item('Удалить файл (В корзину)', on_click=lambda p=path: delete_items([p], 'dupes')).classes('text-red-400')
+                                btn_toggle = ui.button('Развернуть', on_click=lambda: toggle_expand()).props('size=sm color=gray')
+                                if len(group) <= MAX_ITEMS_PER_GROUP:
+                                    btn_toggle.set_visibility(False)
 
-                                    # ПОЛНОЭКРАННЫЙ ПЛЕЕР ТЕПЕРЬ АКТИВЕН:
-                                    ui.image(f"/thumb/{safe_path}").classes('w-full h-[150px] object-contain cursor-pointer bg-black').props('fit=contain loading="lazy"').on('click', lambda e, idx=global_index, paths=visible_dupes_paths: open_media(idx, paths))
-                                    
-                                    c = search_engine.db_cache.conn.cursor()
-                                    c.execute("SELECT size_mb, width, height FROM files WHERE path=?", (path,))
-                                    info = c.fetchone()
-                                    size_str = f"{info[0]:.2f} MB" if info and info[0] else "N/A"
-                                    res_str = f"{info[1]}x{info[2]}" if info and info[1] else "N/A"
-                                    
-                                    with ui.column().classes('p-2 gap-0 w-full'):
-                                        with ui.row().classes('w-full justify-between items-center'):
-                                            ui.label(res_str).classes('text-green-400 font-bold text-xs')
-                                            ui.button(icon='folder', on_click=lambda p=path: reveal_file_native(p)).props('flat round dense color=white size=xs').tooltip('Открыть папку')
-                                        ui.label(size_str).classes('text-yellow-400 font-bold text-xs')
-                                        ui.label(os.path.basename(path)).classes('text-gray-400 text-[10px] truncate w-full').tooltip(path)
+                        content_container = ui.column().classes('w-full p-0 m-0')
 
-                            # ПЛАШКА ЗАЩИТЫ, ЕСЛИ ФАЙЛОВ В ГРУППЕ СЛИШКОМ МНОГО:
-                            if hidden_count > 0:
-                                with ui.card().classes('w-[200px] h-[210px] shrink-0 flex flex-col items-center justify-center bg-gray-900 border border-dashed border-gray-600 gap-2 p-4'):
-                                    ui.icon('more_horiz', size='3rem').classes('text-gray-500')
-                                    ui.label(f"+ еще {hidden_count} шт.").classes('text-center font-bold text-gray-300 text-lg')
-                                    ui.label("Скрыты для защиты от лагов").classes('text-[10px] text-center text-gray-500')
-                                    ui.label("Автовыбор обработает их все!").classes('text-[10px] text-center text-orange-600 font-bold')
+                        def toggle_expand():
+                            is_expanded['val'] = not is_expanded['val']
+                            inner_page['val'] = 1
+                            btn_toggle.text = 'Свернуть' if is_expanded['val'] else 'Развернуть'
+                            btn_toggle._props['color'] = 'orange' if is_expanded['val'] else 'gray'
+                            btn_toggle.update()
+                            update_view()
+
+                        def update_view():
+                            content_container.clear()
+                            with content_container:
+                                if is_expanded['val']:
+                                    start_i = (inner_page['val'] - 1) * ITEMS_PER_INNER_PAGE
+                                    end_i = start_i + ITEMS_PER_INNER_PAGE
+                                    visible_group = group[start_i:end_i]
+                                    row_cls = 'w-full gap-4 pb-2 items-start flex-wrap'
+                                else:
+                                    visible_group = group[:MAX_ITEMS_PER_GROUP]
+                                    row_cls = 'w-full gap-4 pb-2 items-start overflow-x-auto flex-nowrap'
+
+                                hidden_count = 0 if is_expanded['val'] else len(group) - MAX_ITEMS_PER_GROUP
+
+                                with ui.row().classes(row_cls):
+                                    for path in visible_group:
+                                        safe_path = urllib.parse.quote(path)
+                                        local_index = group.index(path)
+                                        
+                                        with ui.column().classes('w-[200px] shrink-0 relative bg-gray-900 rounded overflow-hidden border border-gray-700 hover:border-orange-500 transition-colors'):
+                                            with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
+                                                ui.checkbox().bind_value(state.sel_dupes, path).on('click', lambda e, i=local_index, p=path, paths=group: handle_shift_click(e, i, p, 'dupes', paths),['shiftKey'])
+                                            
+                                            with ui.context_menu():
+                                                ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
+                                                ui.menu_item('Копировать картинку', on_click=lambda p=path: copy_image_to_clipboard(p))
+                                                ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
+                                                ui.separator()
+                                                ui.menu_item('Удалить файл (В корзину)', on_click=lambda p=path: delete_items([p], 'dupes')).classes('text-red-400')
+
+                                            # Плеер ограничен текущей группой
+                                            ui.image(f"/thumb/{safe_path}").classes('w-full h-[150px] object-contain cursor-pointer bg-black').props('fit=contain loading="lazy"').on('click', lambda e, idx=local_index, paths=group: open_media(idx, paths))
+                                            
+                                            c = search_engine.db_cache.conn.cursor()
+                                            c.execute("SELECT size_mb, width, height FROM files WHERE path=?", (path,))
+                                            info = c.fetchone()
+                                            size_str = f"{info[0]:.2f} MB" if info and info[0] else "N/A"
+                                            res_str = f"{info[1]}x{info[2]}" if info and info[1] else "N/A"
+                                            
+                                            with ui.column().classes('p-2 gap-0 w-full'):
+                                                with ui.row().classes('w-full justify-between items-center'):
+                                                    ui.label(res_str).classes('text-green-400 font-bold text-xs')
+                                                    ui.button(icon='folder', on_click=lambda p=path: reveal_file_native(p)).props('flat round dense color=white size=xs').tooltip('Открыть папку')
+                                                ui.label(size_str).classes('text-yellow-400 font-bold text-xs')
+                                                ui.label(os.path.basename(path)).classes('text-gray-400 text-[10px] truncate w-full').tooltip(path)
+
+                                    if hidden_count > 0 and not is_expanded['val']:
+                                        with ui.card().classes('w-[200px] h-[210px] shrink-0 flex flex-col items-center justify-center bg-gray-900 border border-dashed border-gray-600 gap-2 p-4 cursor-pointer hover:border-orange-500 transition-colors').on('click', toggle_expand):
+                                            ui.icon('more_horiz', size='3rem').classes('text-gray-500')
+                                            ui.label(f"+ еще {hidden_count} шт.").classes('text-center font-bold text-gray-300 text-lg')
+                                            ui.label("Нажмите, чтобы развернуть").classes('text-[10px] text-center text-orange-400')
+                                            
+                                # Внутренняя пагинация для больших групп
+                                if is_expanded['val'] and len(group) > ITEMS_PER_INNER_PAGE:
+                                    tot_inner_pages = max(1, (len(group) + ITEMS_PER_INNER_PAGE - 1) // ITEMS_PER_INNER_PAGE)
+                                    
+                                    def change_inner_page(d):
+                                        inner_page['val'] = max(1, min(tot_inner_pages, inner_page['val'] + d))
+                                        update_view()
+
+                                    with ui.row().classes('w-full justify-center items-center gap-4 py-2 border-t border-gray-700 mt-2'):
+                                        ui.button(icon='chevron_left', on_click=lambda: change_inner_page(-1)).props('flat outline color=orange size=sm')
+                                        ui.label(f'Под-страница {inner_page["val"]} из {tot_inner_pages}').classes('text-gray-400 text-xs font-bold')
+                                        ui.button(icon='chevron_right', on_click=lambda: change_inner_page(1)).props('flat outline color=orange size=sm')
+
+                        update_view() # Первичная отрисовка при создании
+
+                for group_idx, group in enumerate(page_groups):
+                    render_dupe_group(group_idx, group)
 
             ui.button(icon='keyboard_arrow_up', on_click=lambda: ui.run_javascript(f'document.getElementById("{scroll_id}").scrollTo({{top: 0, behavior: "smooth"}})')).props('round color=orange-800').classes('absolute bottom-6 right-6 z-50 shadow-lg').tooltip('Наверх')
 
@@ -4746,89 +4796,94 @@ async def index_page():
                         start_idx = (getattr(state, 'cluster_page', 1) - 1) * GROUPS_PER_PAGE
                         page_groups = state.cluster_results[start_idx : start_idx + GROUPS_PER_PAGE]
                         
-                        for group in page_groups:
+                        def render_cluster_group(group):
                             cluster_name = group["name"]
-                            is_expanded = cluster_name in state.expanded_clusters
-                            c_page = state.expanded_pages.get(cluster_name, 1)
+                            paths = group["paths"]
+                            is_expanded = {'val': False}
+                            inner_page = {'val': 1}
                             
                             with ui.card().classes('w-full bg-gray-800 border border-gray-700 p-2 mb-4'):
-                                # --- ШАПКА КЛАСТЕРА ---
                                 with ui.row().classes('w-full justify-between items-center px-2 mb-2'):
-                                    ui.label(f'📁 {cluster_name} (Всего файлов: {len(group["paths"])})').classes('font-bold text-purple-400')
+                                    ui.label(f'📁 {cluster_name} (Всего файлов: {len(paths)})').classes('font-bold text-purple-400')
                                     
                                     with ui.row().classes('gap-2 items-center'):
-                                        def select_cluster(paths, val):
-                                            # Мгновенно выделяет ВСЮ группу в памяти (600+ файлов)
+                                        def select_cluster(val):
                                             for p in paths: state.sel_cluster[p] = val
-                                            cluster_gallery_ui.refresh()
+                                            update_view()
 
-                                        ui.button('Выделить группу', on_click=lambda p=group["paths"]: select_cluster(p, True)).props('outline size=sm color=green')
-                                        ui.button('Снять выделение', on_click=lambda p=group["paths"]: select_cluster(p, False)).props('outline size=sm color=red')
+                                        ui.button('Выделить группу', on_click=lambda: select_cluster(True)).props('outline size=sm color=green')
+                                        ui.button('Снять выделение', on_click=lambda: select_cluster(False)).props('outline size=sm color=red')
                                         
-                                        def toggle_expand(c_name=cluster_name):
-                                            if c_name in state.expanded_clusters:
-                                                state.expanded_clusters.remove(c_name)
-                                            else:
-                                                state.expanded_clusters.add(c_name)
-                                                state.expanded_pages[c_name] = 1 # Сброс на 1-ю страницу группы
-                                            cluster_gallery_ui.refresh()
-                                            
-                                        if len(group["paths"]) > MAX_ITEMS_PER_GROUP:
-                                            ui.button('Свернуть' if is_expanded else 'Развернуть', on_click=toggle_expand).props(f'size=sm color={"gray" if is_expanded else "purple"}')
+                                        btn_toggle = ui.button('Развернуть', on_click=lambda: toggle_expand()).props('size=sm color=gray')
+                                        if len(paths) <= MAX_ITEMS_PER_GROUP:
+                                            btn_toggle.set_visibility(False)
 
-                                # --- ЛОГИКА ОТОБРАЖЕНИЯ (DOM VIRTUALIZATION) ---
-                                if is_expanded:
-                                    start_i = (c_page - 1) * ITEMS_PER_PAGE_CLUSTER
-                                    end_i = start_i + ITEMS_PER_PAGE_CLUSTER
-                                    visible_group = group["paths"][start_i:end_i]
-                                else:
-                                    visible_group = group["paths"][:MAX_ITEMS_PER_GROUP]
-                                    
-                                hidden_count = 0 if is_expanded else len(group["paths"]) - MAX_ITEMS_PER_GROUP
-                                row_classes = 'w-full gap-4 pb-2 items-start ' + ('flex-wrap' if is_expanded else 'overflow-x-auto flex-nowrap')
-                                
-                                with ui.row().classes(row_classes):
-                                    for path in visible_group:
-                                        safe_path = urllib.parse.quote(path)
-                                        # Используем индекс в рамках всего кластера для Шифт-клика и плеера!
-                                        local_index = group["paths"].index(path)
+                                content_container = ui.column().classes('w-full p-0 m-0')
+
+                                def toggle_expand():
+                                    is_expanded['val'] = not is_expanded['val']
+                                    inner_page['val'] = 1
+                                    btn_toggle.text = 'Свернуть' if is_expanded['val'] else 'Развернуть'
+                                    btn_toggle._props['color'] = 'purple' if is_expanded['val'] else 'gray'
+                                    btn_toggle.update()
+                                    update_view()
+
+                                def update_view():
+                                    content_container.clear()
+                                    with content_container:
+                                        if is_expanded['val']:
+                                            start_i = (inner_page['val'] - 1) * ITEMS_PER_PAGE_CLUSTER
+                                            end_i = start_i + ITEMS_PER_PAGE_CLUSTER
+                                            visible_group = paths[start_i:end_i]
+                                            row_cls = 'w-full gap-4 pb-2 items-start flex-wrap'
+                                        else:
+                                            visible_group = paths[:MAX_ITEMS_PER_GROUP]
+                                            row_cls = 'w-full gap-4 pb-2 items-start overflow-x-auto flex-nowrap'
+                                            
+                                        hidden_count = 0 if is_expanded['val'] else len(paths) - MAX_ITEMS_PER_GROUP
                                         
-                                        with ui.column().classes('w-[200px] shrink-0 relative bg-gray-900 rounded overflow-hidden border border-gray-700 hover:border-purple-500 transition-colors'):
-                                            with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
-                                                # Shift-Click теперь работает через всю группу group["paths"]
-                                                ui.checkbox().bind_value(state.sel_cluster, path).on('click', lambda e, i=local_index, p=path, paths=group["paths"]: handle_shift_click(e, i, p, 'cluster', paths),['shiftKey'])
+                                        with ui.row().classes(row_cls):
+                                            for path in visible_group:
+                                                safe_path = urllib.parse.quote(path)
+                                                local_index = paths.index(path)
+                                                
+                                                with ui.column().classes('w-[200px] shrink-0 relative bg-gray-900 rounded overflow-hidden border border-gray-700 hover:border-purple-500 transition-colors'):
+                                                    with ui.row().classes('absolute top-2 left-2 bg-black/60 rounded px-1 z-10'):
+                                                        ui.checkbox().bind_value(state.sel_cluster, path).on('click', lambda e, i=local_index, p=path, pts=paths: handle_shift_click(e, i, p, 'cluster', pts),['shiftKey'])
+                                                    
+                                                    with ui.context_menu():
+                                                        ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
+                                                        ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
+                                                        ui.separator()
+                                                        ui.menu_item('Удалить файл', on_click=lambda p=path: delete_items([p], 'cluster')).classes('text-red-400')
+
+                                                    ui.image(f"/thumb/{safe_path}").classes('w-full h-[150px] object-contain cursor-pointer bg-black').props('fit=contain loading="lazy"').on('click', lambda e, idx=local_index, pts=paths: open_media(idx, pts))
+                                                    
+                                                    with ui.column().classes('p-2 gap-0 w-full'):
+                                                        ui.label(os.path.basename(path)).classes('text-gray-400 text-[10px] truncate w-full').tooltip(path)
+
+                                            if hidden_count > 0 and not is_expanded['val']:
+                                                with ui.card().classes('w-[200px] h-[190px] shrink-0 flex flex-col items-center justify-center bg-gray-900 border border-dashed border-gray-600 gap-2 p-4 cursor-pointer hover:border-purple-500 transition-colors').on('click', toggle_expand):
+                                                    ui.icon('more_horiz', size='3rem').classes('text-gray-500')
+                                                    ui.label(f"+ еще {hidden_count} шт.").classes('text-center font-bold text-gray-300 text-lg')
+                                                    ui.label("Нажмите, чтобы развернуть").classes('text-[10px] text-center text-purple-400')
+
+                                        if is_expanded['val'] and len(paths) > ITEMS_PER_PAGE_CLUSTER:
+                                            tot_c_pages = max(1, (len(paths) + ITEMS_PER_PAGE_CLUSTER - 1) // ITEMS_PER_PAGE_CLUSTER)
                                             
-                                            with ui.context_menu():
-                                                ui.menu_item('Скопировать путь', on_click=lambda p=path: ui.clipboard.write(p))
-                                                ui.menu_item('Открыть папку', on_click=lambda p=path: reveal_file_native(p))
-                                                ui.separator()
-                                                ui.menu_item('Удалить файл', on_click=lambda p=path: delete_items([p], 'cluster')).classes('text-red-400')
+                                            def change_c_page(d):
+                                                inner_page['val'] = max(1, min(tot_c_pages, inner_page['val'] + d))
+                                                update_view()
 
-                                            # В ПЛЕЕР ПЕРЕДАЕТСЯ ВЕСЬ КЛАСТЕР, а не только видимые
-                                            ui.image(f"/thumb/{safe_path}").classes('w-full h-[150px] object-contain cursor-pointer bg-black').props('fit=contain loading="lazy"').on('click', lambda e, idx=local_index, paths=group["paths"]: open_media(idx, paths))
-                                            
-                                            with ui.column().classes('p-2 gap-0 w-full'):
-                                                ui.label(os.path.basename(path)).classes('text-gray-400 text-[10px] truncate w-full').tooltip(path)
+                                            with ui.row().classes('w-full justify-center items-center gap-4 py-2 border-t border-gray-700 mt-4'):
+                                                ui.button(icon='chevron_left', on_click=lambda: change_c_page(-1)).props('flat outline color=purple size=sm')
+                                                ui.label(f'Под-страница {inner_page["val"]} из {tot_c_pages}').classes('text-gray-400 text-xs font-bold')
+                                                ui.button(icon='chevron_right', on_click=lambda: change_c_page(1)).props('flat outline color=purple size=sm')
 
-                                    if hidden_count > 0 and not is_expanded:
-                                        with ui.card().classes('w-[200px] h-[190px] shrink-0 flex flex-col items-center justify-center bg-gray-900 border border-dashed border-gray-600 gap-2 p-4 cursor-pointer hover:border-purple-500 transition-colors').on('click', toggle_expand):
-                                            ui.icon('more_horiz', size='3rem').classes('text-gray-500')
-                                            ui.label(f"+ еще {hidden_count} шт.").classes('text-center font-bold text-gray-300 text-lg')
-                                            ui.label("Нажмите, чтобы развернуть").classes('text-[10px] text-center text-purple-400')
+                                update_view() # Первичная отрисовка
 
-                                # --- ВНУТРЕННЯЯ ПАГИНАЦИЯ (Показывается только когда развернуто) ---
-                                if is_expanded and len(group["paths"]) > ITEMS_PER_PAGE_CLUSTER:
-                                    tot_c_pages = max(1, (len(group["paths"]) + ITEMS_PER_PAGE_CLUSTER - 1) // ITEMS_PER_PAGE_CLUSTER)
-                                    
-                                    def change_c_page(d, c_name=cluster_name, max_p=tot_c_pages):
-                                        new_p = max(1, min(max_p, state.expanded_pages.get(c_name, 1) + d))
-                                        state.expanded_pages[c_name] = new_p
-                                        cluster_gallery_ui.refresh()
-
-                                    with ui.row().classes('w-full justify-center items-center gap-4 py-2 border-t border-gray-700 mt-4'):
-                                        ui.button(icon='chevron_left', on_click=lambda: change_c_page(-1)).props('flat outline color=purple size=sm')
-                                        ui.label(f'Под-страница {c_page} из {tot_c_pages}').classes('text-gray-400 text-xs font-bold')
-                                        ui.button(icon='chevron_right', on_click=lambda: change_c_page(1)).props('flat outline color=purple size=sm')
+                        for group in page_groups:
+                            render_cluster_group(group)
 
                     ui.button(icon='keyboard_arrow_up', on_click=lambda: ui.run_javascript(f'document.getElementById("{scroll_id}").scrollTo({{top: 0, behavior: "smooth"}})')).props('round color=purple-800').classes('absolute bottom-6 right-6 z-50 shadow-lg').tooltip('Наверх')
             
