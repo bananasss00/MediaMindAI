@@ -3702,6 +3702,8 @@ async def index_page():
                         ui.button('АВТО-ВЫБОР ХУДШИХ', icon='auto_awesome', on_click=auto_select_worst_dupes).props('color=orange text-black font-bold dense')
                         ui.button('Снять всё', on_click=lambda: ui.timer(0, lambda: set_all('dupes', False), once=True)).props('outline color=white dense')
                     with ui.row().classes('gap-2 items-center'):
+                        ui.button('Копировать по группам ✔', icon='content_copy', on_click=lambda: execute_dupes_action('copy')).props('color=orange-800 text-white font-bold dense')
+                        ui.button('Переместить по группам ✔', icon='drive_file_move', on_click=lambda: execute_dupes_action('move')).props('color=orange-600 text-white font-bold dense')
                         ui.button('УДАЛИТЬ ВЫДЕЛЕННЫЕ ✔', icon='delete_forever', on_click=lambda: delete_items([p for p, c in state.sel_dupes.items() if c], 'dupes')).props('color=red-10 text-white dense')
                 
                 with ui.row().classes('w-full justify-center my-0 items-center gap-4'):
@@ -4741,6 +4743,56 @@ async def index_page():
                         
                     dupes_mode.on_value_change(update_dupes_visibility)
                     update_dupes_visibility()
+
+                async def execute_dupes_action(action='copy'):
+                    selected_paths = [p for p, checked in state.sel_dupes.items() if checked]
+                    if not selected_paths: return ui.notify('Ничего не выбрано!', type='warning')
+                        
+                    base_dest = await run.io_bound(pick_folder_native)
+                    if not base_dest: return
+                    
+                    ui.notify(f"Начато {action} для дубликатов...", type='info')
+
+                    def _process_dupes_files():
+                        success = 0
+                        moved_paths = set()
+                        
+                        for idx, group in enumerate(state.dupes_results):
+                            group_name = f"Group_{idx+1:03d}"
+                            dest_folder = os.path.join(base_dest, group_name)
+                            
+                            for path in group:
+                                if state.sel_dupes.get(path):
+                                    os.makedirs(dest_folder, exist_ok=True)
+                                    fname = os.path.basename(path)
+                                    dest = os.path.join(dest_folder, fname)
+                                    
+                                    # Защита, если исходный файл и цель совпадают
+                                    if os.path.abspath(path) == os.path.abspath(dest):
+                                        continue
+                                    
+                                    try:
+                                        if action == 'copy':
+                                            shutil.copy2(path, dest)
+                                        else:
+                                            shutil.move(path, dest)
+                                            moved_paths.add(path)
+                                        success += 1
+                                    except Exception as e: state.add_log(f"Ошибка {path}: {e}")
+                        return success, moved_paths
+                        
+                    success, moved_paths = await run.io_bound(_process_dupes_files)
+                                    
+                    ui.notify(f'Успешно {action}: {success} файлов', type='positive')
+                    
+                    if action == 'move' and moved_paths:
+                        new_dupes =[]
+                        for g in state.dupes_results:
+                            new_g = [item for item in g if item not in moved_paths]
+                            # Оставляем группу, только если в ней все еще есть с чем сравнивать (больше 1 файла)
+                            if len(new_g) > 1: new_dupes.append(new_g)
+                        state.dupes_results = new_dupes
+                        dupes_gallery_ui.refresh()
 
                 async def run_dupes_action():
                     save_config({
