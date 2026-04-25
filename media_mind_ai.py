@@ -2364,8 +2364,36 @@ def index_page():
                 search_engine.files_cache.save_cache()
                 ui.notify("Индекс файлов (кэш путей) сброшен", type="positive")
 
+            async def vacuum_database():
+                ui.notify("Начато сжатие базы данных и очистка WAL... Это может занять время.", type="warning")
+                def task():
+                    db_path = 'image_cache.db'
+                    wal_path = db_path + '-wal'
+                    
+                    # 1. Замеряем исходный размер (DB + WAL)
+                    start_db = os.path.getsize(db_path) / (1024*1024) if os.path.exists(db_path) else 0
+                    start_wal = os.path.getsize(wal_path) / (1024*1024) if os.path.exists(wal_path) else 0
+                    start_total = start_db + start_wal
+
+                    # 2. Выполняем сжатие
+                    search_engine.db_cache.conn.execute("VACUUM")
+                    
+                    # 3. ПРИНУДИТЕЛЬНО очищаем и обрезаем файл WAL до 0 байт!
+                    search_engine.db_cache.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    
+                    # 4. Замеряем итоговый размер
+                    end_db = os.path.getsize(db_path) / (1024*1024) if os.path.exists(db_path) else 0
+                    end_wal = os.path.getsize(wal_path) / (1024*1024) if os.path.exists(wal_path) else 0
+                    end_total = end_db + end_wal
+                    
+                    return start_total, end_total
+                    
+                start_sz, end_sz = await run.io_bound(task)
+                ui.notify(f"База успешно сжата! Было (с WAL): {start_sz:.1f} МБ -> Стало: {end_sz:.1f} МБ", type="positive", timeout=8000)
+                
             with ui.column().classes('w-full gap-2 mt-4'):
                 ui.button('Удалить "Мертвые души" (Файлы, которых больше нет на диске)', on_click=cleanup_dead_links).props('outline color=orange').classes('w-full')
+                ui.button('Сжать базу данных (VACUUM)', on_click=vacuum_database).props('outline color=blue').classes('w-full').tooltip('Уменьшает размер файла .db на диске после удаления данных')
                 with ui.row().classes('w-full gap-2'):
                     ui.button('Очистить миниатюры', on_click=cleanup_thumbnails).props('outline color=gray').classes('flex-grow')
                     ui.button('Сбросить индекс папок', on_click=cleanup_file_index).props('outline color=gray').classes('flex-grow')
@@ -4725,7 +4753,7 @@ if __name__ in {"__main__", "__mp_main__"}:
     if args.server_only:
         print(f"🌐 Режим сервера активирован. Откройте в браузере: http://{args.host}:{args.port}")
         # native=False отключает десктопное окно, show=False предотвращает автоматическое открытие вкладки
-        ui.run(title="AI Media Organizer Pro", host=args.host, port=args.port, native=False, show=False, dark=True, reload=False)
+        ui.run(title="AI Media Organizer Pro", host=args.host, port=args.port, native=False, show=False, dark=True, reload=False, reconnect_timeout=30.0)
     else:
         # Стандартный оконный (Native) режим
-        ui.run(title="AI Media Organizer Pro", port=args.port, native=True, dark=True, window_size=(1400, 900), reload=False)
+        ui.run(title="AI Media Organizer Pro", port=args.port, native=True, dark=True, window_size=(1400, 900), reload=False, reconnect_timeout=30.0)
