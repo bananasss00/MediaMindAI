@@ -1826,6 +1826,44 @@ class DuplicatesEngine:
     def __init__(self, search_engine):
         self.se = search_engine
         self.db_cache = search_engine.db_cache
+
+    def _extract_video_frames_for_phash(self, path, mode):
+        try:
+            import av
+            frames =[]
+            with av.open(path) as container:
+                stream = container.streams.video[0]
+                total_frames = stream.frames
+                if not total_frames or total_frames <= 0:
+                    total_frames = 100 # Фолбэк, если метаданные битые
+                    
+                if mode == '1 кадр (Самое начало 0%)': indices = [0]
+                elif mode == '1 кадр (Середина 50%)': indices =[total_frames // 2]
+                elif mode == '3 кадра (0%, 50%, 100%)': indices = [0, total_frames // 2, total_frames - 1]
+                elif mode == '5 кадров (Равномерно)': indices =[int(i * (total_frames - 1) / 4) for i in range(5)]
+                elif mode == '10 кадров (Равномерно)': indices =[int(i * (total_frames - 1) / 9) for i in range(10)]
+                else: indices =[total_frames // 2]
+                
+                target_indices = sorted(list(set(indices)))
+                target_idx = 0
+                
+                for i, frame in enumerate(container.decode(video=0)):
+                    if target_idx < len(target_indices) and i == target_indices[target_idx]:
+                        frames.append(frame.to_image().convert("RGB"))
+                        target_idx += 1
+                    if target_idx >= len(target_indices):
+                        break
+                        
+            # Фолбэк, если видео оказалось короче и не выдало кадров
+            if not frames and target_indices:
+                with av.open(path) as container:
+                    for frame in container.decode(video=0):
+                        frames.append(frame.to_image().convert("RGB"))
+                        break
+            return frames
+        except Exception as e:
+            state.add_log(f"⚠️ Ошибка извлечения кадров (pHash) из {path}: {e}")
+            return[]
         
     def find_exact(self, dir_paths, allowed_exts):
         files = self.se._gather_files(dir_paths, allowed_exts)
@@ -1840,9 +1878,8 @@ class DuplicatesEngine:
         for g in results: g.sort()
         return results
 
-    def find_similar(self, dir_paths, allowed_exts, threshold):
+    def find_similar(self, dir_paths, allowed_exts, threshold, video_frames_mode):
         files = self.se._gather_files(dir_paths, allowed_exts)
-        files =[f for f in files if f.lower().endswith(SUPPORTED_IMAGES)]
         path_to_hash = self.db_cache.get_or_create_hashes(files)
         
         c = self.db_cache.conn.cursor()
@@ -1858,20 +1895,30 @@ class DuplicatesEngine:
                 
         missing_paths =[p for p in files if path_to_hash.get(p) not in phash_dict]
         if missing_paths:
-            state.add_log(f"Вычисление pHash для {len(missing_paths)} новых изображений...")
+            state.add_log(f"Вычисление pHash для {len(missing_paths)} новых файлов (включая видео)...")
             to_insert =[]
             last_update = time.time()
             for i, p in enumerate(missing_paths):
                 if state.is_processing == False or self.se.cancel_flag: break
                 try:
-                    with Image.open(p) as img:
-                        ph = str(imagehash.phash(img))
+                    ext = os.path.splitext(p)[1].lower()
+                    hashes_str = ""
+                    if ext in SUPPORTED_IMAGES:
+                        with Image.open(p) as img:
+                            hashes_str = str(imagehash.phash(img))
+                    elif ext in SUPPORTED_VIDEOS:
+                        frames = self._extract_video_frames_for_phash(p, video_frames_mode)
+                        h_list =[str(imagehash.phash(f)) for f in frames]
+                        if h_list:
+                            hashes_str = ",".join(h_list)
+                            
+                    if hashes_str:
                         h = path_to_hash[p]
-                        phash_dict[h] = ph
-                        to_insert.append((h, ph))
+                        phash_dict[h] = hashes_str
+                        to_insert.append((h, hashes_str))
                 except Exception: pass
                 
-                # Защита от обрыва: обновляем UI раз в полсекунды и отдаем процессор
+                # Защита от обрыва: обновляем UI
                 if time.time() - last_update > 0.5:
                     state.progress = i / max(1, len(missing_paths))
                     last_update = time.time()
@@ -1881,10 +1928,14 @@ class DuplicatesEngine:
                 c.executemany("INSERT OR REPLACE INTO phash_cache (hash, phash) VALUES (?, ?)", to_insert)
                 self.db_cache.conn.commit()
         
-        state.add_log("Кластеризация дубликатов...")
+        state.add_log("Кластеризация дубликатов (Кросс-медиа пулинг)...")
+        
+        # Конвертируем HEX-строки в числа uint64 для молниеносных битовых операций
         hash_objs = {}
-        for h, ph_hex in phash_dict.items():
-            try: hash_objs[h] = imagehash.hex_to_hash(ph_hex)
+        for h, ph_str in phash_dict.items():
+            if not ph_str: continue
+            try:
+                hash_objs[h] = [int(x, 16) for x in ph_str.split(',')]
             except Exception: pass
             
         parent = {h: h for h in hash_objs.keys()}
@@ -1900,16 +1951,34 @@ class DuplicatesEngine:
         hash_list = list(hash_objs.keys())
         total = len(hash_list)
         last_update = time.time()
+        
         for i in range(total):
             if self.se.cancel_flag: break
             h1 = hash_list[i]
-            obj1 = hash_objs[h1]
+            obj1_list = hash_objs[h1]
+            
             for j in range(i+1, total):
                 h2 = hash_list[j]
-                if obj1 - hash_objs[h2] <= threshold:
+                obj2_list = hash_objs[h2]
+                
+                # Матричное сравнение Картинка<->Видео (если дистанция <= порогу хоть для 1 пары -> дубликат)
+                match = False
+                for val1 in obj1_list:
+                    for val2 in obj2_list:
+                        # Используем bit_count (Python 3.10+) или фолбэк для старых версий
+                        try:
+                            dist = (val1 ^ val2).bit_count()
+                        except AttributeError:
+                            dist = bin(val1 ^ val2).count('1')
+                            
+                        if dist <= threshold:
+                            match = True
+                            break
+                    if match: break
+                        
+                if match:
                     union(h1, h2)
                     
-            # Отпускаем процессор и UI каждые 0.5 сек (спасает от зависания сервака при N^2 нагрузке)
             if time.time() - last_update > 0.5:
                 state.progress = i / max(1, total)
                 last_update = time.time()
@@ -1922,7 +1991,7 @@ class DuplicatesEngine:
                 root = find(h)
                 groups[root].append(p)
                 
-        results =[paths for paths in groups.values() if len(paths) > 1]
+        results = [paths for paths in groups.values() if len(paths) > 1]
         results.sort(key=lambda g: len(g), reverse=True)
         for g in results: g.sort()
         return results
@@ -1932,7 +2001,7 @@ class ClusteringEngine:
         self.se = search_engine
         self.db_cache = search_engine.db_cache
 
-    def build_clusters(self, dir_paths, allowed_exts, algo, n_clusters, eps, emb_model_name, emb_size):
+    def build_clusters(self, dir_paths, allowed_exts, algo, n_clusters, eps, emb_model_name, emb_size, batch_size, video_frames, quant_mode):
         if not SKLEARN_AVAILABLE:
             raise Exception("Установите библиотеку scikit-learn: pip install scikit-learn")
 
@@ -1959,28 +2028,77 @@ class ClusteringEngine:
                 except Exception as e: 
                     state.add_log(f"⚠️ Ошибка загрузки вектора: {e}")
 
-        valid_paths =[]
-        valid_embs =[]
+        valid_paths = []
+        valid_embs = []
+        missing_paths =[]
+        
         for p in files:
             h = path_to_hash.get(p)
             if h in emb_dict:
                 valid_paths.append(p)
                 valid_embs.append(emb_dict[h])
+            else:
+                missing_paths.append(p)
+
+        # Если есть файлы без эмбеддингов — вычисляем их "на лету"
+        if missing_paths:
+            state.add_log(f"Вычисление ИИ-векторов для {len(missing_paths)} новых файлов (On-the-fly)...")
+            
+            # Сохраняем старые настройки движка
+            old_vf = self.se.video_frames
+            old_es = self.se.emb_size
+            old_qm = self.se.quant_mode
+            
+            self.se.video_frames = video_frames
+            self.se.emb_size = emb_size
+            self.se.quant_mode = quant_mode
+            
+            # Запускаем кэширование только для пропущенных файлов
+            self.se.build_cache(dir_paths, emb_model_name, batch_size, allowed_exts, override_files=missing_paths)
+            
+            # Восстанавливаем настройки
+            self.se.video_frames = old_vf
+            self.se.emb_size = old_es
+            self.se.quant_mode = old_qm
+            
+            if self.se.cancel_flag:
+                raise Exception("Инференс отменен пользователем.")
+                
+            # Докачиваем новые вектора из БД
+            for i in range(0, len(missing_paths), chunk_size):
+                chunk_paths = missing_paths[i:i+chunk_size]
+                chunk_hashes =[path_to_hash[p] for p in chunk_paths]
+                ph = ','.join(['?']*len(chunk_hashes))
+                c.execute(f"SELECT hash, features FROM emb_cache WHERE model=? AND hash IN ({ph})", [cache_key] + chunk_hashes)
+                for row in c.fetchall():
+                    try:
+                        feat_tensor = torch.load(io.BytesIO(row[1]), weights_only=False)
+                        emb_dict[row[0]] = feat_tensor.float().cpu().numpy().flatten()
+                    except Exception: pass
+                        
+            # Добавляем новоиспеченные файлы в финальный пул
+            for p in missing_paths:
+                h = path_to_hash.get(p)
+                if h in emb_dict:
+                    valid_paths.append(p)
+                    valid_embs.append(emb_dict[h])
 
         if not valid_paths:
-            raise Exception(f"Эмбеддинги не найдены! Проверьте, что в Индексаторе вы выбрали ту же модель '{emb_model_name}' и то же разрешение '{emb_size}'.")
+            raise Exception("Не удалось получить эмбеддинги для кластеризации. Возможно, файлы повреждены.")
 
-        state.add_log(f"Найдено {len(valid_paths)} файлов с кэшем. Запуск алгоритма {algo}...")
+        # Выгружаем модель из памяти, чтобы она не мешала тяжелому Scikit-learn
+        self.se._unload_embedding_model()
+
+        state.add_log(f"Найдено {len(valid_paths)} файлов. Запуск алгоритма {algo}...")
         
         X = np.array(valid_embs)
-        X = normalize(X) # L2 нормализация (косинусное сходство)
+        X = normalize(X)
 
         if algo == 'K-Means':
             n_c = min(n_clusters, len(X))
             model = KMeans(n_clusters=n_c, random_state=42, n_init='auto')
             labels = model.fit_predict(X)
         else:
-            # DBSCAN: используем евклидову метрику на нормализованных векторах (~косинусное расстояние)
             model = DBSCAN(eps=eps, min_samples=2, metric='euclidean')
             labels = model.fit_predict(X)
 
@@ -1990,12 +2108,10 @@ class ClusteringEngine:
         for p, lbl in zip(valid_paths, labels):
             clusters[lbl].append(p)
 
-        # Выгружаем все доступные теги (от любого теггера) для участвующих файлов
         tags_dict_global = {}
         for i in range(0, len(hashes), chunk_size):
             chunk = hashes[i:i+chunk_size]
             ph = ','.join(['?']*len(chunk))
-            # Группируем теги, чтобы взять хотя бы одни (последние обновленные)
             c.execute(f"SELECT hash, tags FROM tags_cache WHERE hash IN ({ph})", chunk)
             for row in c.fetchall():
                 if row[1]: tags_dict_global[row[0]] = json.loads(row[1])
@@ -2003,7 +2119,7 @@ class ClusteringEngine:
         results =[]
         for lbl, paths in clusters.items():
             if lbl == -1:
-                name = "Outliers_Noise" # Для DBSCAN, если файл никуда не подошел
+                name = "Outliers_Noise"
             else:
                 tag_counts = defaultdict(float)
                 for p in paths:
@@ -2013,7 +2129,7 @@ class ClusteringEngine:
                             tag_counts[t] += prob
                 
                 sorted_tags = sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)
-                top_tags =[t[0].replace(' ', '_').replace(':', '') for t in sorted_tags[:3]]
+                top_tags = [t[0].replace(' ', '_').replace(':', '') for t in sorted_tags[:3]]
                 name = f"Cluster_{lbl:03d}" + ("_" + "_".join(top_tags) if top_tags else "")
                 
             results.append({"name": name, "paths": paths})
@@ -4550,17 +4666,29 @@ async def index_page():
                             ui.button(icon='create_new_folder', on_click=lambda: select_folder_multi(dupes_dir)).props('flat round dense').tooltip('Добавить папку')
                             ui.button(icon='delete_sweep', on_click=lambda: clear_folder_cache_multi(dupes_dir.value)).props('flat round dense text-color=red').tooltip('Очистить кэш')
                     
-                    dupes_mode = ui.select(['Точные (Быстрый Хеш)', 'Похожие картинки (pHash)'], value=cfg.get('dupes_mode', 'Точные (Быстрый Хеш)'), label='Режим поиска').classes('w-full mt-2 text-lg font-bold')
+                    saved_dupes_mode = cfg.get('dupes_mode', 'Точные (Быстрый Хеш)')
+                    if saved_dupes_mode == 'Похожие картинки (pHash)':  # Миграция со старого конфига
+                        saved_dupes_mode = 'Похожие картинки и ВИДЕО (pHash)'
+                        
+                    dupes_mode = ui.select(['Точные (Быстрый Хеш)', 'Похожие картинки и ВИДЕО (pHash)'], value=saved_dupes_mode, label='Режим поиска').classes('w-full mt-2 text-lg font-bold')
                     phash_threshold = ui.number('Порог СХОЖЕСТИ (0-15, больше = шире допуск)', value=cfg.get('phash_threshold', 4), format='%.0f').classes('w-full mt-2 text-orange-400 font-bold')
+                    
+                    dupes_video_frames = ui.select([
+                        '1 кадр (Самое начало 0%)',
+                        '1 кадр (Середина 50%)',
+                        '3 кадра (0%, 50%, 100%)',
+                        '5 кадров (Равномерно)',
+                        '10 кадров (Равномерно)'
+                    ], value=cfg.get('dupes_video_frames', '3 кадра (0%, 50%, 100%)'), label='Глубина анализа видео (pHash)').classes('w-full mt-2 font-bold text-orange-300')
                     
                     with ui.row().classes('w-full gap-2 mt-2 mb-2'):
                         chk_img_dupes = ui.checkbox('Картинки', value=cfg.get('chk_img_dupes', True))
                         chk_vid_dupes = ui.checkbox('Видео', value=cfg.get('chk_vid_dupes', True))
 
                     def update_dupes_visibility(e=None):
-                        is_phash = (dupes_mode.value == 'Похожие картинки (pHash)')
+                        is_phash = (dupes_mode.value != 'Точные (Быстрый Хеш)')
                         phash_threshold.set_visibility(is_phash)
-                        chk_vid_dupes.set_visibility(not is_phash)
+                        dupes_video_frames.set_visibility(is_phash)
                         
                     dupes_mode.on_value_change(update_dupes_visibility)
                     update_dupes_visibility()
@@ -4568,7 +4696,7 @@ async def index_page():
                 async def run_dupes_action():
                     save_config({
                         'dupes_dir': dupes_dir.value, 'dupes_mode': dupes_mode.value,
-                        'phash_threshold': phash_threshold.value,
+                        'phash_threshold': phash_threshold.value, 'dupes_video_frames': dupes_video_frames.value,
                         'chk_img_dupes': chk_img_dupes.value, 'chk_vid_dupes': chk_vid_dupes.value
                     })
                     if not dupes_dir.value: return ui.notify("Укажите папки!", type='warning')
@@ -4583,9 +4711,7 @@ async def index_page():
                     
                     exts =[]
                     if chk_img_dupes.value: exts.extend(SUPPORTED_IMAGES)
-                    # pHash работает только с картинками, поэтому видео разрешаем только для "Точного" режима
-                    if dupes_mode.value == 'Точные (Быстрый Хеш)' and chk_vid_dupes.value: 
-                        exts.extend(SUPPORTED_VIDEOS)
+                    if chk_vid_dupes.value: exts.extend(SUPPORTED_VIDEOS)
 
                     def bg_task():
                         try:
@@ -4593,10 +4719,9 @@ async def index_page():
                             if dupes_mode.value == 'Точные (Быстрый Хеш)':
                                 res = dupes_engine.find_exact(dupes_dir.value, tuple(exts))
                             else:
-                                res = dupes_engine.find_similar(dupes_dir.value, tuple(exts), int(phash_threshold.value))
+                                res = dupes_engine.find_similar(dupes_dir.value, tuple(exts), int(phash_threshold.value), dupes_video_frames.value)
                                 
                             state.dupes_results = res
-                            # Заполняем словарь выделения False для всех найденных файлов
                             for group in res:
                                 for p in group:
                                     state.sel_dupes[p] = False
@@ -4645,6 +4770,13 @@ async def index_page():
                         
                     cluster_emb_model = ui.select(['Qwen/Qwen3-VL-Embedding-2B', 'Qwen/Qwen3-VL-Embedding-8B'], value=cfg.get('cluster_emb_model', 'Qwen/Qwen3-VL-Embedding-2B'), label='Модель (из которой брать вектора)').classes('w-full text-xs')
                     cluster_emb_size = ui.number('Разрешение при кэше', value=cfg.get('emb_size', 512), format='%.0f').classes('w-full')
+
+                    with ui.expansion('Тонкие настройки ИИ-Инференса (Если файлов нет в БД)', icon='tune').classes('w-full bg-gray-800/50 rounded-lg border border-gray-700 mt-2'):
+                        with ui.row().classes('w-full gap-2 px-2 pt-2'):
+                            cluster_batch_size = ui.number('Батч', value=cfg.get('cluster_batch_size', 16), format='%.0f').classes('w-[45%]')
+                            cluster_video_frames = ui.number('Кадры видео', value=cfg.get('cluster_video_frames', 4), format='%.0f').classes('w-[45%]')
+                        with ui.row().classes('w-full gap-2 px-2 pb-2'):
+                            cluster_quant_mode = ui.select(['None', '8-bit', '4-bit'], value=cfg.get('cluster_quant_mode', 'None'), label='Квант').classes('w-[45%]')
 
                     def update_cluster_visibility(e=None):
                         is_kmeans = (cluster_algo.value == 'K-Means')
@@ -4730,7 +4862,8 @@ async def index_page():
                             res = cluster_engine.build_clusters(
                                 cluster_dir.value, tuple(exts), cluster_algo.value,
                                 int(cluster_k.value), float(cluster_eps.value),
-                                cluster_emb_model.value, int(cluster_emb_size.value)
+                                cluster_emb_model.value, int(cluster_emb_size.value),
+                                int(cluster_batch_size.value), int(cluster_video_frames.value), cluster_quant_mode.value
                             )
                             state.cluster_results = res
                             for cluster in res:
