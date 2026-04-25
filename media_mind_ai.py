@@ -2269,7 +2269,7 @@ def copy_image_to_clipboard(path):
 # 5. ВЕРСТКА И ИНТЕРФЕЙС NICEGUI
 # ==========================================
 @ui.page('/')
-def index_page():
+async def index_page():
     cfg = load_config()
     state.nsfw_threshold = float(cfg.get('nsfw_threshold', 0.45))
     state.flatten_structure = bool(cfg.get('flatten_structure', False))
@@ -2745,79 +2745,93 @@ def index_page():
         except Exception:
             return 0.0, 0, 0
 
-    def apply_physical_filters(results_list):
+    async def apply_physical_filters_async(results_list):
         if not results_list: return[]
-        c = search_engine.db_cache.conn.cursor()
-        c.execute("SELECT path, size_mb, width, height FROM files")
-        file_infos = {row[0]: (row[1], row[2], row[3]) for row in c.fetchall()}
         
-        filtered =[]
-        db_needs_commit = False
-        
-        for item in results_list:
-            p = item[1]
-            info = file_infos.get(p)
-            
-            # АВТО-ИНДЕКСАЦИЯ СТАРЫХ ФАЙЛОВ ПРИ МИГРАЦИИ НА ЛЕТУ
-            if not info or info[1] is None or info[2] is None:
-                size_mb, w, h = get_physical_info(p)
-                hash_val = search_engine.db_cache.get_hash_by_path(p) or get_fast_hash(p)
-                c.execute("INSERT OR REPLACE INTO files (hash, path, size_mb, width, height) VALUES (?, ?, ?, ?, ?)", (hash_val, p, size_mb, w, h))
-                db_needs_commit = True
-            else:
-                size_mb, w, h = info
-                
-            if state.filter_min_res == 0 and state.filter_max_res >= 10000 and state.filter_max_size >= 10000 and state.filter_orientation == 'Любая':
-                filtered.append(item)
-                continue
-                
-            if size_mb is not None and size_mb > state.filter_max_size: continue
-            
-            max_dim = max(w, h) if w and h else 0
-            if max_dim > 0:
-                if max_dim < state.filter_min_res or max_dim > state.filter_max_res: continue
-                if state.filter_orientation != 'Любая':
-                    if state.filter_orientation == 'Горизонтальная' and w <= h * 1.05: continue
-                    if state.filter_orientation == 'Вертикальная' and h <= w * 1.05: continue
-                    if state.filter_orientation == 'Квадрат' and (w > h * 1.05 or h > w * 1.05): continue
-            
-            filtered.append(item)
-            
-        if db_needs_commit:
-            search_engine.db_cache.conn.commit()
-            
-        return filtered
+        # Забираем переменные из state ДО отправки в поток
+        min_r = state.filter_min_res
+        max_r = state.filter_max_res
+        max_s = state.filter_max_size
+        orient = state.filter_orientation
 
-    def delete_items(paths, tab_name):
+        def _filter_task():
+            c = search_engine.db_cache.conn.cursor()
+            c.execute("SELECT path, size_mb, width, height FROM files")
+            file_infos = {row[0]: (row[1], row[2], row[3]) for row in c.fetchall()}
+            
+            filtered =[]
+            db_needs_commit = False
+            
+            for item in results_list:
+                p = item[1]
+                info = file_infos.get(p)
+                
+                if not info or info[1] is None or info[2] is None:
+                    size_mb, w, h = get_physical_info(p)
+                    hash_val = search_engine.db_cache.get_hash_by_path(p) or get_fast_hash(p)
+                    c.execute("INSERT OR REPLACE INTO files (hash, path, size_mb, width, height) VALUES (?, ?, ?, ?, ?)", (hash_val, p, size_mb, w, h))
+                    db_needs_commit = True
+                else:
+                    size_mb, w, h = info
+                    
+                if min_r == 0 and max_r >= 10000 and max_s >= 10000 and orient == 'Любая':
+                    filtered.append(item)
+                    continue
+                    
+                if size_mb is not None and size_mb > max_s: continue
+                
+                max_dim = max(w, h) if w and h else 0
+                if max_dim > 0:
+                    if max_dim < min_r or max_dim > max_r: continue
+                    if orient != 'Любая':
+                        if orient == 'Горизонтальная' and w <= h * 1.05: continue
+                        if orient == 'Вертикальная' and h <= w * 1.05: continue
+                        if orient == 'Квадрат' and (w > h * 1.05 or h > w * 1.05): continue
+                
+                filtered.append(item)
+                
+            if db_needs_commit:
+                search_engine.db_cache.conn.commit()
+            return filtered
+
+        return await run.io_bound(_filter_task)
+
+    async def delete_items(paths, tab_name):
         if not paths: return
-        deleted = 0
         attr_name = "aesthetic_results" if tab_name == "aes" else f"{tab_name}_results"
         
-        for p in paths:
-            try:
-                send2trash(os.path.normpath(p))
-                deleted += 1
-                search_engine.db_cache.remove_paths([p])
-                res_list = getattr(state, attr_name)
-                
-                # В дубликатах результаты хранятся как список списков
-                if tab_name == 'dupes':
-                    new_dupes =[]
-                    for g in res_list:
-                        new_g =[item for item in g if item != p]
-                        if len(new_g) > 1: new_dupes.append(new_g)
-                    setattr(state, attr_name, new_dupes)
-                elif tab_name == 'cluster':
-                    new_clusters = []
-                    for c in res_list:
-                        new_paths = [item for item in c["paths"] if item != p]
-                        if len(new_paths) > 0: new_clusters.append({"name": c["name"], "paths": new_paths})
-                    setattr(state, attr_name, new_clusters)
-                else:
-                    setattr(state, attr_name, [item for item in res_list if item[1] != p])
-            except Exception as e:
-                state.add_log(f"Ошибка удаления {p}: {e}")
-                
+        # Выносим физическое удаление файлов и работу с БД в отдельный поток
+        def _trash_files():
+            deleted_count = 0
+            for p in paths:
+                try:
+                    send2trash(os.path.normpath(p))
+                    deleted_count += 1
+                    search_engine.db_cache.remove_paths([p])
+                except Exception as e:
+                    state.add_log(f"Ошибка удаления {p}: {e}")
+            return deleted_count
+
+        ui.notify("Удаление файлов...", type='info')
+        deleted = await run.io_bound(_trash_files)
+        
+        # Обновление списков в состоянии делаем в основном потоке
+        res_list = getattr(state, attr_name)
+        if tab_name == 'dupes':
+            new_dupes = []
+            for g in res_list:
+                new_g =[item for item in g if item not in paths]
+                if len(new_g) > 1: new_dupes.append(new_g)
+            setattr(state, attr_name, new_dupes)
+        elif tab_name == 'cluster':
+            new_clusters =[]
+            for c in res_list:
+                new_paths = [item for item in c["paths"] if item not in paths]
+                if len(new_paths) > 0: new_clusters.append({"name": c["name"], "paths": new_paths})
+            setattr(state, attr_name, new_clusters)
+        else:
+            setattr(state, attr_name, [item for item in res_list if item[1] not in paths])
+            
         ui.notify(f"🗑️ Отправлено в корзину: {deleted} шт.", type='positive', color='red')
         sel_dict = getattr(state, f"sel_{tab_name}")
         for p in paths:
@@ -2836,48 +2850,53 @@ def index_page():
         if not folder: return
         
         base_dir = getattr(state, f"{tab}_base_dir", state.search_base_dir)
-        success = 0
-        moved_paths = set()
-        
-        for path in selected_paths:
-            try:
-                rel_path = os.path.relpath(path, base_dir)
-                if rel_path.startswith('..') or os.path.isabs(rel_path): rel_path = os.path.basename(path)
-            except Exception: rel_path = os.path.basename(path)
-                
-            rel_dir, fname = os.path.split(rel_path)
-            if state.flatten_structure:
-                rel_dir = ""
+        ui.notify(f"Начато {action} {len(selected_paths)} файлов...", type='info')
 
-            prefix = ""
-            if prepend_score:
-                if tab == 'search': prefix = f"{next((s for s, p in state.search_results if p == path), 0):.3f}_"
-                elif tab == 'aes': prefix = f"{next((a for a, p, m in state.aesthetic_results if p == path), 0):05.2f}_"
-                elif tab == 'nsfw': prefix = f"{next((d for d, p, l, dt in state.nsfw_results if p == path), 0)*100:05.1f}_"
-                elif tab == 'face': prefix = f"{next((s for s, p in state.face_results if p == path), 0)*100:05.1f}_"
+        # Фоновая задача для файловых операций
+        def _process_files():
+            success = 0
+            moved_paths = set()
+            for path in selected_paths:
+                try:
+                    rel_path = os.path.relpath(path, base_dir)
+                    if rel_path.startswith('..') or os.path.isabs(rel_path): rel_path = os.path.basename(path)
+                except Exception: rel_path = os.path.basename(path)
                     
-            dest = os.path.join(folder, rel_dir, prefix + fname)
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            
-            try:
-                if action == 'copy': shutil.copy2(path, dest)
-                else: 
-                    shutil.move(path, dest)
-                    moved_paths.add(path)
+                rel_dir, fname = os.path.split(rel_path)
+                if state.flatten_structure:
+                    rel_dir = ""
+
+                prefix = ""
+                if prepend_score:
+                    if tab == 'search': prefix = f"{next((s for s, p in state.search_results if p == path), 0):.3f}_"
+                    elif tab == 'aes': prefix = f"{next((a for a, p, m in state.aesthetic_results if p == path), 0):05.2f}_"
+                    elif tab == 'nsfw': prefix = f"{next((d for d, p, l, dt in state.nsfw_results if p == path), 0)*100:05.1f}_"
+                    elif tab == 'face': prefix = f"{next((s for s, p in state.face_results if p == path), 0)*100:05.1f}_"
+                        
+                dest = os.path.join(folder, rel_dir, prefix + fname)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
                 
-                # Экспорт txt тегов (только для вкладки Tags)
-                if export_txt and tab == 'tags':
-                    txt_dest = os.path.splitext(dest)[0] + '.txt'
-                    # Достаем теги прямо из результатов
-                    item_data = next((i for i in state.tags_results if i[1] == path), None)
-                    if item_data and len(item_data) > 2:
-                        tags_dict = item_data[2]
-                        valid_tags =[t for t, s in tags_dict.items() if s >= txt_threshold]
-                        if valid_tags:
-                            with open(txt_dest, 'w', encoding='utf-8') as f:
-                                f.write(", ".join(valid_tags))
-                success += 1
-            except Exception as e: state.add_log(f"Ошибка {path}: {e}")
+                try:
+                    if action == 'copy': shutil.copy2(path, dest)
+                    else: 
+                        shutil.move(path, dest)
+                        moved_paths.add(path)
+                    
+                    if export_txt and tab == 'tags':
+                        txt_dest = os.path.splitext(dest)[0] + '.txt'
+                        item_data = next((i for i in state.tags_results if i[1] == path), None)
+                        if item_data and len(item_data) > 2:
+                            tags_dict = item_data[2]
+                            valid_tags = [t for t, s in tags_dict.items() if s >= txt_threshold]
+                            if valid_tags:
+                                with open(txt_dest, 'w', encoding='utf-8') as f:
+                                    f.write(", ".join(valid_tags))
+                    success += 1
+                except Exception as e: state.add_log(f"Ошибка {path}: {e}")
+            return success, moved_paths
+
+        # Ждем выполнения без блокировки UI
+        success, moved_paths = await run.io_bound(_process_files)
                 
         ui.notify(f'Успешно {action}: {success} файлов', type='positive')
         
@@ -2906,29 +2925,47 @@ def index_page():
                 for i in range(start, end + 1):
                     sel_dict[all_p[i]] = target_val
 
-    def set_all(tab, value):
+    async def set_all(tab, value):
+        # Даем UI перерисоваться перед лагом
+        await asyncio.sleep(0.01) 
+        
         if tab == 'dupes':
             for g in state.dupes_results:
                 for p in g: state.sel_dupes[p] = value
-            return dupes_gallery_ui.refresh()
+            dupes_gallery_ui.refresh()
+            return 
         if tab == 'cluster':
             for c in state.cluster_results:
                 for p in c["paths"]: state.sel_cluster[p] = value
-            return cluster_gallery_ui.refresh()
+            cluster_gallery_ui.refresh()
+            return
             
         filter_val = getattr(state, f"{tab}_res_filter")
         sel_dict = getattr(state, f"sel_{tab}")
+        
+        # Если элементов слишком много, можно использовать io_bound, но обычно dict comprehension работает мгновенно. 
+        # Главное - освободить поток перед рефрешем
         for item in getattr(state, f"{tab}_results"):
             p = item[1]
             if filter_val == 'Картинки' and not p.lower().endswith(SUPPORTED_IMAGES): continue
             if filter_val == 'Видео' and not p.lower().endswith(SUPPORTED_VIDEOS): continue
             if p in sel_dict: sel_dict[p] = value
+            
+        # Обновляем UI
+        if tab == 'search': search_gallery_ui.refresh()
+        elif tab == 'aes': aesthetic_gallery_ui.refresh()
+        elif tab == 'nsfw': nsfw_gallery_ui.refresh()
+        elif tab == 'face': face_gallery_ui.refresh()
+        elif tab == 'tags': tags_gallery_ui.refresh()
 
     # --- КОМПОНЕНТЫ ГАЛЕРЕИ ---
     @ui.refreshable
-    def search_gallery_ui():
+    async def search_gallery_ui():
         if not state.search_results:
-            return ui.label("Здесь появятся результаты...").classes("text-gray-400 m-4")
+            ui.label("Здесь появятся результаты...").classes("text-gray-400 m-4")
+            return
+
+        await asyncio.sleep(0.001)
 
         filtered_results = []
         for item in state.search_results:
@@ -2936,7 +2973,7 @@ def index_page():
             if state.search_res_filter == 'Картинки' and not p.endswith(SUPPORTED_IMAGES): continue
             if state.search_res_filter == 'Видео' and not p.endswith(SUPPORTED_VIDEOS): continue
             filtered_results.append(item)
-        filtered_results = apply_physical_filters(filtered_results)
+        filtered_results = await apply_physical_filters_async(filtered_results)
 
         total_pages = max(1, (len(filtered_results) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
         if state.search_page > total_pages: state.search_page = 1
@@ -2954,8 +2991,8 @@ def index_page():
             with ui.column().classes('w-full shrink-0 bg-gray-900 p-4 pb-2 border-b border-gray-800 z-20 gap-0 shadow-md'):
                 with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
                     with ui.row().classes('gap-2 items-center'):
-                        ui.button('Выбрать всё', on_click=lambda: set_all('search', True)).props('outline color=white dense')
-                        ui.button('Снять всё', on_click=lambda: set_all('search', False)).props('outline color=white dense')
+                        ui.button('Выбрать всё', on_click=lambda: ui.timer(0, lambda: set_all('search', True), once=True)).props('outline color=white dense')
+                        ui.button('Снять всё', on_click=lambda: ui.timer(0, lambda: set_all('search', False), once=True)).props('outline color=white dense')
                         ui.toggle(['Все', 'Картинки', 'Видео'], value=state.search_res_filter, on_change=apply_filter).classes('text-xs ml-2')
                         ui.button(icon='filter_alt', on_click=lambda: (setattr(state, 'show_phys_filters', not getattr(state, 'show_phys_filters', False)), search_gallery_ui.refresh())).props('flat color=gray dense').tooltip('Доп. фильтры')
                     with ui.row().classes('gap-2 items-center'):
@@ -3022,9 +3059,12 @@ def index_page():
             ui.button(icon='keyboard_arrow_up', on_click=lambda: ui.run_javascript(f'document.getElementById("{scroll_id}").scrollTo({{top: 0, behavior: "smooth"}})')).props('round color=blue').classes('absolute bottom-6 right-6 z-50 shadow-lg').tooltip('Наверх')
 
     @ui.refreshable
-    def aesthetic_gallery_ui():
+    async def aesthetic_gallery_ui():
         if not state.aesthetic_results:
-            return ui.label("Здесь появятся топовые фото/видео...").classes("text-gray-400 m-4")
+            ui.label("Здесь появятся топовые фото/видео...").classes("text-gray-400 m-4")
+            return
+
+        await asyncio.sleep(0.001)
 
         filtered_results =[]
         for item in state.aesthetic_results:
@@ -3032,7 +3072,7 @@ def index_page():
             if state.aes_res_filter == 'Картинки' and not p.endswith(SUPPORTED_IMAGES): continue
             if state.aes_res_filter == 'Видео' and not p.endswith(SUPPORTED_VIDEOS): continue
             filtered_results.append(item)
-        filtered_results = apply_physical_filters(filtered_results)
+        filtered_results = await apply_physical_filters_async(filtered_results)
 
         total_pages = max(1, (len(filtered_results) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
         if state.aes_page > total_pages: state.aes_page = 1
@@ -3050,8 +3090,8 @@ def index_page():
             with ui.column().classes('w-full shrink-0 bg-gray-900 p-4 pb-2 border-b border-gray-800 z-20 gap-0 shadow-md'):
                 with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
                     with ui.row().classes('gap-2 items-center'):
-                        ui.button('Выбрать всё', on_click=lambda: set_all('aes', True)).props('outline color=white dense')
-                        ui.button('Снять всё', on_click=lambda: set_all('aes', False)).props('outline color=white dense')
+                        ui.button('Выбрать всё', on_click=lambda: ui.timer(0, lambda: set_all('aes', True), once=True)).props('outline color=white dense')
+                        ui.button('Снять всё', on_click=lambda: ui.timer(0, lambda: set_all('aes', False), once=True)).props('outline color=white dense')
                         ui.toggle(['Все', 'Картинки', 'Видео'], value=state.aes_res_filter, on_change=apply_filter).classes('text-xs ml-2')
                         ui.button(icon='filter_alt', on_click=lambda: (setattr(state, 'show_phys_filters', not getattr(state, 'show_phys_filters', False)), aesthetic_gallery_ui.refresh())).props('flat color=gray dense').tooltip('Доп. фильтры')
                     with ui.row().classes('gap-2 items-center'):
@@ -3115,9 +3155,12 @@ def index_page():
             ui.button(icon='keyboard_arrow_up', on_click=lambda: ui.run_javascript(f'document.getElementById("{scroll_id}").scrollTo({{top: 0, behavior: "smooth"}})')).props('round color=yellow-800').classes('absolute bottom-6 right-6 z-50 shadow-lg').tooltip('Наверх')
 
     @ui.refreshable
-    def nsfw_gallery_ui():
+    async def nsfw_gallery_ui():
         if not state.nsfw_results:
-            return ui.label("Здесь появятся результаты NSFW сканирования...").classes("text-gray-400 m-4")
+            ui.label("Здесь появятся результаты NSFW сканирования...").classes("text-gray-400 m-4")
+            return
+        
+        await asyncio.sleep(0.001)
 
         filtered_results =[]
         for item in state.nsfw_results:
@@ -3125,7 +3168,7 @@ def index_page():
             if state.nsfw_res_filter == 'Картинки' and not p.endswith(SUPPORTED_IMAGES): continue
             if state.nsfw_res_filter == 'Видео' and not p.endswith(SUPPORTED_VIDEOS): continue
             filtered_results.append(item)
-        filtered_results = apply_physical_filters(filtered_results)
+        filtered_results = await apply_physical_filters_async(filtered_results)
 
         total_pages = max(1, (len(filtered_results) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
         if state.nsfw_page > total_pages: state.nsfw_page = 1
@@ -3143,8 +3186,8 @@ def index_page():
             with ui.column().classes('w-full shrink-0 bg-gray-900 p-4 pb-2 border-b border-gray-800 z-20 gap-0 shadow-md'):
                 with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
                     with ui.row().classes('gap-2 items-center'):
-                        ui.button('Выбрать всё', on_click=lambda: set_all('nsfw', True)).props('outline color=white dense')
-                        ui.button('Снять всё', on_click=lambda: set_all('nsfw', False)).props('outline color=white dense')
+                        ui.button('Выбрать всё', on_click=lambda: ui.timer(0, lambda: set_all('nsfw', True), once=True)).props('outline color=white dense')
+                        ui.button('Снять всё', on_click=lambda: ui.timer(0, lambda: set_all('nsfw', False), once=True)).props('outline color=white dense')
                         ui.toggle(['Все', 'Картинки', 'Видео'], value=state.nsfw_res_filter, on_change=apply_filter).classes('text-xs ml-2')
                         ui.button(icon='filter_alt', on_click=lambda: (setattr(state, 'show_phys_filters', not getattr(state, 'show_phys_filters', False)), nsfw_gallery_ui.refresh())).props('flat color=gray dense').tooltip('Доп. фильтры')
                     with ui.row().classes('gap-2 items-center'):
@@ -3210,9 +3253,12 @@ def index_page():
             ui.button(icon='keyboard_arrow_up', on_click=lambda: ui.run_javascript(f'document.getElementById("{scroll_id}").scrollTo({{top: 0, behavior: "smooth"}})')).props('round color=red-800').classes('absolute bottom-6 right-6 z-50 shadow-lg').tooltip('Наверх')
 
     @ui.refreshable
-    def face_gallery_ui():
+    async def face_gallery_ui():
         if not state.face_results:
-            return ui.label("Здесь появятся найденные фотографии с искомым лицом...").classes("text-gray-400 m-4")
+            ui.label("Здесь появятся найденные фотографии с искомым лицом...").classes("text-gray-400 m-4")
+            return
+        
+        await asyncio.sleep(0.001)
 
         filtered_results = []
         for item in state.face_results:
@@ -3220,7 +3266,7 @@ def index_page():
             if state.face_res_filter == 'Картинки' and not p.endswith(SUPPORTED_IMAGES): continue
             if state.face_res_filter == 'Видео' and not p.endswith(SUPPORTED_VIDEOS): continue
             filtered_results.append(item)
-        filtered_results = apply_physical_filters(filtered_results)
+        filtered_results = await apply_physical_filters_async(filtered_results)
 
         total_pages = max(1, (len(filtered_results) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
         if state.face_page > total_pages: state.face_page = 1
@@ -3238,8 +3284,8 @@ def index_page():
             with ui.column().classes('w-full shrink-0 bg-gray-900 p-4 pb-2 border-b border-gray-800 z-20 gap-0 shadow-md'):
                 with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
                     with ui.row().classes('gap-2 items-center'):
-                        ui.button('Выбрать всё', on_click=lambda: set_all('face', True)).props('outline color=white dense')
-                        ui.button('Снять всё', on_click=lambda: set_all('face', False)).props('outline color=white dense')
+                        ui.button('Выбрать всё', on_click=lambda: ui.timer(0, lambda: set_all('face', True), once=True)).props('outline color=white dense')
+                        ui.button('Снять всё', on_click=lambda: ui.timer(0, lambda: set_all('face', False), once=True)).props('outline color=white dense')
                         ui.toggle(['Все', 'Картинки', 'Видео'], value=state.face_res_filter, on_change=apply_filter).classes('text-xs ml-2')
                         ui.button(icon='filter_alt', on_click=lambda: (setattr(state, 'show_phys_filters', not getattr(state, 'show_phys_filters', False)), face_gallery_ui.refresh())).props('flat color=gray dense').tooltip('Доп. фильтры')
                     with ui.row().classes('gap-2 items-center'):
@@ -3304,9 +3350,12 @@ def index_page():
 
     # --- КОМПОНЕНТ ГАЛЕРЕИ ТЕГОВ ---
     @ui.refreshable
-    def tags_gallery_ui():
+    async def tags_gallery_ui():
         if not state.tags_results:
-            return ui.label("Здесь появятся картинки, подходящие под выбранные теги...").classes("text-gray-400 m-4")
+            ui.label("Здесь появятся картинки, подходящие под выбранные теги...").classes("text-gray-400 m-4")
+            return
+        
+        await asyncio.sleep(0.001)
 
         filtered_results = []
         for item in state.tags_results:
@@ -3314,7 +3363,7 @@ def index_page():
             if state.tags_res_filter == 'Картинки' and not p.endswith(SUPPORTED_IMAGES): continue
             if state.tags_res_filter == 'Видео' and not p.endswith(SUPPORTED_VIDEOS): continue
             filtered_results.append(item)
-        filtered_results = apply_physical_filters(filtered_results)
+        filtered_results = await apply_physical_filters_async(filtered_results)
 
         total_pages = max(1, (len(filtered_results) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
         if state.tags_page > total_pages: state.tags_page = 1
@@ -3332,8 +3381,8 @@ def index_page():
             with ui.column().classes('w-full shrink-0 bg-gray-900 p-4 pb-2 border-b border-gray-800 z-20 gap-0 shadow-md'):
                 with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
                     with ui.row().classes('gap-2 items-center'):
-                        ui.button('Выбрать всё', on_click=lambda: set_all('tags', True)).props('outline color=white dense')
-                        ui.button('Снять всё', on_click=lambda: set_all('tags', False)).props('outline color=white dense')
+                        ui.button('Выбрать всё', on_click=lambda: ui.timer(0, lambda: set_all('tags', True), once=True)).props('outline color=white dense')
+                        ui.button('Снять всё', on_click=lambda: ui.timer(0, lambda: set_all('tags', False), once=True)).props('outline color=white dense')
                         ui.toggle(['Все', 'Картинки', 'Видео'], value=state.tags_res_filter, on_change=apply_filter).classes('text-xs ml-2')
                         ui.button(icon='filter_alt', on_click=lambda: (setattr(state, 'show_phys_filters', not getattr(state, 'show_phys_filters', False)), tags_gallery_ui.refresh())).props('flat color=gray dense').tooltip('Доп. фильтры')
                     with ui.row().classes('gap-2 items-center'):
@@ -3429,9 +3478,12 @@ def index_page():
         ui.notify("Худшие дубликаты (включая скрытые) помечены на удаление!", type="positive", color="green")
 
     @ui.refreshable
-    def dupes_gallery_ui():
+    async def dupes_gallery_ui():
         if not state.dupes_results:
-            return ui.label("Найденные дубликаты появятся здесь...").classes("text-gray-400 m-4")
+            ui.label("Найденные дубликаты появятся здесь...").classes("text-gray-400 m-4")
+            return
+        
+        await asyncio.sleep(0.001)
             
         # ЖЕСТКИЕ ЛИМИТЫ ДЛЯ АБСОЛЮТНОЙ СТАБИЛЬНОСТИ
         GROUPS_PER_PAGE = 3  
@@ -3449,7 +3501,7 @@ def index_page():
                 with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
                     with ui.row().classes('gap-2 items-center'):
                         ui.button('АВТО-ВЫБОР ХУДШИХ', icon='auto_awesome', on_click=auto_select_worst_dupes).props('color=orange text-black font-bold dense')
-                        ui.button('Снять всё', on_click=lambda: set_all('dupes', False)).props('outline color=white dense')
+                        ui.button('Снять всё', on_click=lambda: ui.timer(0, lambda: set_all('dupes', False), once=True)).props('outline color=white dense')
                     with ui.row().classes('gap-2 items-center'):
                         ui.button('УДАЛИТЬ ВЫДЕЛЕННЫЕ ✔', icon='delete_forever', on_click=lambda: delete_items([p for p, c in state.sel_dupes.items() if c], 'dupes')).props('color=red-10 text-white dense')
                 
@@ -3642,7 +3694,7 @@ def index_page():
                     btn_search = ui.button('🚀 Искать', on_click=run_search_action).classes('w-full bg-blue-600 hover:bg-blue-500 font-bold')
 
             with ui.column().classes('flex-1 w-0 bg-gray-900 rounded-xl border border-gray-800 overflow-hidden h-full relative p-0'):
-                search_gallery_ui()
+                await search_gallery_ui()
 
         # ВКЛАДКА 2: ЭСТЕТИКА
         with ui.tab_panel(tab_aesthetic).classes('w-full h-[calc(100vh-115px)] p-4 flex flex-row flex-nowrap items-stretch gap-4'):
@@ -3749,7 +3801,7 @@ def index_page():
                     btn_rate = ui.button('✨ Оценить', on_click=run_aesthetic_action).classes('w-full bg-yellow-600 hover:bg-yellow-500 font-bold text-lg')
 
             with ui.column().classes('flex-1 w-0 bg-gray-900 rounded-xl border border-gray-800 overflow-hidden h-full relative p-0'):
-                aesthetic_gallery_ui()
+                await aesthetic_gallery_ui()
 
         # ВКЛАДКА 3: NSFW
         with ui.tab_panel(tab_nsfw).classes('w-full h-[calc(100vh-115px)] p-4 flex flex-row flex-nowrap items-stretch gap-4'):
@@ -3837,7 +3889,7 @@ def index_page():
                     btn_nsfw = ui.button('🚨 Анализ', on_click=run_nsfw_action).classes('w-full bg-red-800 hover:bg-red-700 font-bold text-lg')
 
             with ui.column().classes('flex-1 w-0 bg-gray-900 rounded-xl border border-gray-800 overflow-hidden h-full relative p-0'):
-                nsfw_gallery_ui()
+                await nsfw_gallery_ui()
 
         # ВКЛАДКА 4: ПОИСК ПО ЛИЦУ (FACE SEARCH)
         with ui.tab_panel(tab_face).classes('w-full h-[calc(100vh-115px)] p-4 flex flex-row flex-nowrap items-stretch gap-4'):
@@ -3918,7 +3970,7 @@ def index_page():
                     btn_face = ui.button('🕵️ Искать Лицо', on_click=run_face_action).classes('w-full bg-teal-600 hover:bg-teal-500 font-bold text-lg')
 
             with ui.column().classes('flex-1 w-0 bg-gray-900 rounded-xl border border-gray-800 overflow-hidden h-full relative p-0'):
-                face_gallery_ui()
+                await face_gallery_ui()
 
         # ВКЛАДКА 5: ТЕГИ (DANBOORU)
         with ui.tab_panel(tab_tags).classes('w-full h-[calc(100vh-115px)] p-4 flex flex-row flex-nowrap items-stretch gap-4'):
@@ -4198,7 +4250,7 @@ def index_page():
                     btn_search_tags = ui.button('🎯 Искать', on_click=search_tags_action).classes('w-full bg-pink-700 hover:bg-pink-600 font-bold')
 
             with ui.column().classes('flex-1 w-0 bg-gray-900 rounded-xl border border-gray-800 overflow-hidden h-full relative p-0'):
-                tags_gallery_ui()
+                await tags_gallery_ui()
 
         # ВКЛАДКА 6: ИНДЕКСАТОР (Кэш)
         with ui.tab_panel(tab_cache).classes('w-full h-[calc(100vh-115px)] p-8 flex flex-col items-center overflow-y-auto pb-24'):
@@ -4472,7 +4524,7 @@ def index_page():
                     btn_dupes = ui.button('👯 Найти Дубликаты', on_click=run_dupes_action).classes('w-full bg-orange-700 hover:bg-orange-600 font-bold text-lg')
 
             with ui.column().classes('flex-1 w-0 bg-gray-900 rounded-xl border border-gray-800 overflow-hidden h-full relative p-0'):
-                dupes_gallery_ui()
+                await dupes_gallery_ui()
 
         # ВКЛАДКА: AI КЛАСТЕРИЗАЦИЯ
         with ui.tab_panel(tab_cluster).classes('w-full h-[calc(100vh-115px)] p-4 flex flex-row flex-nowrap items-stretch gap-4'):
@@ -4598,10 +4650,13 @@ def index_page():
                     btn_cluster = ui.button('✨ Раскидать по папкам', on_click=run_cluster_action).classes('w-full bg-purple-700 hover:bg-purple-600 font-bold text-lg')
 
             @ui.refreshable
-            def cluster_gallery_ui():
+            async def cluster_gallery_ui():
                 if not state.cluster_results:
-                    return ui.label("Здесь появятся сгруппированные нейросетью файлы...").classes("text-gray-400 m-4")
-                    
+                    ui.label("Здесь появятся сгруппированные нейросетью файлы...").classes("text-gray-400 m-4")
+                    return
+                
+                await asyncio.sleep(0.001)
+
                 GROUPS_PER_PAGE = 3  
                 MAX_ITEMS_PER_GROUP = 30  # В свернутом виде
                 ITEMS_PER_PAGE_CLUSTER = 60 # Во внутреннем развернутом виде (безопасно для DOM)
@@ -4623,8 +4678,8 @@ def index_page():
                     with ui.column().classes('w-full shrink-0 bg-gray-900 p-4 pb-2 border-b border-gray-800 z-20 gap-0 shadow-md'):
                         with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
                             with ui.row().classes('gap-2 items-center'):
-                                ui.button('Выбрать всё', on_click=lambda: set_all('cluster', True)).props('outline color=white dense')
-                                ui.button('Снять всё', on_click=lambda: set_all('cluster', False)).props('outline color=white dense')
+                                ui.button('Выбрать всё', on_click=lambda: ui.timer(0, lambda: set_all('cluster', True), once=True)).props('outline color=white dense')
+                                ui.button('Снять всё', on_click=lambda: ui.timer(0, lambda: set_all('cluster', False), once=True)).props('outline color=white dense')
                             with ui.row().classes('gap-2 items-center'):
                                 ui.button('Копировать по папкам ✔', icon='content_copy', on_click=lambda: execute_cluster_action('copy')).props('color=purple-800 text-white font-bold dense')
                                 ui.button('Переместить по папкам ✔', icon='drive_file_move', on_click=lambda: execute_cluster_action('move')).props('color=purple-600 text-white font-bold dense')
@@ -4727,7 +4782,7 @@ def index_page():
                     ui.button(icon='keyboard_arrow_up', on_click=lambda: ui.run_javascript(f'document.getElementById("{scroll_id}").scrollTo({{top: 0, behavior: "smooth"}})')).props('round color=purple-800').classes('absolute bottom-6 right-6 z-50 shadow-lg').tooltip('Наверх')
             
             with ui.column().classes('flex-1 w-0 bg-gray-900 rounded-xl border border-gray-800 overflow-hidden h-full relative p-0'):
-                cluster_gallery_ui()
+                await cluster_gallery_ui()
 
     with ui.footer().classes('bg-gray-900 border-t border-gray-800 px-4 py-0 flex flex-row flex-nowrap items-center justify-between z-40 h-8 shadow-lg'):
         ui.label().bind_text_from(state, 'status_text').classes('text-blue-400 font-mono text-xs truncate max-w-[30%] shrink-0')
