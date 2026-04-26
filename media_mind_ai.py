@@ -2216,6 +2216,7 @@ class AppState:
 
         self.filter_min_res = 0
         self.filter_max_res = 10000
+        self.filter_min_size = 0.0
         self.filter_max_size = 10000.0
         self.filter_orientation = 'Любая'
 
@@ -2922,10 +2923,11 @@ async def index_page():
         if not paths: return set()
         min_r = state.filter_min_res
         max_r = state.filter_max_res
+        min_s = state.filter_min_size
         max_s = state.filter_max_size
         orient = state.filter_orientation
 
-        if min_r <= 0 and max_r >= 10000 and max_s >= 10000 and orient == 'Любая':
+        if min_r <= 0 and max_r >= 10000 and min_s <= 0.0 and max_s >= 10000 and orient == 'Любая':
             return set(paths)
 
         def _filter_task():
@@ -2952,7 +2954,7 @@ async def index_page():
                 else:
                     size_mb, w, h = info
                     
-                if size_mb is not None and size_mb > max_s: continue
+                if size_mb is not None and (size_mb < min_s or size_mb > max_s): continue
                 
                 max_dim = max(w, h) if w and h else 0
                 if max_dim > 0:
@@ -2975,11 +2977,12 @@ async def index_page():
         
         min_r = state.filter_min_res
         max_r = state.filter_max_res
+        min_s = state.filter_min_size
         max_s = state.filter_max_size
         orient = state.filter_orientation
 
         # Если фильтры по умолчанию, мы можем сразу вернуть исходный список без обращений к БД или диску!
-        if min_r <= 0 and max_r >= 10000 and max_s >= 10000 and orient == 'Любая':
+        if min_r <= 0 and max_r >= 10000 and min_s <= 0.0 and max_s >= 10000 and orient == 'Любая':
             return results_list
 
         def _filter_task():
@@ -3012,7 +3015,7 @@ async def index_page():
                 else:
                     size_mb, w, h = info
                     
-                if size_mb is not None and size_mb > max_s: continue
+                if size_mb is not None and (size_mb < min_s or size_mb > max_s): continue
                 
                 max_dim = max(w, h) if w and h else 0
                 if max_dim > 0:
@@ -3244,8 +3247,10 @@ async def index_page():
                                 ui.number('Мин', value=0, format='%.0f').bind_value(state, 'filter_min_res').classes('flex-1')
                                 ui.number('Макс', value=10000, format='%.0f').bind_value(state, 'filter_max_res').classes('flex-1')
                         with ui.column().classes('gap-1 flex-1'):
-                            ui.label('Макс. вес:').classes('text-xs text-gray-400')
-                            ui.number('МБ', value=10000, format='%.0f').bind_value(state, 'filter_max_size').classes('w-full')
+                            ui.label('Вес (МБ):').classes('text-xs text-gray-400')
+                            with ui.row().classes('w-full gap-2 flex-nowrap'):
+                                ui.number('Мин', value=0, format='%.1f').bind_value(state, 'filter_min_size').classes('flex-1')
+                                ui.number('Макс', value=10000, format='%.1f').bind_value(state, 'filter_max_size').classes('flex-1')
                         with ui.column().classes('gap-1 flex-1'):
                             ui.label('Ориентация:').classes('text-xs text-gray-400')
                             ui.select(['Любая', 'Горизонтальная', 'Вертикальная', 'Квадрат'], value='Любая').bind_value(state, 'filter_orientation').classes('w-full')
@@ -3347,8 +3352,10 @@ async def index_page():
                                 ui.number('Мин', value=0, format='%.0f').bind_value(state, 'filter_min_res').classes('flex-1')
                                 ui.number('Макс', value=10000, format='%.0f').bind_value(state, 'filter_max_res').classes('flex-1')
                         with ui.column().classes('gap-1 flex-1'):
-                            ui.label('Макс. вес:').classes('text-xs text-gray-400')
-                            ui.number('МБ', value=10000, format='%.0f').bind_value(state, 'filter_max_size').classes('w-full')
+                            ui.label('Вес (МБ):').classes('text-xs text-gray-400')
+                            with ui.row().classes('w-full gap-2 flex-nowrap'):
+                                ui.number('Мин', value=0, format='%.1f').bind_value(state, 'filter_min_size').classes('flex-1')
+                                ui.number('Макс', value=10000, format='%.1f').bind_value(state, 'filter_max_size').classes('flex-1')
                         with ui.column().classes('gap-1 flex-1'):
                             ui.label('Ориентация:').classes('text-xs text-gray-400')
                             ui.select(['Любая', 'Горизонтальная', 'Вертикальная', 'Квадрат'], value='Любая').bind_value(state, 'filter_orientation').classes('w-full')
@@ -3447,8 +3454,10 @@ async def index_page():
                                 ui.number('Мин', value=0, format='%.0f').bind_value(state, 'filter_min_res').classes('flex-1')
                                 ui.number('Макс', value=10000, format='%.0f').bind_value(state, 'filter_max_res').classes('flex-1')
                         with ui.column().classes('gap-1 flex-1'):
-                            ui.label('Макс. вес:').classes('text-xs text-gray-400')
-                            ui.number('МБ', value=10000, format='%.0f').bind_value(state, 'filter_max_size').classes('w-full')
+                            ui.label('Вес (МБ):').classes('text-xs text-gray-400')
+                            with ui.row().classes('w-full gap-2 flex-nowrap'):
+                                ui.number('Мин', value=0, format='%.1f').bind_value(state, 'filter_min_size').classes('flex-1')
+                                ui.number('Макс', value=10000, format='%.1f').bind_value(state, 'filter_max_size').classes('flex-1')
                         with ui.column().classes('gap-1 flex-1'):
                             ui.label('Ориентация:').classes('text-xs text-gray-400')
                             ui.select(['Любая', 'Горизонтальная', 'Вертикальная', 'Квадрат'], value='Любая').bind_value(state, 'filter_orientation').classes('w-full')
@@ -3549,8 +3558,10 @@ async def index_page():
                                 ui.number('Мин', value=0, format='%.0f').bind_value(state, 'filter_min_res').classes('flex-1')
                                 ui.number('Макс', value=10000, format='%.0f').bind_value(state, 'filter_max_res').classes('flex-1')
                         with ui.column().classes('gap-1 flex-1'):
-                            ui.label('Макс. вес:').classes('text-xs text-gray-400')
-                            ui.number('МБ', value=10000, format='%.0f').bind_value(state, 'filter_max_size').classes('w-full')
+                            ui.label('Вес (МБ):').classes('text-xs text-gray-400')
+                            with ui.row().classes('w-full gap-2 flex-nowrap'):
+                                ui.number('Мин', value=0, format='%.1f').bind_value(state, 'filter_min_size').classes('flex-1')
+                                ui.number('Макс', value=10000, format='%.1f').bind_value(state, 'filter_max_size').classes('flex-1')
                         with ui.column().classes('gap-1 flex-1'):
                             ui.label('Ориентация:').classes('text-xs text-gray-400')
                             ui.select(['Любая', 'Горизонтальная', 'Вертикальная', 'Квадрат'], value='Любая').bind_value(state, 'filter_orientation').classes('w-full')
@@ -3650,8 +3661,10 @@ async def index_page():
                                 ui.number('Мин', value=0, format='%.0f').bind_value(state, 'filter_min_res').classes('flex-1')
                                 ui.number('Макс', value=10000, format='%.0f').bind_value(state, 'filter_max_res').classes('flex-1')
                         with ui.column().classes('gap-1 flex-1'):
-                            ui.label('Макс. вес:').classes('text-xs text-gray-400')
-                            ui.number('МБ', value=10000, format='%.0f').bind_value(state, 'filter_max_size').classes('w-full')
+                            ui.label('Вес (МБ):').classes('text-xs text-gray-400')
+                            with ui.row().classes('w-full gap-2 flex-nowrap'):
+                                ui.number('Мин', value=0, format='%.1f').bind_value(state, 'filter_min_size').classes('flex-1')
+                                ui.number('Макс', value=10000, format='%.1f').bind_value(state, 'filter_max_size').classes('flex-1')
                         with ui.column().classes('gap-1 flex-1'):
                             ui.label('Ориентация:').classes('text-xs text-gray-400')
                             ui.select(['Любая', 'Горизонтальная', 'Вертикальная', 'Квадрат'], value='Любая').bind_value(state, 'filter_orientation').classes('w-full')
@@ -3780,8 +3793,10 @@ async def index_page():
                                 ui.number('Мин', value=0, format='%.0f').bind_value(state, 'filter_min_res').classes('flex-1')
                                 ui.number('Макс', value=10000, format='%.0f').bind_value(state, 'filter_max_res').classes('flex-1')
                         with ui.column().classes('gap-1 flex-1'):
-                            ui.label('Макс. вес:').classes('text-xs text-gray-400')
-                            ui.number('МБ', value=10000, format='%.0f').bind_value(state, 'filter_max_size').classes('w-full')
+                            ui.label('Вес (МБ):').classes('text-xs text-gray-400')
+                            with ui.row().classes('w-full gap-2 flex-nowrap'):
+                                ui.number('Мин', value=0, format='%.1f').bind_value(state, 'filter_min_size').classes('flex-1')
+                                ui.number('Макс', value=10000, format='%.1f').bind_value(state, 'filter_max_size').classes('flex-1')
                         with ui.column().classes('gap-1 flex-1'):
                             ui.label('Ориентация:').classes('text-xs text-gray-400')
                             ui.select(['Любая', 'Горизонтальная', 'Вертикальная', 'Квадрат'], value='Любая').bind_value(state, 'filter_orientation').classes('w-full')
@@ -5126,8 +5141,10 @@ async def index_page():
                                         ui.number('Мин', value=0, format='%.0f').bind_value(state, 'filter_min_res').classes('flex-1')
                                         ui.number('Макс', value=10000, format='%.0f').bind_value(state, 'filter_max_res').classes('flex-1')
                                 with ui.column().classes('gap-1 flex-1'):
-                                    ui.label('Макс. вес:').classes('text-xs text-gray-400')
-                                    ui.number('МБ', value=10000, format='%.0f').bind_value(state, 'filter_max_size').classes('w-full')
+                                    ui.label('Вес (МБ):').classes('text-xs text-gray-400')
+                                    with ui.row().classes('w-full gap-2 flex-nowrap'):
+                                        ui.number('Мин', value=0, format='%.1f').bind_value(state, 'filter_min_size').classes('flex-1')
+                                        ui.number('Макс', value=10000, format='%.1f').bind_value(state, 'filter_max_size').classes('flex-1')
                                 with ui.column().classes('gap-1 flex-1'):
                                     ui.label('Ориентация:').classes('text-xs text-gray-400')
                                     ui.select(['Любая', 'Горизонтальная', 'Вертикальная', 'Квадрат'], value='Любая').bind_value(state, 'filter_orientation').classes('w-full')
