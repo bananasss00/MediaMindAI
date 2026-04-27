@@ -2059,15 +2059,22 @@ class ClusteringEngine:
 
         # Вычисление "на лету"
         if missing_paths:
-            state.add_log(f"Вычисление ИИ-векторов для {len(missing_paths)} новых файлов (On-the-fly)...")
-            old_vf, old_es, old_qm = self.se.video_frames, self.se.emb_size, self.se.quant_mode
-            self.se.video_frames, self.se.emb_size, self.se.quant_mode = video_frames, emb_size, quant_mode
+            # Удаляем пути, которых уже нет на диске, чтобы избежать ошибок
+            missing_paths = [p for p in missing_paths if os.path.exists(p)]
             
-            self.se.build_cache(dir_paths, emb_model_name, batch_size, allowed_exts, override_files=missing_paths)
-            self.se.video_frames, self.se.emb_size, self.se.quant_mode = old_vf, old_es, old_qm
-            
-            if self.se.cancel_flag: raise Exception("Инференс отменен пользователем.")
+            if not missing_paths:
+                state.add_log("Все отсутствующие файлы оказались удалены с диска, пропускаем...")
+            else:
+                state.add_log(f"Вычисление ИИ-векторов для {len(missing_paths)} новых файлов (On-the-fly)...")
+                old_vf, old_es, old_qm = self.se.video_frames, self.se.emb_size, self.se.quant_mode
+                self.se.video_frames, self.se.emb_size, self.se.quant_mode = video_frames, emb_size, quant_mode
                 
+                self.se.build_cache(dir_paths, emb_model_name, batch_size, allowed_exts, override_files=missing_paths)
+                self.se.video_frames, self.se.emb_size, self.se.quant_mode = old_vf, old_es, old_qm
+                
+                if self.se.cancel_flag: raise Exception("Инференс отменен пользователем.")
+                    
+            # Перечитываем пути, которые успешно закэшировались
             for i in range(0, len(missing_paths), chunk_size):
                 chunk_paths = missing_paths[i:i+chunk_size]
                 chunk_hashes =[path_to_hash[p] for p in chunk_paths]
@@ -3055,10 +3062,10 @@ async def index_page():
         # Обновление списков в состоянии делаем в основном потоке
         res_list = getattr(state, attr_name)
         if tab_name == 'dupes':
-            new_dupes = []
+            new_dupes =[]
             for g in res_list:
-                new_g =[item for item in g if item not in paths]
-                if len(new_g) > 1: new_dupes.append(new_g)
+                new_g =[item for item in g["paths"] if item not in paths]
+                if len(new_g) > 1: new_dupes.append({"name": g["name"], "paths": new_g})
             setattr(state, attr_name, new_dupes)
         elif tab_name == 'cluster':
             new_clusters =[]
@@ -3168,7 +3175,7 @@ async def index_page():
         
         if tab == 'dupes':
             for g in state.dupes_results:
-                for p in g: state.sel_dupes[p] = value
+                for p in g["paths"]: state.sel_dupes[p] = value
             dupes_gallery_ui.refresh()
             return 
         if tab == 'cluster':
@@ -3727,7 +3734,7 @@ async def index_page():
             updates = {}
             for group in state.dupes_results:
                 scored =[]
-                for p in group:
+                for p in group["paths"]:
                     size, w, h = info.get(p, (0, 0, 0))
                     res = (w or 0) * (h or 0)
                     scored.append((res, size or 0, p))
@@ -3753,14 +3760,14 @@ async def index_page():
         await asyncio.sleep(0.001)
 
         # --- ПРИМЕНЕНИЕ ФИЗ. ФИЛЬТРОВ ---
-        all_paths_in_dupes = [p for g in state.dupes_results for p in g]
+        all_paths_in_dupes = [p for g in state.dupes_results for p in g["paths"]]
         valid_paths = await get_physically_valid_paths_async(all_paths_in_dupes)
         
         filtered_dupes =[]
         for g in state.dupes_results:
-            new_g = [p for p in g if p in valid_paths]
+            new_g = [p for p in g["paths"] if p in valid_paths]
             if len(new_g) > 0:
-                filtered_dupes.append(new_g)
+                filtered_dupes.append({"ref": g, "name": g["name"], "paths": new_g})
             
         # ЖЕСТКИЕ ЛИМИТЫ ДЛЯ АБСОЛЮТНОЙ СТАБИЛЬНОСТИ
         GROUPS_PER_PAGE = int(state.groups_per_page)
@@ -3817,21 +3824,29 @@ async def index_page():
                 
                 ITEMS_PER_INNER_PAGE = 60 # Лимит при развороте
                 
-                def render_dupe_group(group_idx, group):
+                def render_dupe_group(group_idx, group_obj):
+                    group = group_obj["paths"]
                     is_expanded = {'val': False}
                     inner_page = {'val': 1}
                     
                     with ui.card().classes('w-full bg-gray-800 border border-gray-700 p-2 mb-4'):
-                        with ui.row().classes('w-full justify-between items-center px-2 mb-2'):
-                            ui.label(f"Группа {start_idx + group_idx + 1} (Всего файлов: {len(group)})").classes('font-bold text-orange-400')
+                        with ui.row().classes('w-full justify-between items-center px-2 mb-2 flex-nowrap'):
+                            with ui.row().classes('gap-2 items-center flex-1 min-w-0'):
+                                ui.icon('folder_copy', color='orange-400', size='sm')
+                                ui.input(value=group_obj["name"], on_change=lambda e: group_obj["ref"].update({"name": e.value})).classes('flex-1').props('dense borderless input-class="text-orange-400 font-bold text-lg"')
+                                ui.label(f"(Файлов: {len(group)})").classes('font-bold text-orange-400 whitespace-nowrap')
                             
-                            with ui.row().classes('gap-2 items-center'):
+                            with ui.row().classes('gap-2 items-center shrink-0'):
                                 def select_group(val):
                                     for p in group: state.sel_dupes[p] = val
                                     update_view()
+                                def invert_group():
+                                    for p in group: state.sel_dupes[p] = not state.sel_dupes.get(p, False)
+                                    update_view()
                                     
-                                ui.button('Выделить группу', on_click=lambda: select_group(True)).props('outline size=sm color=green')
-                                ui.button('Снять выделение', on_click=lambda: select_group(False)).props('outline size=sm color=red')
+                                ui.button('Выделить', on_click=lambda: select_group(True)).props('outline size=sm color=green')
+                                ui.button('Снять', on_click=lambda: select_group(False)).props('outline size=sm color=red')
+                                ui.button('Инверт.', on_click=invert_group).props('outline size=sm color=blue').tooltip('Инвертировать выделение')
                                 
                                 btn_toggle = ui.button('Развернуть', on_click=lambda: toggle_expand()).props('size=sm color=gray')
                                 if len(group) <= MAX_ITEMS_PER_GROUP:
@@ -4856,11 +4871,11 @@ async def index_page():
                         success = 0
                         moved_paths = set()
                         
-                        for idx, group in enumerate(state.dupes_results):
-                            group_name = f"Group_{idx+1:03d}"
+                        for group in state.dupes_results:
+                            group_name = group["name"]
                             dest_folder = os.path.join(base_dest, group_name)
                             
-                            for path in group:
+                            for path in group["paths"]:
                                 if state.sel_dupes.get(path):
                                     os.makedirs(dest_folder, exist_ok=True)
                                     fname = os.path.basename(path)
@@ -4887,9 +4902,9 @@ async def index_page():
                     if action == 'move' and moved_paths:
                         new_dupes =[]
                         for g in state.dupes_results:
-                            new_g = [item for item in g if item not in moved_paths]
+                            new_g = [item for item in g["paths"] if item not in moved_paths]
                             # Оставляем группу, только если в ней все еще есть с чем сравнивать (больше 1 файла)
-                            if len(new_g) > 1: new_dupes.append(new_g)
+                            if len(new_g) > 1: new_dupes.append({"name": g["name"], "paths": new_g})
                         state.dupes_results = new_dupes
                         dupes_gallery_ui.refresh()
 
@@ -4921,9 +4936,10 @@ async def index_page():
                             else:
                                 res = dupes_engine.find_similar(dupes_dir.value, tuple(exts), int(phash_threshold.value), dupes_video_frames.value)
                                 
-                            state.dupes_results = res
-                            for group in res:
-                                for p in group:
+                            formatted_res =[{"name": f"Group_{idx+1:03d}", "paths": g} for idx, g in enumerate(res)]
+                            state.dupes_results = formatted_res
+                            for group in formatted_res:
+                                for p in group["paths"]:
                                     state.sel_dupes[p] = False
                                     
                             state.add_log(f"✅ Поиск дубликатов завершен! Найдено групп: {len(res)}")
@@ -5102,7 +5118,7 @@ async def index_page():
                 for c in state.cluster_results:
                     new_paths = [p for p in c["paths"] if p in valid_paths]
                     if new_paths:
-                        filtered_clusters.append({"name": c["name"], "paths": new_paths})
+                        filtered_clusters.append({"ref": c, "name": c["name"], "paths": new_paths})
 
                 GROUPS_PER_PAGE = int(state.groups_per_page)
                 MAX_ITEMS_PER_GROUP = 30  # В свернутом виде
@@ -5164,22 +5180,28 @@ async def index_page():
                             ui.label("Нет файлов, подходящих под выбранный фильтр.").classes("text-gray-400 m-4")
                         
                         def render_cluster_group(group):
-                            cluster_name = group["name"]
                             paths = group["paths"]
                             is_expanded = {'val': False}
                             inner_page = {'val': 1}
                             
                             with ui.card().classes('w-full bg-gray-800 border border-gray-700 p-2 mb-4'):
-                                with ui.row().classes('w-full justify-between items-center px-2 mb-2'):
-                                    ui.label(f'📁 {cluster_name} (Всего файлов: {len(paths)})').classes('font-bold text-purple-400')
+                                with ui.row().classes('w-full justify-between items-center px-2 mb-2 flex-nowrap'):
+                                    with ui.row().classes('gap-2 items-center flex-1 min-w-0'):
+                                        ui.icon('folder', color='purple-400', size='sm')
+                                        ui.input(value=group["name"], on_change=lambda e: group["ref"].update({"name": e.value})).classes('flex-1').props('dense borderless input-class="text-purple-400 font-bold text-lg"')
+                                        ui.label(f"(Файлов: {len(paths)})").classes('font-bold text-purple-400 whitespace-nowrap')
                                     
-                                    with ui.row().classes('gap-2 items-center'):
+                                    with ui.row().classes('gap-2 items-center shrink-0'):
                                         def select_cluster(val):
                                             for p in paths: state.sel_cluster[p] = val
                                             update_view()
+                                        def invert_cluster():
+                                            for p in paths: state.sel_cluster[p] = not state.sel_cluster.get(p, False)
+                                            update_view()
 
-                                        ui.button('Выделить группу', on_click=lambda: select_cluster(True)).props('outline size=sm color=green')
-                                        ui.button('Снять выделение', on_click=lambda: select_cluster(False)).props('outline size=sm color=red')
+                                        ui.button('Выделить', on_click=lambda: select_cluster(True)).props('outline size=sm color=green')
+                                        ui.button('Снять', on_click=lambda: select_cluster(False)).props('outline size=sm color=red')
+                                        ui.button('Инверт.', on_click=invert_cluster).props('outline size=sm color=blue').tooltip('Инвертировать выделение')
                                         
                                         btn_toggle = ui.button('Развернуть', on_click=lambda: toggle_expand()).props('size=sm color=gray')
                                         if len(paths) <= MAX_ITEMS_PER_GROUP:
