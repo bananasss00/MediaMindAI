@@ -2596,7 +2596,7 @@ async def index_page():
     with ui.dialog() as nsfw_debug_dialog:
         with ui.card().classes('w-[500px] max-w-full bg-gray-900 text-white border border-gray-700'):
             debug_title = ui.label('Детали NSFW').classes('text-lg font-bold mb-2 break-all')
-            debug_container = ui.column().classes('w-full gap-1 max-h-[60vh] overflow-y-auto')
+            debug_container = ui.column().classes('w-full gap-0 max-h-[60vh] overflow-y-auto')
             ui.button('Закрыть', on_click=nsfw_debug_dialog.close).classes('w-full mt-4 bg-gray-800 hover:bg-gray-700')
 
     def show_nsfw_debug(path, details):
@@ -2604,29 +2604,38 @@ async def index_page():
         debug_container.clear()
         safe_set = {'safe', 'sfw', 'normal', 'general', 'neutral', 'drawing', 'safe_content', 'anime picture', 'anime'}
         with debug_container:
-            sorted_details = sorted(details.items(), key=lambda x: x[1], reverse=True)
+            # Ограничиваем вывод ТОП-100 категорий, отсекаем < 0.1% вероятности
+            sorted_details = sorted(details.items(), key=lambda x: x[1], reverse=True)[:100]
+            html_parts = []
             for lbl, prob in sorted_details:
-                color = "text-red-400 font-bold" if prob > 0.1 and lbl.lower() not in safe_set else "text-green-400" if lbl.lower() in safe_set else "text-gray-400"
-                with ui.row().classes('w-full justify-between border-b border-gray-800 py-1 px-2'):
-                    ui.label(lbl).classes(f'font-mono text-sm {color}')
-                    ui.label(f"{prob*100:.2f}%").classes(f'font-mono text-sm {color}')
+                if prob < 0.001: continue 
+                color = "#f87171" if prob > 0.1 and lbl.lower() not in safe_set else "#4ade80" if lbl.lower() in safe_set else "#9ca3af"
+                weight = "bold" if prob > 0.1 and lbl.lower() not in safe_set else "normal"
+                html_parts.append(f"<div style='display:flex; justify-content:space-between; border-bottom:1px solid #374151; padding:4px 8px; font-family:monospace; font-size:14px;'><span style='color:{color}; font-weight:{weight};'>{lbl}</span><span style='color:{color}; font-weight:{weight};'>{prob*100:.2f}%</span></div>")
+            ui.html("".join(html_parts)).classes('w-full')
         nsfw_debug_dialog.open()
 
     with ui.dialog() as tags_debug_dialog:
         with ui.card().classes('w-[500px] max-w-full bg-gray-900 text-white border border-gray-700'):
             tags_debug_title = ui.label('Теги (Danbooru)').classes('text-lg font-bold mb-2 break-all')
-            tags_debug_container = ui.column().classes('w-full gap-1 max-h-[60vh] overflow-y-auto')
+            tags_debug_container = ui.column().classes('w-full gap-0 max-h-[60vh] overflow-y-auto')
             ui.button('Закрыть', on_click=tags_debug_dialog.close).classes('w-full mt-4 bg-gray-800 hover:bg-gray-700')
 
     def show_tags_debug(path, tags_dict):
         tags_debug_title.set_text(os.path.basename(path))
         tags_debug_container.clear()
         with tags_debug_container:
-            sorted_tags = sorted(tags_dict.items(), key=lambda x: x[1], reverse=True)
+            # ЖЕСТКОЕ ОГРАНИЧЕНИЕ: Берем только ТОП-150 тегов, чтобы не вешать браузер тысячами строк
+            sorted_tags = sorted(tags_dict.items(), key=lambda x: x[1], reverse=True)[:150]
+            html_parts = []
             for lbl, prob in sorted_tags:
-                with ui.row().classes('w-full justify-between border-b border-gray-800 py-1 px-2'):
-                    ui.label(lbl).classes('font-mono text-sm text-pink-300')
-                    ui.label(f"{prob*100:.2f}%").classes('font-mono text-sm text-gray-400')
+                if prob < 0.01: continue # Скрываем теги с вероятностью меньше 1%
+                html_parts.append(f"<div style='display:flex; justify-content:space-between; border-bottom:1px solid #374151; padding:4px 8px; font-family:monospace; font-size:14px;'><span style='color:#f9a8d4;'>{lbl}</span><span style='color:#9ca3af;'>{prob*100:.2f}%</span></div>")
+            
+            if len(tags_dict) > 150:
+                html_parts.append(f"<div style='text-align:center; padding:8px; color:#6b7280; font-size:12px;'>Показаны топ-150 тегов (скрыто {len(tags_dict)-150} шт. мусора)</div>")
+                
+            ui.html("".join(html_parts)).classes('w-full')
         tags_debug_dialog.open()
 
     # --- ПОЛНОЭКРАННЫЙ ПЛЕЕР ---
@@ -3083,66 +3092,79 @@ async def index_page():
             
         refresh_tab_ui(tab_name)
 
-    # --- ПАКЕТНЫЕ ДЕЙСТВИЯ ---
+    # --- ПАКЕТНЫЕ ДЕЙСТВИЯ (ОПТИМИЗИРОВАНО ДЛЯ O(1) ДОСТУПА) ---
     async def execute_batch(action='copy', tab='search', prepend_score=False, export_txt=False, txt_threshold=0.1):
         sel_dict = getattr(state, f"sel_{tab}")
         selected_paths =[p for p, checked in sel_dict.items() if checked]
         if not selected_paths:
             return ui.notify('Ничего не выбрано!', type='warning')
             
-        folder = await run.io_bound(pick_folder_native)
-        if not folder: return
+        if action == 'export_txt_inplace':
+            folder = "inplace"
+        else:
+            folder = await run.io_bound(pick_folder_native)
+            if not folder: return
         
         base_dir = getattr(state, f"{tab}_base_dir", state.search_base_dir)
-        ui.notify(f"Начато {action} {len(selected_paths)} файлов...", type='info')
+        ui.notify(f"Начато {action} для {len(selected_paths)} файлов...", type='info')
 
-        # Фоновая задача для файловых операций
         def _process_files():
             success = 0
             moved_paths = set()
-            for path in selected_paths:
-                try:
-                    rel_path = os.path.relpath(path, base_dir)
-                    if rel_path.startswith('..') or os.path.isabs(rel_path): rel_path = os.path.basename(path)
-                except Exception: rel_path = os.path.basename(path)
-                    
-                rel_dir, fname = os.path.split(rel_path)
-                if state.flatten_structure:
-                    rel_dir = ""
+            
+            # Предварительное кэширование словарей для O(1) поиска (исключает зависания при тысячах файлов)
+            score_dict = {}
+            if tab == 'search': score_dict = {p: s for s, p in state.search_results}
+            elif tab == 'aes': score_dict = {p: (s, m) for s, p, m in state.aesthetic_results}
+            elif tab == 'nsfw': score_dict = {p: (d, l, dt) for d, p, l, dt in state.nsfw_results}
+            elif tab == 'face': score_dict = {p: s for s, p in state.face_results}
+            elif tab == 'tags': score_dict = {p: t for s, p, t in state.tags_results}
 
-                prefix = ""
-                if prepend_score:
-                    if tab == 'search': prefix = f"{next((s for s, p in state.search_results if p == path), 0):.3f}_"
-                    elif tab == 'aes': prefix = f"{next((a for a, p, m in state.aesthetic_results if p == path), 0):05.2f}_"
-                    elif tab == 'nsfw': prefix = f"{next((d for d, p, l, dt in state.nsfw_results if p == path), 0)*100:05.1f}_"
-                    elif tab == 'face': prefix = f"{next((s for s, p in state.face_results if p == path), 0)*100:05.1f}_"
+            for path in selected_paths:
+                if action == 'export_txt_inplace':
+                    dest = path
+                else:
+                    try:
+                        rel_path = os.path.relpath(path, base_dir)
+                        if rel_path.startswith('..') or os.path.isabs(rel_path): rel_path = os.path.basename(path)
+                    except Exception: rel_path = os.path.basename(path)
                         
-                dest = os.path.join(folder, rel_dir, prefix + fname)
-                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    rel_dir, fname = os.path.split(rel_path)
+                    if state.flatten_structure:
+                        rel_dir = ""
+
+                    prefix = ""
+                    if prepend_score:
+                        if tab == 'search': prefix = f"{score_dict.get(path, 0):.3f}_"
+                        elif tab == 'aes': prefix = f"{score_dict.get(path, (0, 0))[0]:05.2f}_"
+                        elif tab == 'nsfw': prefix = f"{score_dict.get(path, (0, '', {}))[0]*100:05.1f}_"
+                        elif tab == 'face': prefix = f"{score_dict.get(path, 0)*100:05.1f}_"
+                            
+                    dest = os.path.join(folder, rel_dir, prefix + fname)
+                    if action in ('copy', 'move', 'export_txt'):
+                        os.makedirs(os.path.dirname(dest), exist_ok=True)
                 
                 try:
                     if action == 'copy': shutil.copy2(path, dest)
-                    else: 
+                    elif action == 'move': 
                         shutil.move(path, dest)
                         moved_paths.add(path)
                     
                     if export_txt and tab == 'tags':
                         txt_dest = os.path.splitext(dest)[0] + '.txt'
-                        item_data = next((i for i in state.tags_results if i[1] == path), None)
-                        if item_data and len(item_data) > 2:
-                            tags_dict = item_data[2]
-                            valid_tags =[t for t, s in tags_dict.items() if s >= txt_threshold]
-                            if valid_tags:
-                                with open(txt_dest, 'w', encoding='utf-8') as f:
-                                    f.write(", ".join(valid_tags))
+                        tags_dict = score_dict.get(path)
+                        if tags_dict is not None:
+                            sorted_tags = sorted(tags_dict.items(), key=lambda x: x[1], reverse=True)
+                            valid_tags =[t.replace('_', ' ') for t, s in sorted_tags if s >= txt_threshold]
+                            with open(txt_dest, 'w', encoding='utf-8') as f:
+                                f.write(", ".join(valid_tags))
                     success += 1
                 except Exception as e: state.add_log(f"Ошибка {path}: {e}")
             return success, moved_paths
 
-        # Ждем выполнения без блокировки UI
         success, moved_paths = await run.io_bound(_process_files)
                 
-        ui.notify(f'Успешно {action}: {success} файлов', type='positive')
+        ui.notify(f'Успешно: {success} файлов', type='positive')
         
         if action == 'move' and moved_paths:
             setattr(state, f"{tab}_results",[i for i in getattr(state, f"{tab}_results") if i[1] not in moved_paths])
@@ -3655,9 +3677,12 @@ async def index_page():
                         ui.toggle(['Все', 'Картинки', 'Видео'], value=state.tags_res_filter, on_change=apply_filter).classes('text-xs ml-2')
                         ui.button(icon='filter_alt', on_click=lambda: (setattr(state, 'show_phys_filters', not getattr(state, 'show_phys_filters', False)), tags_gallery_ui.refresh())).props('flat color=gray dense').tooltip('Доп. фильтры')
                     with ui.row().classes('gap-2 items-center'):
-                        ui.button('HTML Экспорт', icon='html', on_click=lambda: export_html_action('tags')).props('color=purple dense outline')
-                        ui.button('Копировать ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'tags', False, chk_txt_tags.value, tags_threshold.value)).props('color=pink-800 dense')
-                        ui.button('Переместить ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'tags', False, chk_txt_tags.value, tags_threshold.value)).props('color=red dense')
+                        # Новые кнопки экспорта TXT
+                        ui.button('TXT (Рядом) ✔', icon='description', on_click=lambda: execute_batch('export_txt_inplace', 'tags', False, True, tags_threshold.value)).props('color=pink-900 dense').tooltip('Сохранить .txt файлы с тегами в ту же папку к оригиналам')
+                        ui.button('TXT (В папку) ✔', icon='folder_copy', on_click=lambda: execute_batch('export_txt', 'tags', False, True, tags_threshold.value)).props('color=pink-800 dense').tooltip('Сохранить ТОЛЬКО .txt файлы в отдельную папку (удобно для датасетов)')
+                        
+                        ui.button('Копировать ✔', icon='content_copy', on_click=lambda: execute_batch('copy', 'tags', False, chk_txt_tags.value, tags_threshold.value)).props('color=blue-800 dense outline').tooltip('Копировать картинки (и .txt, если стоит галочка ниже)')
+                        ui.button('Переместить ✔', icon='drive_file_move', on_click=lambda: execute_batch('move', 'tags', False, chk_txt_tags.value, tags_threshold.value)).props('color=red dense outline')
                         ui.button('УДАЛИТЬ ✔', icon='delete_forever', on_click=lambda: delete_items([p for p, c in state.sel_tags.items() if c], 'tags')).props('color=red-10 text-white dense')
 
                 if getattr(state, 'show_phys_filters', False):
