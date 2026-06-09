@@ -3810,6 +3810,7 @@ async def index_page():
                 with ui.row().classes('w-full flex justify-between items-center p-2 bg-gray-800 rounded-lg mb-2'):
                     with ui.row().classes('gap-2 items-center'):
                         ui.button('АВТО-ВЫБОР ХУДШИХ', icon='auto_awesome', on_click=auto_select_worst_dupes).props('color=orange text-black font-bold dense')
+                        ui.button('Выбрать всё', on_click=lambda: ui.timer(0, lambda: set_all('dupes', True), once=True)).props('outline color=white dense')
                         ui.button('Снять всё', on_click=lambda: ui.timer(0, lambda: set_all('dupes', False), once=True)).props('outline color=white dense')
                         ui.button(icon='filter_alt', on_click=lambda: (setattr(state, 'show_phys_filters_dupes', not getattr(state, 'show_phys_filters_dupes', False)), dupes_gallery_ui.refresh())).props('flat color=gray dense').tooltip('Доп. фильтры')
                     with ui.row().classes('gap-2 items-center'):
