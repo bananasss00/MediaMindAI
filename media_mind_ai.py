@@ -3055,15 +3055,24 @@ async def index_page():
         
         # Выносим физическое удаление файлов и работу с БД в отдельный поток
         def _trash_files():
-            deleted_count = 0
-            for p in paths:
-                try:
-                    send2trash(os.path.normpath(p))
-                    deleted_count += 1
-                    search_engine.db_cache.remove_paths([p])
-                except Exception as e:
-                    state.add_log(f"Ошибка удаления {p}: {e}")
-            return deleted_count
+            import ctypes
+            # Инициализация COM-библиотеки для фонового потока на Windows
+            if os.name == 'nt':
+                ctypes.windll.ole32.CoInitialize(None)
+            try:
+                deleted_count = 0
+                for p in paths:
+                    try:
+                        send2trash(os.path.normpath(p))
+                        deleted_count += 1
+                        search_engine.db_cache.remove_paths([p])
+                    except Exception as e:
+                        state.add_log(f"Ошибка удаления {p}: {e}")
+                return deleted_count
+            finally:
+                # Освобождение COM-ресурсов
+                if os.name == 'nt':
+                    ctypes.windll.ole32.CoUninitialize()
 
         ui.notify("Удаление файлов...", type='info')
         deleted = await run.io_bound(_trash_files)
